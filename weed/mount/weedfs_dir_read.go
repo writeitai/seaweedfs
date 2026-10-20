@@ -247,13 +247,7 @@ func (wfs *WFS) doReadDirectory(input *fuse.ReadIn, out DirEntrySink, isPlusMode
 			}
 			if fh, found := wfs.fhMap.FindFileHandle(inode); found {
 				glog.V(4).Infof("readdir opened file %s", childPath)
-				// Only the entry's own lock: this runs under the meta cache's,
-				// where taking the handle lock could deadlock (Mountable).
-				fh.entry.RLock()
-				if open := fh.entry.Entry; open != nil && (entry.Inode == 0 || open.GetAttributes().GetInode() == entry.Inode) {
-					entry = filer.FromPbEntry(string(dirPath), open)
-				}
-				fh.entry.RUnlock()
+				entry = wfs.openEntry(fh, dirPath, entry)
 			}
 			wfs.outputFilerEntry(entryOut, inode, entry)
 			// Taken only once the entry is really in the sink, so one that did not
@@ -384,14 +378,14 @@ func (wfs *WFS) doReadDirectory(input *fuse.ReadIn, out DirEntrySink, isPlusMode
 			glog.V(1).Infof("refresh %s sections: %v", dirPath, err)
 		}
 
+		// The batch is read out of the cache first and handed to the sink
+		// after: an open file's entry is read under its handle's locks, which
+		// must not be taken under the cache's (Mountable). What the sink does
+		// not take stays in the stream for the next call.
 		bufferFull := false
+		firstIndex := int64(len(dh.entryStream))
 		storeLastName, loadErr := wfs.metaCache.ListDirectoryEntries(readdirContext, dirPath, lastEntryName, false, int64(batchSize), func(entry *filer.Entry) (bool, error) {
-			currentIndex := int64(len(dh.entryStream))
 			dh.entryStream = append(dh.entryStream, entry)
-			if !processEachEntryFn(entry, currentIndex) {
-				bufferFull = true
-				return false, nil
-			}
 			return true, nil
 		})
 		if loadErr != nil {
@@ -399,6 +393,12 @@ func (wfs *WFS) doReadDirectory(input *fuse.ReadIn, out DirEntrySink, isPlusMode
 			return fuse.EIO
 		}
 		dh.lastListedName = storeLastName
+		for index := firstIndex; index < int64(len(dh.entryStream)); index++ {
+			if !processEachEntryFn(dh.entryStream[index], index) {
+				bufferFull = true
+				break
+			}
+		}
 
 		// The store reaching nothing is the only sound end-of-directory signal:
 		// a batch can come back short because entries expired, not because the

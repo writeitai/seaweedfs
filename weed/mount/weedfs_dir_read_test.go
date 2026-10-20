@@ -2,9 +2,11 @@ package mount
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"testing"
 
+	"github.com/seaweedfs/go-fuse/v2/fuse"
 	"github.com/seaweedfs/seaweedfs/weed/mount/meta_cache"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/util"
@@ -118,5 +120,72 @@ func TestLoadDirectoryEntriesDirectShowsSystemEntriesWhenEnabled(t *testing.T) {
 	}
 	if entries[0].Name() != "topics" || entries[1].Name() != "visible" {
 		t.Fatalf("entry names = %q, %q, want topics, visible", entries[0].Name(), entries[1].Name())
+	}
+}
+
+// plusSink takes every entry of a plus listing, keeping what it reported.
+type plusSink struct {
+	outs map[string]*fuse.EntryOut
+}
+
+func (s *plusSink) AddEntry(fuse.DirEntry) bool { return true }
+func (s *plusSink) AddEntryPlus(entry fuse.DirEntry) *fuse.EntryOut {
+	out := &fuse.EntryOut{}
+	s.outs[entry.Name] = out
+	return out
+}
+func (s *plusSink) TakesLookupRef() bool { return true }
+
+// A cached plus listing reads an open file's entry under the handle's lock
+// while a Write changes it: the cache's batch is handed to the sink after
+// the cache's lock is released, so that lock is taken without the risk of
+// a deadlock, and the race detector sees no unsynchronized access.
+func TestReadDirPlusUnderConcurrentWrite(t *testing.T) {
+	dir := util.FullPath("/d")
+	var names []string
+	for i := range 100 {
+		names = append(names, fmt.Sprintf("f%03d", i))
+	}
+	wfs := newPagingWFS(t, dir, names, 0)
+	dirInode, _ := wfs.inodeToPath.GetInode(dir)
+	child := dir.Child("f010")
+	listed, _, err := wfs.metaCache.FindEntry(context.Background(), child)
+	if err != nil {
+		t.Fatalf("find: %v", err)
+	}
+	inode := wfs.inodeToPath.Lookup(child, listed.Crtime.Unix(), false, false, listed.Inode, true)
+	fh, _ := wfs.fhMap.AcquireFileHandle(wfs, inode, listed.ToProtoEntry(), 0, 0)
+
+	stop := make(chan struct{})
+	written := make(chan error, 1)
+	go func() {
+		data := []byte("0123456789abcdef")
+		for {
+			select {
+			case <-stop:
+				written <- nil
+				return
+			default:
+			}
+			if _, st := wfs.Write(nil, &fuse.WriteIn{InHeader: fuse.InHeader{NodeId: inode}, Fh: uint64(fh.fh), Size: uint32(len(data))}, data); st != fuse.OK {
+				written <- fmt.Errorf("write: %v", st)
+				return
+			}
+		}
+	}()
+	for range 50 {
+		dhid, _ := wfs.AcquireDirectoryHandle()
+		sink := &plusSink{outs: map[string]*fuse.EntryOut{}}
+		if st := wfs.doReadDirectory(&fuse.ReadIn{InHeader: fuse.InHeader{NodeId: dirInode}, Fh: uint64(dhid), Size: 1 << 20}, sink, true); st != fuse.OK {
+			t.Fatalf("readdirplus: %v", st)
+		}
+		wfs.ReleaseDirectoryHandle(dhid)
+		if len(sink.outs) != 102 || sink.outs["f010"].Ino != inode {
+			t.Fatalf("listed %d entries", len(sink.outs))
+		}
+	}
+	close(stop)
+	if err := <-written; err != nil {
+		t.Fatal(err)
 	}
 }
