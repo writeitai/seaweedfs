@@ -38,7 +38,7 @@ func (wfs *WFS) AcquireHandle(inode uint64, flags, uid, gid uint32) (fileHandle 
 		})
 		entryVersionTsNs = entryVersion{tsNs: existingFh.entryVersionTsNs.Load(), signature: existingFh.entryVersionSignature.Load()}
 	} else {
-		entry, entryVersionTsNs, status = wfs.maybeLoadEntry(path)
+		path, entry, entryVersionTsNs, status = wfs.loadInodeEntry(inode, path)
 		if status != fuse.OK {
 			return nil, status
 		}

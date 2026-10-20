@@ -1,6 +1,7 @@
 package mount
 
 import (
+	"slices"
 	"sync"
 	"time"
 
@@ -61,6 +62,13 @@ func (ie *InodeEntry) appendPaths(dst []util.FullPath) []util.FullPath {
 		dst = append(dst, *ie.extraPaths...)
 	}
 	return dst
+}
+
+func (ie *InodeEntry) hasPath(p util.FullPath) bool {
+	if ie.path == p {
+		return true
+	}
+	return ie.extraPaths != nil && slices.Contains(*ie.extraPaths, p)
 }
 
 func (ie *InodeEntry) addPath(p util.FullPath) {
@@ -176,9 +184,17 @@ func (i *InodeToPath) Lookup(path util.FullPath, unixTime int64, isDirectory boo
 	}
 	i.path2inode[path] = inode
 
-	if _, found := i.inode2path[inode]; found {
+	if ie, found := i.inode2path[inode]; found {
+		// Hard links share one inode: remember every alias looked up, so
+		// the inode can still be reached through a survivor once the path
+		// it was first seen at is gone (see PromotePath). Mountable
+		// (writeitai/seaweedfs, branch mountable), for the macOS NFS mount:
+		// design/designs/macos-mount.md §4 in writeitai/fsit.
+		if isHardlink && !ie.hasPath(path) {
+			ie.addPath(path)
+		}
 		if isLookup {
-			i.inode2path[inode].nlookup++
+			ie.nlookup++
 		}
 	} else {
 		nlookup := uint64(0)
@@ -512,6 +528,31 @@ func (i *InodeToPath) AddPath(inode uint64, path util.FullPath) {
 			nlookup: 1,
 		}
 	}
+}
+
+// PromotePath makes alias, one of the inode's extra paths, its primary
+// path, dropping the primary it replaces: the caller found that one gone
+// from the store and alias still holding the object. Used when a hard
+// link's first-seen name was removed while another survives.
+//
+// Mountable (writeitai/seaweedfs, branch mountable): added for the macOS
+// NFS mount, whose file handles name inodes and must keep working through
+// a surviving hard link. See design/designs/macos-mount.md §4 in
+// writeitai/fsit.
+func (i *InodeToPath) PromotePath(inode uint64, alias util.FullPath) bool {
+	i.Lock()
+	defer i.Unlock()
+	ie, found := i.inode2path[inode]
+	if !found || ie.path == alias || !ie.hasPath(alias) {
+		return false
+	}
+	gone := ie.path
+	ie.removeOnePath(alias)
+	ie.replacePath(ie.path, alias)
+	if i.path2inode[gone] == inode {
+		delete(i.path2inode, gone)
+	}
+	return true
 }
 
 // RemovePath drops the name. onStillReferenced, if given, runs under the

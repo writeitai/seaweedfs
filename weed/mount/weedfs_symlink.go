@@ -91,7 +91,7 @@ func (wfs *WFS) Readlink(cancel <-chan struct{}, header *fuse.InHeader) (out []b
 		return
 	}
 
-	entry, _, status := wfs.maybeLoadEntry(entryFullPath)
+	_, entry, _, status := wfs.loadInodeEntry(header.NodeId, entryFullPath)
 	if status != fuse.OK {
 		return nil, status
 	}

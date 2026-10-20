@@ -208,3 +208,36 @@ func TestMovePathWithNoSourceLeavesTheTarget(t *testing.T) {
 		t.Errorf("/a/g.txt resolves to %d (found %v), want %d", got, found, inode)
 	}
 }
+
+// Every alias of a hard link looked up is kept, and a survivor can take
+// over as the primary path once the first-seen one is gone.
+func TestHardLinkAliasesArePromoted(t *testing.T) {
+	m := NewInodeToPath(util.FullPath("/"), 0)
+	inode := m.Lookup("/a", 1, false, true, 77, true)
+	if other := m.Lookup("/b", 1, false, true, 77, true); other != inode {
+		t.Fatalf("aliases got inodes %d and %d", inode, other)
+	}
+	if paths := m.GetAllPaths(inode); len(paths) != 2 || paths[0] != "/a" || paths[1] != "/b" {
+		t.Fatalf("paths %v", paths)
+	}
+	m.Lookup("/b", 1, false, true, 77, true) // known already: not added twice
+	if paths := m.GetAllPaths(inode); len(paths) != 2 {
+		t.Fatalf("paths %v", paths)
+	}
+	if m.PromotePath(inode, "/c") || m.PromotePath(inode, "/a") {
+		t.Fatal("promoted a path that is not an alias")
+	}
+	if !m.PromotePath(inode, "/b") {
+		t.Fatal("the alias was not promoted")
+	}
+	if p, _ := m.GetPath(inode); p != "/b" {
+		t.Fatalf("primary %s", p)
+	}
+	if paths := m.GetAllPaths(inode); len(paths) != 1 || m.HasPath("/a") {
+		t.Fatalf("the gone path stayed: %v", paths)
+	}
+	// Not a hard link: a second path never shares the inode.
+	if x, y := m.Lookup("/x", 1, false, false, 90, true), m.Lookup("/y", 1, false, false, 90, true); x == y {
+		t.Fatal("two plain files share an inode")
+	}
+}

@@ -524,8 +524,34 @@ func (wfs *WFS) maybeReadEntry(inode uint64) (path util.FullPath, fh *FileHandle
 		}
 		return
 	}
-	entry, _, status = wfs.maybeLoadEntry(path)
+	path, entry, _, status = wfs.loadInodeEntry(inode, path)
 	return
+}
+
+// loadInodeEntry loads the entry at path, the inode's primary path. When
+// that is gone and the inode is a hard link known by other names, a
+// surviving alias that still holds the same object (its stored inode is
+// this inode) answers instead and becomes the primary path.
+//
+// Mountable (writeitai/seaweedfs, branch mountable): added for the macOS
+// NFS mount, whose file handles name inodes and must keep working through
+// a surviving hard link. See design/designs/macos-mount.md §4 in
+// writeitai/fsit.
+func (wfs *WFS) loadInodeEntry(inode uint64, path util.FullPath) (util.FullPath, *filer_pb.Entry, entryVersion, fuse.Status) {
+	entry, version, status := wfs.maybeLoadEntry(path)
+	if status != fuse.ENOENT {
+		return path, entry, version, status
+	}
+	for _, alias := range wfs.inodeToPath.GetAllPaths(inode) {
+		if alias == path {
+			continue
+		}
+		aliasEntry, aliasVersion, aliasStatus := wfs.maybeLoadEntry(alias)
+		if aliasStatus == fuse.OK && aliasEntry.GetAttributes().GetInode() == inode && wfs.inodeToPath.PromotePath(inode, alias) {
+			return alias, aliasEntry, aliasVersion, fuse.OK
+		}
+	}
+	return path, entry, version, status
 }
 
 // isLocalOnlyEntry reports whether entry holds local-only state not yet on the
