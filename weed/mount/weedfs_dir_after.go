@@ -126,7 +126,7 @@ func (wfs *WFS) listCachedAfter(dirPath util.FullPath, after string, each func(*
 // listDirectAfter lists from the filer, for a directory too large to cache.
 func (wfs *WFS) listDirectAfter(dirPath util.FullPath, after string, each func(*filer.Entry) bool) (eof bool, code fuse.Status) {
 	for {
-		entries, _, err := loadDirectoryEntriesDirect(readdirContext, wfs, wfs.option.UidGidMapper, dirPath, after, false, batchSize, 0, wfs.option.IncludeSystemEntries)
+		entries, _, listed, last, err := loadDirectoryEntriesDirect(readdirContext, wfs, wfs.option.UidGidMapper, dirPath, after, false, batchSize, 0, wfs.option.IncludeSystemEntries)
 		if err != nil {
 			glog.Errorf("list filer directory: %v", err)
 			return false, fuse.EIO
@@ -135,11 +135,12 @@ func (wfs *WFS) listDirectAfter(dirPath util.FullPath, after string, each func(*
 			if !each(entry) {
 				return false, fuse.OK
 			}
-			after = entry.Name()
 		}
-		if len(entries) < batchSize {
+		// Page and end by what the filer listed, hidden entries included.
+		if listed < batchSize {
 			return true, fuse.OK
 		}
+		after = last
 	}
 }
 
@@ -165,6 +166,7 @@ func (wfs *WFS) listEntryAfter(dirPath util.FullPath, entry *filer.Entry, plus b
 	if fh, found := wfs.fhMap.FindFileHandle(inode); found {
 		entry = wfs.openEntry(fh, dirPath, entry)
 	}
+	listed.StoredInode = entry.Inode
 	listed.Inode, listed.Out = inode, &fuse.EntryOut{}
 	wfs.outputFilerEntry(listed.Out, inode, entry)
 	if !add(listed) {
@@ -182,7 +184,9 @@ func (wfs *WFS) openEntry(fh *FileHandle, dirPath util.FullPath, listed *filer.E
 	defer wfs.fhLockTable.ReleaseLock(fh.fh, fhActiveLock)
 	fh.entry.RLock()
 	defer fh.entry.RUnlock()
-	if fh.entry.Entry == nil {
+	// The handle's view counts only if it is the same object: an open
+	// handle can outlive the file that held this name.
+	if fh.entry.Entry == nil || listed.Inode != 0 && fh.entry.Entry.GetAttributes().GetInode() != listed.Inode {
 		return listed
 	}
 	return filer.FromPbEntry(string(dirPath), fh.entry.Entry)

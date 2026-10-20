@@ -423,7 +423,7 @@ func (wfs *WFS) readDirectoryDirect(input *fuse.ReadIn, out DirEntrySink, dh *Di
 	if input.Offset >= dh.entryStreamOffset {
 		if len(dh.entryStream) == 0 && input.Offset > dh.entryStreamOffset {
 			skipCount := uint32(input.Offset-dh.entryStreamOffset) + batchSize
-			entries, snapshotTs, err := loadDirectoryEntriesDirect(readdirContext, wfs, wfs.option.UidGidMapper, dirPath, "", false, skipCount, dh.snapshotTsNs, wfs.option.IncludeSystemEntries)
+			entries, snapshotTs, _, _, err := loadDirectoryEntriesDirect(readdirContext, wfs, wfs.option.UidGidMapper, dirPath, "", false, skipCount, dh.snapshotTsNs, wfs.option.IncludeSystemEntries)
 			if err != nil {
 				glog.Errorf("list filer directory: %v", err)
 				return fuse.EIO
@@ -457,7 +457,7 @@ func (wfs *WFS) readDirectoryDirect(input *fuse.ReadIn, out DirEntrySink, dh *Di
 			}
 		}
 
-		entries, snapshotTs, err := loadDirectoryEntriesDirect(readdirContext, wfs, wfs.option.UidGidMapper, dirPath, lastEntryName, false, batchSize, dh.snapshotTsNs, wfs.option.IncludeSystemEntries)
+		entries, snapshotTs, listed, _, err := loadDirectoryEntriesDirect(readdirContext, wfs, wfs.option.UidGidMapper, dirPath, lastEntryName, false, batchSize, dh.snapshotTsNs, wfs.option.IncludeSystemEntries)
 		if err != nil {
 			glog.Errorf("list filer directory: %v", err)
 			return fuse.EIO
@@ -475,7 +475,7 @@ func (wfs *WFS) readDirectoryDirect(input *fuse.ReadIn, out DirEntrySink, dh *Di
 				break
 			}
 		}
-		if !bufferFull && len(entries) < int(batchSize) {
+		if !bufferFull && listed < int(batchSize) {
 			dh.isFinished = true
 			// After a full successful read-through listing, exit direct mode
 			// so subsequent reads can use the cache instead of hitting the filer.
@@ -486,7 +486,11 @@ func (wfs *WFS) readDirectoryDirect(input *fuse.ReadIn, out DirEntrySink, dh *Di
 	return fuse.OK
 }
 
-func loadDirectoryEntriesDirect(ctx context.Context, client filer_pb.FilerClient, uidGidMapper *meta_cache.UidGidMapper, dirPath util.FullPath, startFileName string, includeStart bool, limit uint32, snapshotTsNs int64, includeSystemEntries bool) ([]*filer.Entry, int64, error) {
+// loadDirectoryEntriesDirect lists up to limit entries from the filer.
+// listed and last are what the filer returned before hidden system entries
+// were dropped (Mountable: a short filtered batch is not the end), so a
+// caller pages and detects the end by them.
+func loadDirectoryEntriesDirect(ctx context.Context, client filer_pb.FilerClient, uidGidMapper *meta_cache.UidGidMapper, dirPath util.FullPath, startFileName string, includeStart bool, limit uint32, snapshotTsNs int64, includeSystemEntries bool) (entries []*filer.Entry, actualSnapshotTsNs int64, listed int, last string, err error) {
 	// limit can be a client-supplied resume offset rather than a batch size, so
 	// preallocating for it would size the slice from where the caller happened to
 	// seek. Reserve a batch and let append find the rest.
@@ -494,15 +498,15 @@ func loadDirectoryEntriesDirect(ctx context.Context, client filer_pb.FilerClient
 	if prealloc > batchSize {
 		prealloc = batchSize
 	}
-	entries := make([]*filer.Entry, 0, prealloc)
-	var actualSnapshotTsNs int64
-	err := client.WithFilerClient(false, func(sc filer_pb.SeaweedFilerClient) error {
+	entries = make([]*filer.Entry, 0, prealloc)
+	err = client.WithFilerClient(false, func(sc filer_pb.SeaweedFilerClient) error {
 		// A retried attempt starts its batch over: what an interrupted
 		// stream delivered would otherwise come twice. (Mountable,
 		// writeitai/seaweedfs branch mountable.)
-		entries = entries[:0]
+		entries, listed, last = entries[:0], 0, ""
 		var innerErr error
 		actualSnapshotTsNs, innerErr = filer_pb.DoSeaweedListWithSnapshot(ctx, sc, dirPath, "", func(entry *filer_pb.Entry, isLast bool) error {
+			listed, last = listed+1, entry.Name
 			if !includeSystemEntries && meta_cache.IsHiddenSystemEntry(string(dirPath), entry.Name) {
 				return nil
 			}
@@ -515,7 +519,7 @@ func loadDirectoryEntriesDirect(ctx context.Context, client filer_pb.FilerClient
 		return innerErr
 	})
 	if err != nil {
-		return nil, actualSnapshotTsNs, err
+		return nil, actualSnapshotTsNs, 0, "", err
 	}
-	return entries, actualSnapshotTsNs, nil
+	return entries, actualSnapshotTsNs, listed, last, nil
 }

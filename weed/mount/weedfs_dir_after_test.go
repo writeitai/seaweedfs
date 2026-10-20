@@ -236,3 +236,41 @@ func TestReadDirectoryAfterAsksFitsFirst(t *testing.T) {
 		t.Fatalf("%d entered; b in the table: %v", entered, wfs.inodeToPath.HasPath(dir.Child("b")))
 	}
 }
+
+// A hidden system entry inside a batch does not make the batch look short:
+// listing / with "etc" among 1,500 names returns them all.
+func TestReadDirectoryAfterPagesPastHiddenEntries(t *testing.T) {
+	root := util.FullPath("/")
+	names := []string{"etc"}
+	var visible []string
+	for i := range 1500 {
+		visible = append(visible, fmt.Sprintf("f%04d", i))
+	}
+	names = append(names, visible...)
+	wfs := newPagingWFS(t, util.FullPath("/d"), nil, 0)
+	startFakeFiler(t, wfs, &listFiler{dir: root, names: names})
+	var got []string
+	eof, st := wfs.listDirectAfter(root, "", func(e *filer.Entry) bool {
+		got = append(got, e.Name())
+		return true
+	})
+	if st != fuse.OK || !eof || !slices.Equal(got, visible) {
+		t.Fatalf("status %v, eof %v, %d names of %d", st, eof, len(got), len(visible))
+	}
+}
+
+// An open handle on the inode a listed name maps to lends its attributes
+// only when it holds the same object.
+func TestReadDirectoryAfterOpenEntryOfAnotherObject(t *testing.T) {
+	dir := util.FullPath("/d")
+	wfs := newPagingWFS(t, dir, []string{"a"}, 0)
+	dirInode, _ := wfs.inodeToPath.GetInode(dir)
+	var listed *ListedEntry
+	wfs.ReadDirectoryAfter(dirInode, "", true, nil, func(e *ListedEntry) bool { listed = e; return true })
+	stale := &filer_pb.Entry{Name: "a", Attributes: &filer_pb.FuseAttributes{FileMode: 0o644, FileSize: 4096, Inode: 31337}}
+	wfs.fhMap.AcquireFileHandle(wfs, listed.Inode, stale, 0, 0)
+	wfs.ReadDirectoryAfter(dirInode, "", true, nil, func(e *ListedEntry) bool { listed = e; return true })
+	if listed.Out.Size == 4096 || listed.StoredInode == 31337 {
+		t.Fatalf("listed with another object's attributes: size %d, stored %d", listed.Out.Size, listed.StoredInode)
+	}
+}
