@@ -304,9 +304,9 @@ func TestOverwrittenSinglePathDetaches(t *testing.T) {
 }
 
 // Two inodes carry persisted 77: the original (77) and an unrelated file
-// the probe moved to 78. A link of the original joins the inode known to
-// be a link, never the unrelated one; when neither is known to be, a link
-// joins neither.
+// the probe moved to 78. A link joins the inode of its own group, by
+// HardLinkId; a link of another group, or of a group that cannot be told
+// apart, joins neither. A third collider does not lose the others.
 func TestLinksJoinTheirOwnInode(t *testing.T) {
 	m := NewInodeToPath(util.FullPath("/"), 0)
 	orig := m.Lookup("/orig", 1, false, false, 77, true)
@@ -314,14 +314,55 @@ func TestLinksJoinTheirOwnInode(t *testing.T) {
 	if orig != 77 || unrelated == 77 {
 		t.Fatalf("inodes %d %d", orig, unrelated)
 	}
-	if m.Lookup("/fresh-link", 1, false, true, 77, true) == unrelated {
-		t.Fatal("an unknown link joined the unrelated file")
+	if got := m.LookupLinked("/elsewhere", 1, false, "group-X", 77, true); got == orig || got == unrelated {
+		t.Fatalf("a link of another group joined %d", got)
 	}
-	m.Lookup("/orig", 1, false, true, 77, true) // the original, now a link
-	if got := m.Lookup("/new-link", 1, false, true, 77, true); got != orig {
-		t.Fatalf("the original's new link got %d, want %d", got, orig)
+	m.LookupLinked("/orig", 1, false, "group-O", 77, true) // the original, now a link
+	third := m.Lookup("/third", 1, false, false, 77, true)
+	for _, p := range []util.FullPath{"/new-link", "/another-link"} {
+		if got := m.LookupLinked(p, 1, false, "group-O", 77, true); got != orig {
+			t.Fatalf("%s got %d, want %d", p, got, orig)
+		}
 	}
-	if paths := m.GetAllPaths(unrelated); !slices.Equal(paths, []util.FullPath{"/other"}) {
-		t.Fatalf("the unrelated file gained %v", paths)
+	for _, other := range []uint64{unrelated, third} {
+		if paths := m.GetAllPaths(other); len(paths) != 1 {
+			t.Fatalf("inode %d gained %v", other, paths)
+		}
+	}
+}
+
+// Two hard-link groups that share a legacy persisted inode stay apart.
+func TestDistinctLinkGroupsStayApart(t *testing.T) {
+	m := NewInodeToPath(util.FullPath("/"), 0)
+	a := m.LookupLinked("/a1", 1, false, "A", 4242, true)
+	if m.LookupLinked("/a2", 1, false, "A", 4242, true) != a {
+		t.Fatal("one group got two inodes")
+	}
+	if b := m.LookupLinked("/b1", 1, false, "B", 4242, true); b == a {
+		t.Fatal("two groups were merged")
+	}
+	// /a2 overwritten by a link of group B: detached from A.
+	if m.LookupLinked("/a2", 2, false, "B", 4242, true) == a {
+		t.Fatal("a path now in group B stayed on group A's inode")
+	}
+}
+
+// A path whose object changes type, or stops being a link of a group with
+// other members, is detached even with the same persisted inode; and an
+// inode whose paths are all gone is never joined again.
+func TestSamePersistedInodeOtherObject(t *testing.T) {
+	m := NewInodeToPath(util.FullPath("/"), 0)
+	file := m.Lookup("/x", 1, false, false, 500, true)
+	if dir := m.Lookup("/x", 1, true, false, 500, true); dir == file {
+		t.Fatal("a directory took the file's inode")
+	}
+	link := m.LookupLinked("/l1", 1, false, "L", 600, true)
+	m.LookupLinked("/l2", 1, false, "L", 600, true)
+	if alone := m.Lookup("/l2", 1, false, false, 600, true); alone == link {
+		t.Fatal("a standalone file stayed on the link group's inode")
+	}
+	m.DetachPath(link, "/l1")
+	if again := m.LookupLinked("/l3", 1, false, "L", 600, true); again == link {
+		t.Fatal("a link joined an inode with no path left")
 	}
 }

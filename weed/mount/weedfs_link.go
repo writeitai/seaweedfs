@@ -188,6 +188,7 @@ func (wfs *WFS) Link(cancel <-chan struct{}, in *fuse.LinkIn, name string, out *
 	}
 
 	wfs.inodeToPath.AddPath(sourceInode, newEntryPath)
+	wfs.inodeToPath.SetLinkID(sourceInode, oldEntry.HardLinkId) // Mountable: see LookupLinked
 
 	// Propagate the new HardLinkCounter to sibling cache entries and
 	// invalidate the kernel's inode attr cache. Without this, `stat` on any

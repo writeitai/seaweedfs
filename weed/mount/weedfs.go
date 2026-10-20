@@ -534,6 +534,8 @@ func (wfs *WFS) maybeReadEntry(inode uint64) (path util.FullPath, fh *FileHandle
 // by other names, a surviving alias still holding the object answers
 // instead and becomes the primary path. Concurrent callers converge on the
 // same survivor: one that finds the primary already moved looks again.
+// With no survivor the answer is ENOENT, never the object now at the path,
+// and the path is detached from the inode.
 //
 // Mountable (writeitai/seaweedfs, branch mountable): added for the macOS
 // NFS mount, whose file handles name inodes and must keep working through
@@ -571,12 +573,16 @@ func (wfs *WFS) loadInodeEntry(inode uint64, path util.FullPath) (util.FullPath,
 				// A survivor may be there: an error, not a missing file.
 				return path, nil, entryVersion{}, unknown
 			}
-			break
+			// The object is gone from path, and from every alias: whatever
+			// is there now is another object, never answered for this inode,
+			// and the path no longer leads to it.
+			wfs.inodeToPath.DetachPath(inode, path)
+			return path, nil, entryVersion{}, fuse.ENOENT
 		}
 		path = current
 		entry, version, status = wfs.maybeLoadEntry(path)
 	}
-	return path, entry, version, status
+	return path, nil, entryVersion{}, fuse.ENOENT
 }
 
 // NamespaceEntry is the inode's entry as the namespace has it now: through

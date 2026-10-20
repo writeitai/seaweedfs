@@ -2,9 +2,6 @@ package mount
 
 import (
 	"github.com/seaweedfs/go-fuse/v2/fuse"
-
-	"github.com/seaweedfs/seaweedfs/weed/filer"
-	"github.com/seaweedfs/seaweedfs/weed/glog"
 )
 
 // Lookup is called by the kernel when the VFS wants to know
@@ -28,19 +25,21 @@ func (wfs *WFS) Lookup(cancel <-chan struct{}, header *fuse.InHeader, name strin
 
 	// Use shared lookup logic that checks cache first, then filer if needed
 	localEntry, _, status := wfs.lookupEntry(fullFilePath)
+	if status == fuse.ENOENT {
+		// Gone: the path no longer leads to the inode it named, so a
+		// newcomer there gets an inode of its own (Mountable).
+		if inode, found := wfs.inodeToPath.GetInode(fullFilePath); found {
+			wfs.inodeToPath.DetachPath(inode, fullFilePath)
+		}
+	}
 	if status != fuse.OK {
 		return status
 	}
 
-	inode := wfs.inodeToPath.Lookup(fullFilePath, localEntry.Crtime.Unix(), localEntry.IsDirectory(), len(localEntry.HardLinkId) > 0, localEntry.Inode, true)
+	inode := wfs.inodeToPath.LookupLinked(fullFilePath, localEntry.Crtime.Unix(), localEntry.IsDirectory(), string(localEntry.HardLinkId), localEntry.Inode, true)
 
 	if fh, found := wfs.fhMap.FindFileHandle(inode); found {
-		fh.entryLock.RLock()
-		if entry := fh.GetEntry().GetEntry(); entry != nil {
-			glog.V(4).Infof("lookup opened file %s size %d", dirPath.Child(localEntry.Name()), filer.FileSize(entry))
-			localEntry = filer.FromPbEntry(string(dirPath), entry)
-		}
-		fh.entryLock.RUnlock()
+		localEntry = wfs.openEntry(fh, dirPath, localEntry)
 	}
 
 	wfs.outputFilerEntry(out, inode, localEntry)

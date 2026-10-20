@@ -163,3 +163,44 @@ func TestNamespaceEntryIgnoresOpenHandles(t *testing.T) {
 		t.Fatalf("GetAttr still answers from the open handle: %v", st)
 	}
 }
+
+// Once the primary path holds another object and no link survives, the
+// inode answers ENOENT, never the newcomer, and the path is detached.
+func TestReplacedWithoutSurvivorIsGone(t *testing.T) {
+	wfs, filer, _ := linkedWFS(t)
+	inode := wfs.inodeToPath.Lookup("/d/solo", 1, false, false, 300, true)
+	filer.set("/d/solo", linkEntry("solo", 300, "", "original"))
+	filer.set("/d/solo", linkEntry("solo", 9999, "", "newcomer"))
+	var out fuse.AttrOut
+	if st := wfs.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{NodeId: inode}}, &out); st != fuse.ENOENT {
+		t.Fatalf("GetAttr of the replaced inode: %v, size %d", st, out.Size)
+	}
+	if _, st := wfs.inodeToPath.GetPath(inode); st != fuse.ENOENT {
+		t.Fatal("the path still leads to the replaced inode")
+	}
+	if _, st := wfs.NamespaceEntry(inode); st != fuse.ENOENT {
+		t.Fatalf("NamespaceEntry: %v", st)
+	}
+}
+
+// A lookup that finds the name gone detaches it: a newcomer with the same
+// stored inode gets another inode, not the deleted file's open handle.
+func TestLookupMissDetaches(t *testing.T) {
+	wfs, filer, _ := linkedWFS(t)
+	dir, _ := wfs.inodeToPath.GetInode("/d")
+	filer.set("/d/f", linkEntry("f", 310, "", "original"))
+	var out fuse.EntryOut
+	if st := wfs.Lookup(nil, &fuse.InHeader{NodeId: dir}, "f", &out); st != fuse.OK {
+		t.Fatalf("lookup: %v", st)
+	}
+	old := out.NodeId
+	wfs.fhMap.AcquireFileHandle(wfs, old, linkEntry("f", 310, "", "original"), 0, 0)
+	filer.set("/d/f", nil)
+	if st := wfs.Lookup(nil, &fuse.InHeader{NodeId: dir}, "f", &out); st != fuse.ENOENT {
+		t.Fatalf("lookup of the deleted name: %v", st)
+	}
+	filer.set("/d/f", linkEntry("f", 310, "", "successor"))
+	if st := wfs.Lookup(nil, &fuse.InHeader{NodeId: dir}, "f", &out); st != fuse.OK || out.NodeId == old || out.Size != 9 {
+		t.Fatalf("lookup of the newcomer %v: inode %d (old %d), size %d", st, out.NodeId, old, out.Size)
+	}
+}

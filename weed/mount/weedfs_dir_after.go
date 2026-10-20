@@ -159,10 +159,9 @@ func (wfs *WFS) listEntryAfter(dirPath util.FullPath, entry *filer.Entry, plus b
 		listed.Inode = wfs.inodeToPath.InodeForListing(childPath, entry.Crtime.Unix(), entry.Inode)
 		return add(listed)
 	}
-	isHardlink := len(entry.HardLinkId) > 0
 	// The reference is taken now and given back if add refuses the entry,
 	// so a refused entry leaves nothing behind in the inode table.
-	inode := wfs.inodeToPath.Lookup(childPath, entry.Crtime.Unix(), entry.IsDirectory(), isHardlink, entry.Inode, true)
+	inode := wfs.inodeToPath.LookupLinked(childPath, entry.Crtime.Unix(), entry.IsDirectory(), string(entry.HardLinkId), entry.Inode, true)
 	if fh, found := wfs.fhMap.FindFileHandle(inode); found {
 		entry = wfs.openEntry(fh, dirPath, entry)
 	}

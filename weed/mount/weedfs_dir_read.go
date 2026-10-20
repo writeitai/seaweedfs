@@ -227,7 +227,7 @@ func (wfs *WFS) doReadDirectory(input *fuse.ReadIn, out DirEntrySink, isPlusMode
 		}
 		var inode uint64
 		if takesLookupRef {
-			inode = wfs.inodeToPath.Lookup(childPath, entry.Crtime.Unix(), entry.IsDirectory(), len(entry.HardLinkId) > 0, entry.Inode, false)
+			inode = wfs.inodeToPath.LookupLinked(childPath, entry.Crtime.Unix(), entry.IsDirectory(), string(entry.HardLinkId), entry.Inode, false)
 		} else {
 			inode = wfs.inodeToPath.InodeForListing(childPath, entry.Crtime.Unix(), entry.Inode)
 		}
@@ -247,13 +247,19 @@ func (wfs *WFS) doReadDirectory(input *fuse.ReadIn, out DirEntrySink, isPlusMode
 			}
 			if fh, found := wfs.fhMap.FindFileHandle(inode); found {
 				glog.V(4).Infof("readdir opened file %s", childPath)
-				entry = filer.FromPbEntry(string(dirPath), fh.GetEntry().GetEntry())
+				// Only the entry's own lock: this runs under the meta cache's,
+				// where taking the handle lock could deadlock (Mountable).
+				fh.entry.RLock()
+				if open := fh.entry.Entry; open != nil && (entry.Inode == 0 || open.GetAttributes().GetInode() == entry.Inode) {
+					entry = filer.FromPbEntry(string(dirPath), open)
+				}
+				fh.entry.RUnlock()
 			}
 			wfs.outputFilerEntry(entryOut, inode, entry)
 			// Taken only once the entry is really in the sink, so one that did not
 			// fit leaves no reference behind. The fallback covers a racing Forget.
 			if takesLookupRef && !wfs.inodeToPath.IncrementNlookup(inode) {
-				wfs.inodeToPath.Lookup(childPath, entry.Crtime.Unix(), entry.IsDirectory(), len(entry.HardLinkId) > 0, entry.Inode, true)
+				wfs.inodeToPath.LookupLinked(childPath, entry.Crtime.Unix(), entry.IsDirectory(), string(entry.HardLinkId), entry.Inode, true)
 			}
 		}
 		return true
