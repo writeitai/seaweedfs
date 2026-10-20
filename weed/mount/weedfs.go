@@ -529,9 +529,11 @@ func (wfs *WFS) maybeReadEntry(inode uint64) (path util.FullPath, fh *FileHandle
 }
 
 // loadInodeEntry loads the entry at path, the inode's primary path. When
-// that is gone and the inode is a hard link known by other names, a
-// surviving alias that still holds the same object (its stored inode is
-// this inode) answers instead and becomes the primary path.
+// that path no longer holds the inode's object (gone, or overwritten by
+// another, as its stored inode shows) and the inode is a hard link known
+// by other names, a surviving alias still holding the object answers
+// instead and becomes the primary path. Concurrent callers converge on the
+// same survivor: one that finds the primary already moved looks again.
 //
 // Mountable (writeitai/seaweedfs, branch mountable): added for the macOS
 // NFS mount, whose file handles name inodes and must keep working through
@@ -539,19 +541,40 @@ func (wfs *WFS) maybeReadEntry(inode uint64) (path util.FullPath, fh *FileHandle
 // writeitai/fsit.
 func (wfs *WFS) loadInodeEntry(inode uint64, path util.FullPath) (util.FullPath, *filer_pb.Entry, entryVersion, fuse.Status) {
 	entry, version, status := wfs.maybeLoadEntry(path)
-	if status != fuse.ENOENT {
-		return path, entry, version, status
-	}
-	for _, alias := range wfs.inodeToPath.GetAllPaths(inode) {
-		if alias == path {
-			continue
+	for range 4 {
+		if !notTheInode(inode, entry, status) {
+			return path, entry, version, status
 		}
-		aliasEntry, aliasVersion, aliasStatus := wfs.maybeLoadEntry(alias)
-		if aliasStatus == fuse.OK && aliasEntry.GetAttributes().GetInode() == inode && wfs.inodeToPath.PromotePath(inode, alias) {
-			return alias, aliasEntry, aliasVersion, fuse.OK
+		aliases := wfs.inodeToPath.GetAllPaths(inode)
+		for _, alias := range aliases {
+			if alias == path {
+				continue
+			}
+			aliasEntry, aliasVersion, aliasStatus := wfs.maybeLoadEntry(alias)
+			if !notTheInode(inode, aliasEntry, aliasStatus) && wfs.inodeToPath.PromotePath(inode, path, alias) {
+				return alias, aliasEntry, aliasVersion, aliasStatus
+			}
 		}
+		// No survivor, or another caller moved the primary meanwhile: in
+		// that case, start over from where it is now.
+		current, currentStatus := wfs.inodeToPath.GetPath(inode)
+		if len(aliases) < 2 || currentStatus != fuse.OK || current == path {
+			break
+		}
+		path = current
+		entry, version, status = wfs.maybeLoadEntry(path)
 	}
 	return path, entry, version, status
+}
+
+// notTheInode reports whether a loaded entry is not the inode's object:
+// missing, or storing another inode (the path was overwritten).
+func notTheInode(inode uint64, entry *filer_pb.Entry, status fuse.Status) bool {
+	if status == fuse.ENOENT {
+		return true
+	}
+	stored := entry.GetAttributes().GetInode()
+	return status == fuse.OK && stored != 0 && stored != inode
 }
 
 // isLocalOnlyEntry reports whether entry holds local-only state not yet on the

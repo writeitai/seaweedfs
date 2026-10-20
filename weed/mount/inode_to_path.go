@@ -170,6 +170,18 @@ func (i *InodeToPath) Lookup(path util.FullPath, unixTime int64, isDirectory boo
 	i.Lock()
 	defer i.Unlock()
 	inode, found := i.path2inode[path]
+	if found && possibleInode != 0 && possibleInode != inode {
+		// The path names another object now than the hard link it was an
+		// alias of (overwritten, say by a rename): detach it, so the
+		// newcomer gets its own inode and the surviving links keep theirs.
+		// Mountable, for the macOS NFS mount: design/designs/macos-mount.md §4
+		// in writeitai/fsit.
+		if ie := i.inode2path[inode]; ie != nil && ie.extraPaths != nil && ie.hasPath(path) {
+			ie.removeOnePath(path)
+			delete(i.path2inode, path)
+			found = false
+		}
+	}
 	if !found {
 		if possibleInode == 0 {
 			inode = path.AsInode(unixTime)
@@ -530,25 +542,32 @@ func (i *InodeToPath) AddPath(inode uint64, path util.FullPath) {
 	}
 }
 
-// PromotePath makes alias, one of the inode's extra paths, its primary
-// path, dropping the primary it replaces: the caller found that one gone
-// from the store and alias still holding the object. Used when a hard
-// link's first-seen name was removed while another survives.
+// PromotePath makes alias the inode's primary path in place of gone, which
+// the caller found no longer holding the object (removed, or overwritten
+// by another), and drops gone. It is idempotent: when a concurrent caller
+// already made alias primary, it only drops gone if still there. It fails,
+// and the caller should look again, when the primary is neither gone nor
+// alias, or alias is not one of the inode's paths.
 //
 // Mountable (writeitai/seaweedfs, branch mountable): added for the macOS
 // NFS mount, whose file handles name inodes and must keep working through
 // a surviving hard link. See design/designs/macos-mount.md §4 in
 // writeitai/fsit.
-func (i *InodeToPath) PromotePath(inode uint64, alias util.FullPath) bool {
+func (i *InodeToPath) PromotePath(inode uint64, gone, alias util.FullPath) bool {
 	i.Lock()
 	defer i.Unlock()
 	ie, found := i.inode2path[inode]
-	if !found || ie.path == alias || !ie.hasPath(alias) {
+	if !found || gone == alias || !ie.hasPath(alias) || ie.path != gone && ie.path != alias {
 		return false
 	}
-	gone := ie.path
-	ie.removeOnePath(alias)
-	ie.replacePath(ie.path, alias)
+	paths := []util.FullPath{alias}
+	for _, p := range ie.appendPaths(nil) {
+		if p != alias && p != gone {
+			paths = append(paths, p)
+		}
+	}
+	ie.path = alias
+	ie.setExtraPaths(paths[1:])
 	if i.path2inode[gone] == inode {
 		delete(i.path2inode, gone)
 	}
