@@ -542,47 +542,73 @@ func (wfs *WFS) maybeReadEntry(inode uint64) (path util.FullPath, fh *FileHandle
 // a surviving hard link. See design/designs/macos-mount.md §4 in
 // writeitai/fsit.
 func (wfs *WFS) loadInodeEntry(inode uint64, path util.FullPath) (util.FullPath, *filer_pb.Entry, entryVersion, fuse.Status) {
-	persisted := wfs.inodeToPath.PersistedInode(inode)
+	persisted, isDirectory, linkID := wfs.inodeToPath.Identity(inode)
+	nlookup := wfs.inodeToPath.Lookups(inode)
+	gone := func(entry *filer_pb.Entry, status fuse.Status) bool {
+		return notTheObject(persisted, isDirectory, linkID, entry, status)
+	}
 	entry, version, status := wfs.maybeLoadEntry(path)
+	invalid := map[util.FullPath]bool{} // conclusively not the object
 	for range 4 {
-		if !gone(persisted, entry, status) {
+		if !gone(entry, status) {
 			return path, entry, version, status
 		}
+		invalid[path] = true
 		aliases := wfs.inodeToPath.GetAllPaths(inode)
 		unknown := fuse.OK // an alias that could not be checked
 		for _, alias := range aliases {
-			if alias == path {
+			if alias == path || invalid[alias] {
 				continue
 			}
 			aliasEntry, aliasVersion, aliasStatus := wfs.maybeLoadEntry(alias)
 			switch {
-			case aliasStatus == fuse.OK && aliasEntry.GetAttributes().GetInode() == persisted:
+			case !gone(aliasEntry, aliasStatus) && aliasStatus == fuse.OK:
 				// Only a verified survivor stands in for the object.
 				if wfs.inodeToPath.PromotePath(inode, path, alias) {
 					return alias, aliasEntry, aliasVersion, aliasStatus
 				}
 			case aliasStatus != fuse.OK && aliasStatus != fuse.ENOENT:
 				unknown = aliasStatus
+			default:
+				invalid[alias] = true
 			}
 		}
 		// No survivor, or another caller moved the primary meanwhile: in
 		// that case, start over from where it is now.
 		current, currentStatus := wfs.inodeToPath.GetPath(inode)
-		if len(aliases) < 2 || currentStatus != fuse.OK || current == path {
+		if currentStatus != fuse.OK || invalid[current] || current == path {
 			if unknown != fuse.OK {
 				// A survivor may be there: an error, not a missing file.
 				return path, nil, entryVersion{}, unknown
 			}
-			// The object is gone from path, and from every alias: whatever
+			// The object is gone from path and from every alias: whatever
 			// is there now is another object, never answered for this inode,
-			// and the path no longer leads to it.
-			wfs.inodeToPath.DetachPath(inode, path)
+			// and none of those paths leads to the inode any more, unless a
+			// lookup bound one again meanwhile.
+			for p := range invalid {
+				wfs.inodeToPath.DetachPathIf(inode, nlookup, p)
+			}
 			return path, nil, entryVersion{}, fuse.ENOENT
 		}
 		path = current
 		entry, version, status = wfs.maybeLoadEntry(path)
 	}
 	return path, nil, entryVersion{}, fuse.ENOENT
+}
+
+// notTheObject reports whether a loaded entry is not the object with that
+// identity: missing, or another object, as its persisted inode, its type or
+// its hard-link group shows. An error proves nothing either way.
+func notTheObject(persisted uint64, isDirectory bool, linkID string, entry *filer_pb.Entry, status fuse.Status) bool {
+	if status == fuse.ENOENT {
+		return true
+	}
+	if status != fuse.OK {
+		return false
+	}
+	stored := entry.GetAttributes().GetInode()
+	return stored != 0 && stored != persisted || entry.GetIsDirectory() != isDirectory ||
+		linkID != "" && string(entry.GetHardLinkId()) != linkID
 }
 
 // NamespaceEntry is the inode's entry as the namespace has it now: through
@@ -600,17 +626,6 @@ func (wfs *WFS) NamespaceEntry(inode uint64) (*filer_pb.Entry, fuse.Status) {
 	}
 	_, entry, _, status := wfs.loadInodeEntry(inode, path)
 	return entry, status
-}
-
-// gone reports whether a loaded entry is not the object with the persisted
-// inode: missing, or storing another inode (the path was overwritten).
-// An error proves nothing either way.
-func gone(persisted uint64, entry *filer_pb.Entry, status fuse.Status) bool {
-	if status == fuse.ENOENT {
-		return true
-	}
-	stored := entry.GetAttributes().GetInode()
-	return status == fuse.OK && stored != 0 && stored != persisted
 }
 
 // isLocalOnlyEntry reports whether entry holds local-only state not yet on the

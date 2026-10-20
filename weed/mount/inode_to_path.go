@@ -640,8 +640,7 @@ func (i *InodeToPath) PersistedInode(inode uint64) uint64 {
 
 // replacedLocked reports whether path, mapped to inode, now holds another
 // object than inode's: another persisted inode, another type, a hard link
-// of another group, or a standalone file where a group with other members
-// was.
+// of another group, or a standalone file where a hard link was.
 func (i *InodeToPath) replacedLocked(inode uint64, path util.FullPath, isDirectory bool, linkID string, possibleInode uint64) bool {
 	if inode == 1 {
 		return false
@@ -655,12 +654,71 @@ func (i *InodeToPath) replacedLocked(inode uint64, path util.FullPath, isDirecto
 	known, link := i.linkIDs[inode]
 	switch {
 	case linkID == "":
-		ie := i.inode2path[inode]
-		return link && ie != nil && len(ie.appendPaths(nil)) > 1
+		return link // a standalone file where a hard link was
 	case linkID != unknownLink && link && known != unknownLink:
 		return known != linkID
 	}
 	return false
+}
+
+// Identity is what InodeToPath knows of the object at inode: its persisted
+// inode, whether it is a directory, and its hard-link group ("" when not
+// known to be a hard link, or of unknown group).
+//
+// Mountable (writeitai/seaweedfs, branch mountable): so resolving an inode
+// and reading it can tell its object from another one with the same
+// persisted number.
+func (i *InodeToPath) Identity(inode uint64) (persisted uint64, isDirectory bool, linkID string) {
+	i.RLock()
+	defer i.RUnlock()
+	_, isDirectory = i.dirStates[inode]
+	if known := i.linkIDs[inode]; known != unknownLink {
+		linkID = known
+	}
+	return i.persistedLocked(inode), isDirectory, linkID
+}
+
+// Binding is the inode path leads to, with that inode's lookup count: a
+// caller about to act on what a lookup found passes it to DetachPathIf.
+//
+// Mountable (writeitai/seaweedfs, branch mountable).
+func (i *InodeToPath) Binding(path util.FullPath) (inode, nlookup uint64, found bool) {
+	i.RLock()
+	defer i.RUnlock()
+	inode, found = i.path2inode[path]
+	if ie := i.inode2path[inode]; found && ie != nil {
+		nlookup = ie.nlookup
+	}
+	return inode, nlookup, found
+}
+
+// Lookups is the inode's lookup count, for DetachPathIf.
+//
+// Mountable (writeitai/seaweedfs, branch mountable).
+func (i *InodeToPath) Lookups(inode uint64) uint64 {
+	i.RLock()
+	defer i.RUnlock()
+	if ie := i.inode2path[inode]; ie != nil {
+		return ie.nlookup
+	}
+	return 0
+}
+
+// DetachPathIf is DetachPath for a caller that found path not leading to
+// the object any more, given the inode's lookup count when it looked: a
+// lookup since then (or a forget) may have bound the path again, so it
+// detaches nothing then. A slow caller never undoes a newer lookup.
+//
+// Mountable (writeitai/seaweedfs, branch mountable).
+func (i *InodeToPath) DetachPathIf(inode, nlookup uint64, path util.FullPath) bool {
+	i.Lock()
+	defer i.Unlock()
+	ie := i.inode2path[inode]
+	if inode == 1 || ie == nil || ie.nlookup != nlookup {
+		return false
+	}
+	i.detachPathLocked(inode, path)
+	return true
 }
 
 // linkGroupLocked finds the inode a hard link with that persisted number
@@ -757,6 +815,10 @@ func (i *InodeToPath) DetachPath(inode uint64, path util.FullPath) {
 	if inode == 1 {
 		return
 	}
+	i.detachPathLocked(inode, path)
+}
+
+func (i *InodeToPath) detachPathLocked(inode uint64, path util.FullPath) {
 	if i.path2inode[path] == inode {
 		delete(i.path2inode, path)
 	}

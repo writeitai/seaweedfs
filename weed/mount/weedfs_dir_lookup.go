@@ -23,14 +23,16 @@ func (wfs *WFS) Lookup(cancel <-chan struct{}, header *fuse.InHeader, name strin
 
 	fullFilePath := dirPath.Child(name)
 
+	// What the path led to before asking, so a miss detaches only that, and
+	// never a binding a newer lookup made meanwhile (Mountable).
+	before, nlookup, bound := wfs.inodeToPath.Binding(fullFilePath)
+
 	// Use shared lookup logic that checks cache first, then filer if needed
 	localEntry, _, status := wfs.lookupEntry(fullFilePath)
-	if status == fuse.ENOENT {
+	if status == fuse.ENOENT && bound {
 		// Gone: the path no longer leads to the inode it named, so a
 		// newcomer there gets an inode of its own (Mountable).
-		if inode, found := wfs.inodeToPath.GetInode(fullFilePath); found {
-			wfs.inodeToPath.DetachPath(inode, fullFilePath)
-		}
+		wfs.inodeToPath.DetachPathIf(before, nlookup, fullFilePath)
 	}
 	if status != fuse.OK {
 		return status

@@ -3,6 +3,7 @@ package mount
 import (
 	"context"
 	"sync"
+	"syscall"
 	"testing"
 
 	"github.com/seaweedfs/go-fuse/v2/fuse"
@@ -18,6 +19,9 @@ type linkFiler struct {
 	mu      sync.Mutex
 	entries map[util.FullPath]*filer_pb.Entry
 	broken  map[util.FullPath]bool // answered with an internal error
+	// delay, if set, runs under mu once a lookup has its answer, before it
+	// returns it.
+	delay func(util.FullPath)
 }
 
 func (f *linkFiler) set(p util.FullPath, e *filer_pb.Entry) {
@@ -33,10 +37,15 @@ func (f *linkFiler) set(p util.FullPath, e *filer_pb.Entry) {
 func (f *linkFiler) LookupDirectoryEntry(_ context.Context, r *filer_pb.LookupDirectoryEntryRequest) (*filer_pb.LookupDirectoryEntryResponse, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.broken[util.FullPath(r.Directory).Child(r.Name)] {
+	p := util.FullPath(r.Directory).Child(r.Name)
+	if f.broken[p] {
 		return nil, status.Error(codes.Internal, "disk on fire")
 	}
-	if e := f.entries[util.FullPath(r.Directory).Child(r.Name)]; e != nil {
+	e := f.entries[p]
+	if f.delay != nil {
+		f.delay(p)
+	}
+	if e != nil {
 		return &filer_pb.LookupDirectoryEntryResponse{Entry: e}, nil
 	}
 	return nil, status.Error(codes.NotFound, filer_pb.ErrNotFound.Error())
@@ -63,7 +72,7 @@ func linkedWFS(t *testing.T) (*WFS, *linkFiler, uint64) {
 	startFakeFiler(t, wfs, filer)
 	for _, name := range []string{"one", "two", "three"} {
 		filer.set(dir.Child(name), linkEntry(name, 4242, "link", "shared"))
-		wfs.inodeToPath.Lookup(dir.Child(name), 1, false, true, 4242, true)
+		wfs.inodeToPath.LookupLinked(dir.Child(name), 1, false, "link", 4242, true)
 	}
 	return wfs, filer, 4242
 }
@@ -202,5 +211,120 @@ func TestLookupMissDetaches(t *testing.T) {
 	filer.set("/d/f", linkEntry("f", 310, "", "successor"))
 	if st := wfs.Lookup(nil, &fuse.InHeader{NodeId: dir}, "f", &out); st != fuse.OK || out.NodeId == old || out.Size != 9 {
 		t.Fatalf("lookup of the newcomer %v: inode %d (old %d), size %d", st, out.NodeId, old, out.Size)
+	}
+}
+
+// Another hard-link group with the same legacy stored inode overwrites the
+// primary: that is not the object, so the inode resolves through its
+// survivor, a fresh open reads the survivor's bytes, and a handle holding
+// the other group reads nothing.
+func TestOverwrittenByAnotherLinkGroup(t *testing.T) {
+	wfs, filer, inode := linkedWFS(t)
+	filer.set("/d/one", linkEntry("one", 4242, "other", "intruder"))
+	var out fuse.AttrOut
+	if st := wfs.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{NodeId: inode}}, &out); st != fuse.OK || out.Size != 6 {
+		t.Fatalf("GetAttr %v: size %d", st, out.Size)
+	}
+	if p, _ := wfs.inodeToPath.GetPath(inode); p != "/d/two" {
+		t.Fatalf("primary %s", p)
+	}
+	wfs.openMtimeCache = map[uint64][2]int64{}
+	var opened fuse.OpenOut
+	if st := wfs.Open(nil, &fuse.OpenIn{InHeader: fuse.InHeader{NodeId: inode}}, &opened); st != fuse.OK {
+		t.Fatalf("Open: %v", st)
+	}
+	buf := make([]byte, 16)
+	in := &fuse.ReadIn{InHeader: fuse.InHeader{NodeId: inode}, Fh: opened.Fh, Size: 16}
+	r, st := wfs.ReadAs(nil, in, buf, 4242)
+	if st != fuse.OK {
+		t.Fatalf("ReadAs: %v", st)
+	}
+	if data, _ := r.Bytes(buf); string(data) != "shared" {
+		t.Fatalf("read %q", data)
+	}
+	wfs.GetHandle(FileHandleId(opened.Fh)).SetEntry(linkEntry("one", 4242, "other", "intruder"))
+	if _, st := wfs.ReadAs(nil, in, buf, 4242); st != fuse.Status(syscall.ESTALE) {
+		t.Fatalf("ReadAs of the other group: %v", st)
+	}
+}
+
+// Every link deleted while a handle holds the file open: once that is
+// established, none of the names leads to the inode any more, so a file
+// recreated at one of them with the same stored inode is another inode.
+func TestEveryLinkGoneDetachesThemAll(t *testing.T) {
+	wfs, filer, inode := linkedWFS(t)
+	wfs.fhMap.AcquireFileHandle(wfs, inode, linkEntry("one", inode, "link", "shared"), 0, 0)
+	for _, name := range []string{"one", "two", "three"} {
+		filer.set(util.FullPath("/d").Child(name), nil)
+	}
+	dir, _ := wfs.inodeToPath.GetInode("/d")
+	var entry fuse.EntryOut
+	if st := wfs.Lookup(nil, &fuse.InHeader{NodeId: dir}, "one", &entry); st != fuse.ENOENT {
+		t.Fatalf("Lookup of a deleted link: %v", st)
+	}
+	if _, st := wfs.NamespaceEntry(inode); st != fuse.ENOENT {
+		t.Fatalf("NamespaceEntry: %v", st)
+	}
+	if paths := wfs.inodeToPath.GetAllPaths(inode); len(paths) != 0 {
+		t.Fatalf("still leads to the inode: %v", paths)
+	}
+	filer.set("/d/three", linkEntry("three", 4242, "", "newcomer"))
+	if st := wfs.Lookup(nil, &fuse.InHeader{NodeId: dir}, "three", &entry); st != fuse.OK || entry.NodeId == inode || entry.Size != 8 {
+		t.Fatalf("Lookup of the newcomer %v: inode %d (old %d), size %d", st, entry.NodeId, inode, entry.Size)
+	}
+}
+
+// A standalone file where a hard link was is another object, even when the
+// link is the only name of its inode the mount knows.
+func TestStandaloneWhereALinkWas(t *testing.T) {
+	wfs, filer, _ := linkedWFS(t)
+	inode := wfs.inodeToPath.LookupLinked("/d/solo", 1, false, "solo-link", 500, true)
+	filer.set("/d/solo", linkEntry("solo", 500, "", "newcomer"))
+	dir, _ := wfs.inodeToPath.GetInode("/d")
+	var entry fuse.EntryOut
+	if st := wfs.Lookup(nil, &fuse.InHeader{NodeId: dir}, "solo", &entry); st != fuse.OK || entry.NodeId == inode {
+		t.Fatalf("Lookup %v: inode %d (old %d)", st, entry.NodeId, inode)
+	}
+}
+
+// A lookup's miss detaches only the binding it saw: a lookup that found the
+// file meanwhile and bound the name again keeps it.
+func TestDelayedLookupMissKeepsANewerLookup(t *testing.T) {
+	wfs, filer, _ := linkedWFS(t)
+	dir, _ := wfs.inodeToPath.GetInode("/d")
+	filer.set("/d/f", linkEntry("f", 320, "", "content"))
+	var out fuse.EntryOut
+	if st := wfs.Lookup(nil, &fuse.InHeader{NodeId: dir}, "f", &out); st != fuse.OK {
+		t.Fatalf("lookup: %v", st)
+	}
+	inode := out.NodeId
+	// The slow lookup's filer answers "not found", then waits.
+	answered, release := make(chan struct{}), make(chan struct{})
+	filer.mu.Lock()
+	filer.entries["/d/f"] = nil
+	filer.delay = func(p util.FullPath) {
+		filer.delay = nil
+		filer.mu.Unlock()
+		close(answered)
+		<-release
+		filer.mu.Lock()
+	}
+	filer.mu.Unlock()
+	slow := make(chan fuse.Status, 1)
+	go func() {
+		var out fuse.EntryOut
+		slow <- wfs.Lookup(nil, &fuse.InHeader{NodeId: dir}, "f", &out)
+	}()
+	<-answered
+	filer.set("/d/f", linkEntry("f", 320, "", "content"))
+	if st := wfs.Lookup(nil, &fuse.InHeader{NodeId: dir}, "f", &out); st != fuse.OK || out.NodeId != inode {
+		t.Fatalf("lookup meanwhile %v: inode %d (was %d)", st, out.NodeId, inode)
+	}
+	close(release)
+	if st := <-slow; st != fuse.ENOENT {
+		t.Fatalf("slow lookup: %v", st)
+	}
+	if p, st := wfs.inodeToPath.GetPath(inode); st != fuse.OK || p != "/d/f" {
+		t.Fatalf("the newer lookup's binding was undone: %s, %v", p, st)
 	}
 }
