@@ -366,3 +366,24 @@ func TestSamePersistedInodeOtherObject(t *testing.T) {
 		t.Fatal("a link joined an inode with no path left")
 	}
 }
+
+// A hard link where a standalone file was, while another inode holds the
+// link's group, is a replacement: the path joins that group's inode, so
+// the group stays one inode.
+func TestLinkWhereAStandaloneFileWas(t *testing.T) {
+	m := NewInodeToPath(util.FullPath("/"), 0)
+	alone := m.LookupLinked("/g", 1, false, "", 4242, true)
+	group := m.LookupLinked("/h", 1, false, "L", 4242, true)
+	if group == alone {
+		t.Fatal("the link joined a standalone file")
+	}
+	if !m.Holds(alone, false, "", 4242) || m.Holds(alone, false, "L", 4242) {
+		t.Fatal("Holds disagrees with the lookups")
+	}
+	if got := m.LookupLinked("/g", 1, false, "L", 4242, true); got != group {
+		t.Fatalf("/g now on %d, want the group's %d", got, group)
+	}
+	if paths := m.GetAllPaths(alone); len(paths) != 0 {
+		t.Fatalf("the standalone file's inode still has %v", paths)
+	}
+}

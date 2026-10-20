@@ -20,9 +20,9 @@ import (
 )
 
 // ReadAs is Read for a caller that expects the handle to hold the object
-// whose stored inode is storedInode (and, for a hard link, of the group
-// the inode is known by): if it holds another, the answer is ESTALE and
-// nothing is read.
+// whose stored inode is storedInode, and that is the inode's object by
+// InodeToPath.Holds: if it holds another, the answer is ESTALE and nothing
+// is read.
 func (wfs *WFS) ReadAs(cancel <-chan struct{}, in *fuse.ReadIn, buff []byte, storedInode uint64) (fuse.ReadResult, fuse.Status) {
 	fh := wfs.GetHandle(FileHandleId(in.Fh))
 	if fh == nil {
@@ -31,14 +31,14 @@ func (wfs *WFS) ReadAs(cancel <-chan struct{}, in *fuse.ReadIn, buff []byte, sto
 	fhActiveLock := fh.wfs.fhLockTable.AcquireLock("ReadAs", fh.fh, util.SharedLock)
 	defer fh.wfs.fhLockTable.ReleaseLock(fh.fh, fhActiveLock)
 
-	// The object is told apart by its persisted inode and, for a hard
-	// link, its group, as loadInodeEntry does.
-	_, _, linkID := wfs.inodeToPath.Identity(in.NodeId)
+	// The handle holds the object only if its entry is the inode's by the
+	// identity rule, with the stored inode the caller expects.
 	fh.entry.RLock()
-	stored := fh.entry.Entry.GetAttributes().GetInode()
-	group := string(fh.entry.Entry.GetHardLinkId())
+	entry := fh.entry.Entry
+	stored := entry.GetAttributes().GetInode()
+	holds := entry != nil && wfs.inodeToPath.HoldsEntry(in.NodeId, entry)
 	fh.entry.RUnlock()
-	if stored != 0 && stored != storedInode || linkID != "" && group != linkID {
+	if !holds || stored != 0 && stored != storedInode {
 		return nil, fuse.Status(syscall.ESTALE)
 	}
 

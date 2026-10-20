@@ -12,6 +12,7 @@ package mount
 // "Directories", in writeitai/fsit.
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"strings"
@@ -183,10 +184,15 @@ func (wfs *WFS) openEntry(fh *FileHandle, dirPath util.FullPath, listed *filer.E
 	defer wfs.fhLockTable.ReleaseLock(fh.fh, fhActiveLock)
 	fh.entry.RLock()
 	defer fh.entry.RUnlock()
-	// The handle's view counts only if it is the same object: an open
-	// handle can outlive the file that held this name.
-	if fh.entry.Entry == nil || listed.Inode != 0 && fh.entry.Entry.GetAttributes().GetInode() != listed.Inode {
+	// The handle's view counts only if it is the listed object, the
+	// inode's by the identity rule: an open handle can outlive the file
+	// that held this name. Stored inode, type and hard-link group must all
+	// agree.
+	open := fh.entry.Entry
+	if open == nil || !wfs.inodeToPath.Holds(fh.inode, listed.IsDirectory(), string(listed.HardLinkId), listed.Inode) ||
+		listed.Inode != 0 && open.GetAttributes().GetInode() != listed.Inode ||
+		open.GetIsDirectory() != listed.IsDirectory() || !bytes.Equal(open.GetHardLinkId(), listed.HardLinkId) {
 		return listed
 	}
-	return filer.FromPbEntry(string(dirPath), fh.entry.Entry)
+	return filer.FromPbEntry(string(dirPath), open)
 }

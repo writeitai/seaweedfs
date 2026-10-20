@@ -542,10 +542,11 @@ func (wfs *WFS) maybeReadEntry(inode uint64) (path util.FullPath, fh *FileHandle
 // a surviving hard link. See design/designs/macos-mount.md §4 in
 // writeitai/fsit.
 func (wfs *WFS) loadInodeEntry(inode uint64, path util.FullPath) (util.FullPath, *filer_pb.Entry, entryVersion, fuse.Status) {
-	persisted, isDirectory, linkID := wfs.inodeToPath.Identity(inode)
 	nlookup := wfs.inodeToPath.Lookups(inode)
+	// gone: missing, or another object by the identity rule. An error
+	// proves nothing either way.
 	gone := func(entry *filer_pb.Entry, status fuse.Status) bool {
-		return notTheObject(persisted, isDirectory, linkID, entry, status)
+		return status == fuse.ENOENT || status == fuse.OK && !wfs.inodeToPath.HoldsEntry(inode, entry)
 	}
 	entry, version, status := wfs.maybeLoadEntry(path)
 	invalid := map[util.FullPath]bool{} // conclusively not the object
@@ -594,21 +595,6 @@ func (wfs *WFS) loadInodeEntry(inode uint64, path util.FullPath) (util.FullPath,
 		entry, version, status = wfs.maybeLoadEntry(path)
 	}
 	return path, nil, entryVersion{}, fuse.ENOENT
-}
-
-// notTheObject reports whether a loaded entry is not the object with that
-// identity: missing, or another object, as its persisted inode, its type or
-// its hard-link group shows. An error proves nothing either way.
-func notTheObject(persisted uint64, isDirectory bool, linkID string, entry *filer_pb.Entry, status fuse.Status) bool {
-	if status == fuse.ENOENT {
-		return true
-	}
-	if status != fuse.OK {
-		return false
-	}
-	stored := entry.GetAttributes().GetInode()
-	return stored != 0 && stored != persisted || entry.GetIsDirectory() != isDirectory ||
-		linkID != "" && string(entry.GetHardLinkId()) != linkID
 }
 
 // NamespaceEntry is the inode's entry as the namespace has it now: through

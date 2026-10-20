@@ -328,3 +328,18 @@ func TestDelayedLookupMissKeepsANewerLookup(t *testing.T) {
 		t.Fatalf("the newer lookup's binding was undone: %s, %v", p, st)
 	}
 }
+
+// A survivor of another group with the same stored inode is passed over
+// for one of the object's own.
+func TestSurvivorOfAnotherGroupIsPassedOver(t *testing.T) {
+	wfs, filer, inode := linkedWFS(t)
+	filer.set("/d/one", nil)
+	filer.set("/d/two", linkEntry("two", 4242, "other", "intruder"))
+	var out fuse.AttrOut
+	if st := wfs.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{NodeId: inode}}, &out); st != fuse.OK || out.Size != 6 {
+		t.Fatalf("GetAttr %v: size %d", st, out.Size)
+	}
+	if p, _ := wfs.inodeToPath.GetPath(inode); p != "/d/three" {
+		t.Fatalf("promoted %s", p)
+	}
+}

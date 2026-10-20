@@ -7,6 +7,7 @@ import (
 
 	"github.com/seaweedfs/go-fuse/v2/fuse"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
@@ -206,7 +207,7 @@ func (i *InodeToPath) LookupLinked(path util.FullPath, unixTime int64, isDirecto
 	defer i.Unlock()
 	isHardlink := linkID != ""
 	inode, found := i.path2inode[path]
-	if found && i.replacedLocked(inode, path, isDirectory, linkID, possibleInode) {
+	if found && i.replacedLocked(inode, isDirectory, linkID, possibleInode) {
 		// Detach it: the newcomer gets its own inode, and the old one keeps
 		// only its other links, or none.
 		if ie := i.inode2path[inode]; ie != nil && ie.hasPath(path) {
@@ -638,10 +639,13 @@ func (i *InodeToPath) PersistedInode(inode uint64) uint64 {
 	return i.persistedLocked(inode)
 }
 
-// replacedLocked reports whether path, mapped to inode, now holds another
+// replacedLocked reports whether an entry of that type, hard-link group
+// (HardLinkId, "" for none) and persisted inode (0 for none) is another
 // object than inode's: another persisted inode, another type, a hard link
-// of another group, or a standalone file where a hard link was.
-func (i *InodeToPath) replacedLocked(inode uint64, path util.FullPath, isDirectory bool, linkID string, possibleInode uint64) bool {
+// of another group, a standalone file where a hard link was (SeaweedFS
+// never clears an entry's HardLinkId), or a hard link where a standalone
+// file was while another inode holds that link's group.
+func (i *InodeToPath) replacedLocked(inode uint64, isDirectory bool, linkID string, possibleInode uint64) bool {
 	if inode == 1 {
 		return false
 	}
@@ -654,28 +658,32 @@ func (i *InodeToPath) replacedLocked(inode uint64, path util.FullPath, isDirecto
 	known, link := i.linkIDs[inode]
 	switch {
 	case linkID == "":
-		return link // a standalone file where a hard link was
-	case linkID != unknownLink && link && known != unknownLink:
+		return link
+	case !link:
+		other, joined := i.linkGroupLocked(i.persistedLocked(inode), linkID)
+		return joined && other != inode
+	case linkID != unknownLink && known != unknownLink:
 		return known != linkID
 	}
 	return false
 }
 
-// Identity is what InodeToPath knows of the object at inode: its persisted
-// inode, whether it is a directory, and its hard-link group ("" when not
-// known to be a hard link, or of unknown group).
+// Holds reports whether an entry of that type, hard-link group and
+// persisted inode is the object at inode. It is the one identity rule:
+// LookupLinked detaches a path whose entry fails it, and resolving an
+// inode, reading it, and lending an open handle's entry all go by it.
 //
-// Mountable (writeitai/seaweedfs, branch mountable): so resolving an inode
-// and reading it can tell its object from another one with the same
-// persisted number.
-func (i *InodeToPath) Identity(inode uint64) (persisted uint64, isDirectory bool, linkID string) {
+// Mountable (writeitai/seaweedfs, branch mountable): see
+// design/designs/macos-mount.md §4 in writeitai/fsit.
+func (i *InodeToPath) Holds(inode uint64, isDirectory bool, linkID string, persisted uint64) bool {
 	i.RLock()
 	defer i.RUnlock()
-	_, isDirectory = i.dirStates[inode]
-	if known := i.linkIDs[inode]; known != unknownLink {
-		linkID = known
-	}
-	return i.persistedLocked(inode), isDirectory, linkID
+	return !i.replacedLocked(inode, isDirectory, linkID, persisted)
+}
+
+// HoldsEntry is Holds for a filer entry.
+func (i *InodeToPath) HoldsEntry(inode uint64, entry *filer_pb.Entry) bool {
+	return i.Holds(inode, entry.GetIsDirectory(), string(entry.GetHardLinkId()), entry.GetAttributes().GetInode())
 }
 
 // Binding is the inode path leads to, with that inode's lookup count: a

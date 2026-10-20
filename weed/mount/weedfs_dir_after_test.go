@@ -274,3 +274,20 @@ func TestReadDirectoryAfterOpenEntryOfAnotherObject(t *testing.T) {
 		t.Fatalf("listed with another object's attributes: size %d, stored %d", listed.Out.Size, listed.StoredInode)
 	}
 }
+
+// Nor does a handle holding another hard-link group with the same stored
+// inode lend its attributes.
+func TestReadDirectoryAfterOpenEntryOfAnotherGroup(t *testing.T) {
+	dir := util.FullPath("/d")
+	wfs := newPagingWFS(t, dir, []string{"a"}, 0)
+	dirInode, _ := wfs.inodeToPath.GetInode(dir)
+	var listed *ListedEntry
+	wfs.ReadDirectoryAfter(dirInode, "", true, nil, func(e *ListedEntry) bool { listed = e; return true })
+	other := &filer_pb.Entry{Name: "a", HardLinkId: []byte("other"), HardLinkCounter: 2,
+		Attributes: &filer_pb.FuseAttributes{FileMode: 0o644, FileSize: 4096, Inode: listed.StoredInode}}
+	wfs.fhMap.AcquireFileHandle(wfs, listed.Inode, other, 0, 0)
+	wfs.ReadDirectoryAfter(dirInode, "", true, nil, func(e *ListedEntry) bool { listed = e; return true })
+	if listed.Out.Size == 4096 {
+		t.Fatal("listed with another group's attributes")
+	}
+}
