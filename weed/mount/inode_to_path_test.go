@@ -258,3 +258,28 @@ func TestOverwrittenAliasLeavesTheLink(t *testing.T) {
 		t.Fatalf("the link's paths %v", paths)
 	}
 }
+
+// A file whose persisted inode the collision probe moved (77 taken, so 78)
+// becomes a hard link: its links, which persist 77, all stay on 78 and are
+// never merged into the unrelated 77.
+func TestProbedInodeThroughLinks(t *testing.T) {
+	m := NewInodeToPath(util.FullPath("/"), 0)
+	other := m.Lookup("/x", 1, false, false, 77, true)
+	file := m.Lookup("/f", 1, false, false, 77, true)
+	if other != 77 || file == 77 || m.PersistedInode(file) != 77 || m.PersistedInode(other) != 77 {
+		t.Fatalf("inodes %d %d, persisted %d", other, file, m.PersistedInode(file))
+	}
+	m.AddPath(file, "/g") // LINK
+	for _, p := range []util.FullPath{"/f", "/g", "/h"} {
+		if got := m.Lookup(p, 1, false, true, 77, true); got != file {
+			t.Fatalf("%s: inode %d, want %d", p, got, file)
+		}
+	}
+	if paths := m.GetAllPaths(other); !slices.Equal(paths, []util.FullPath{"/x"}) {
+		t.Fatalf("the unrelated inode gained %v", paths)
+	}
+	m.Forget(file, 5, nil, nil)
+	if m.PersistedInode(file) != file {
+		t.Fatal("the probe's record outlived the inode")
+	}
+}

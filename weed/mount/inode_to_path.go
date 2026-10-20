@@ -22,6 +22,13 @@ type InodeToPath struct {
 	// dirPaths indexes the same states by path, so a directory lookup never
 	// goes through the map that holds one full path per inode.
 	dirPaths map[util.FullPath]*dirState
+	// stored and probed relate an inode Lookup's collision probe moved away
+	// from the entry's persisted inode to that persisted one, and back.
+	// Sparse: only probed inodes are in them. Mountable (writeitai/seaweedfs,
+	// branch mountable), so hard-link recovery compares persisted identities
+	// with persisted identities; see PersistedInode.
+	stored map[uint64]uint64
+	probed map[uint64]uint64
 }
 
 // InodeEntry exists per inode the kernel references. Directory cache state is
@@ -174,7 +181,7 @@ func (i *InodeToPath) Lookup(path util.FullPath, unixTime int64, isDirectory boo
 	i.Lock()
 	defer i.Unlock()
 	inode, found := i.path2inode[path]
-	if found && possibleInode != 0 && possibleInode != inode {
+	if found && possibleInode != 0 && possibleInode != i.persistedLocked(inode) {
 		// The path names another object now than the hard link it was an
 		// alias of (overwritten, say by a rename): detach it, so the
 		// newcomer gets its own inode and the surviving links keep theirs.
@@ -191,11 +198,24 @@ func (i *InodeToPath) Lookup(path util.FullPath, unixTime int64, isDirectory boo
 			inode = path.AsInode(unixTime)
 		} else {
 			inode = possibleInode
+			if probed, ok := i.probed[possibleInode]; ok && isHardlink {
+				inode = probed // another link of an object the probe moved
+			}
 		}
-		if !isHardlink {
+		// A hard link shares its inode with its other links, unless the
+		// inode holds another object (Mountable: compared by persisted
+		// identity), when it is probed like any other.
+		_, taken := i.inode2path[inode]
+		if !isHardlink || taken && possibleInode != 0 && i.persistedLocked(inode) != possibleInode {
 			for _, found := i.inode2path[inode]; found; inode++ {
 				_, found = i.inode2path[inode+1]
 			}
+		}
+		if possibleInode != 0 && inode != possibleInode {
+			if i.stored == nil {
+				i.stored, i.probed = map[uint64]uint64{}, map[uint64]uint64{}
+			}
+			i.stored[inode], i.probed[possibleInode] = possibleInode, inode
 		}
 	}
 	i.path2inode[path] = inode
@@ -579,6 +599,24 @@ func (i *InodeToPath) PromotePath(inode uint64, gone, alias util.FullPath) bool 
 	return true
 }
 
+// PersistedInode is the inode the store keeps for the object at inode:
+// inode itself, unless Lookup's collision probe moved the two apart.
+//
+// Mountable (writeitai/seaweedfs, branch mountable): added for hard-link
+// recovery, which verifies a surviving alias by its persisted identity.
+func (i *InodeToPath) PersistedInode(inode uint64) uint64 {
+	i.RLock()
+	defer i.RUnlock()
+	return i.persistedLocked(inode)
+}
+
+func (i *InodeToPath) persistedLocked(inode uint64) uint64 {
+	if stored, ok := i.stored[inode]; ok {
+		return stored
+	}
+	return inode
+}
+
 // ChildrenCacheGeneration reports whether a directory's children are
 // cached, and a generation that changes whenever that cache is reset or
 // rebuilt, so a reader can tell a cache it paged through stayed the same.
@@ -691,6 +729,12 @@ func (i *InodeToPath) Forget(inode, nlookup uint64, onRelease func(inode uint64)
 				}
 			}
 			delete(i.inode2path, inode)
+			if stored, ok := i.stored[inode]; ok {
+				delete(i.stored, inode)
+				if i.probed[stored] == inode {
+					delete(i.probed, stored)
+				}
+			}
 			i.dropDirPath(inode)
 			delete(i.dirStates, inode)
 		} else {

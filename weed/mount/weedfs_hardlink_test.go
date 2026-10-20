@@ -17,6 +17,7 @@ type linkFiler struct {
 	filer_pb.UnimplementedSeaweedFilerServer
 	mu      sync.Mutex
 	entries map[util.FullPath]*filer_pb.Entry
+	broken  map[util.FullPath]bool // answered with an internal error
 }
 
 func (f *linkFiler) set(p util.FullPath, e *filer_pb.Entry) {
@@ -32,6 +33,9 @@ func (f *linkFiler) set(p util.FullPath, e *filer_pb.Entry) {
 func (f *linkFiler) LookupDirectoryEntry(_ context.Context, r *filer_pb.LookupDirectoryEntryRequest) (*filer_pb.LookupDirectoryEntryResponse, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.broken[util.FullPath(r.Directory).Child(r.Name)] {
+		return nil, status.Error(codes.Internal, "disk on fire")
+	}
 	if e := f.entries[util.FullPath(r.Directory).Child(r.Name)]; e != nil {
 		return &filer_pb.LookupDirectoryEntryResponse{Entry: e}, nil
 	}
@@ -55,9 +59,9 @@ func linkedWFS(t *testing.T) (*WFS, *linkFiler, uint64) {
 	dir := util.FullPath("/d")
 	wfs := newPagingWFS(t, dir, nil, 0)
 	wfs.inodeToPath.InvalidateChildrenCache(dir)
-	filer := &linkFiler{entries: map[util.FullPath]*filer_pb.Entry{}}
+	filer := &linkFiler{entries: map[util.FullPath]*filer_pb.Entry{}, broken: map[util.FullPath]bool{}}
 	startFakeFiler(t, wfs, filer)
-	for _, name := range []string{"one", "two"} {
+	for _, name := range []string{"one", "two", "three"} {
 		filer.set(dir.Child(name), linkEntry(name, 4242, "link", "shared"))
 		wfs.inodeToPath.Lookup(dir.Child(name), 1, false, true, 4242, true)
 	}
@@ -115,5 +119,27 @@ func TestRenameOverAHardLink(t *testing.T) {
 	}
 	if st := wfs.Lookup(nil, &fuse.InHeader{NodeId: dir}, "two", &entry); st != fuse.OK || entry.NodeId != inode || entry.Size != 6 {
 		t.Fatalf("Lookup of the survivor %v: inode %d, size %d", st, entry.NodeId, entry.Size)
+	}
+}
+
+// Only a survivor whose identity checks out is promoted: an alias that
+// cannot be read is passed over for the next, and when none checks out
+// but one could not be read, the answer is that error, not ENOENT.
+func TestRecoveryVerifiesTheSurvivor(t *testing.T) {
+	wfs, filer, inode := linkedWFS(t)
+	filer.set("/d/one", nil)
+	filer.mu.Lock()
+	filer.broken["/d/two"] = true
+	filer.mu.Unlock()
+	var out fuse.AttrOut
+	if st := wfs.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{NodeId: inode}}, &out); st != fuse.OK {
+		t.Fatalf("GetAttr: %v", st)
+	}
+	if p, _ := wfs.inodeToPath.GetPath(inode); p != "/d/three" {
+		t.Fatalf("promoted %s", p)
+	}
+	filer.set("/d/three", nil)
+	if st := wfs.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{NodeId: inode}}, &out); st != fuse.EIO {
+		t.Fatalf("with the only other link unreadable: %v, want EIO", st)
 	}
 }

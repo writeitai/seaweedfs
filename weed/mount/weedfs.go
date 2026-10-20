@@ -540,25 +540,37 @@ func (wfs *WFS) maybeReadEntry(inode uint64) (path util.FullPath, fh *FileHandle
 // a surviving hard link. See design/designs/macos-mount.md §4 in
 // writeitai/fsit.
 func (wfs *WFS) loadInodeEntry(inode uint64, path util.FullPath) (util.FullPath, *filer_pb.Entry, entryVersion, fuse.Status) {
+	persisted := wfs.inodeToPath.PersistedInode(inode)
 	entry, version, status := wfs.maybeLoadEntry(path)
 	for range 4 {
-		if !notTheInode(inode, entry, status) {
+		if !gone(persisted, entry, status) {
 			return path, entry, version, status
 		}
 		aliases := wfs.inodeToPath.GetAllPaths(inode)
+		unknown := fuse.OK // an alias that could not be checked
 		for _, alias := range aliases {
 			if alias == path {
 				continue
 			}
 			aliasEntry, aliasVersion, aliasStatus := wfs.maybeLoadEntry(alias)
-			if !notTheInode(inode, aliasEntry, aliasStatus) && wfs.inodeToPath.PromotePath(inode, path, alias) {
-				return alias, aliasEntry, aliasVersion, aliasStatus
+			switch {
+			case aliasStatus == fuse.OK && aliasEntry.GetAttributes().GetInode() == persisted:
+				// Only a verified survivor stands in for the object.
+				if wfs.inodeToPath.PromotePath(inode, path, alias) {
+					return alias, aliasEntry, aliasVersion, aliasStatus
+				}
+			case aliasStatus != fuse.OK && aliasStatus != fuse.ENOENT:
+				unknown = aliasStatus
 			}
 		}
 		// No survivor, or another caller moved the primary meanwhile: in
 		// that case, start over from where it is now.
 		current, currentStatus := wfs.inodeToPath.GetPath(inode)
 		if len(aliases) < 2 || currentStatus != fuse.OK || current == path {
+			if unknown != fuse.OK {
+				// A survivor may be there: an error, not a missing file.
+				return path, nil, entryVersion{}, unknown
+			}
 			break
 		}
 		path = current
@@ -567,14 +579,15 @@ func (wfs *WFS) loadInodeEntry(inode uint64, path util.FullPath) (util.FullPath,
 	return path, entry, version, status
 }
 
-// notTheInode reports whether a loaded entry is not the inode's object:
-// missing, or storing another inode (the path was overwritten).
-func notTheInode(inode uint64, entry *filer_pb.Entry, status fuse.Status) bool {
+// gone reports whether a loaded entry is not the object with the persisted
+// inode: missing, or storing another inode (the path was overwritten).
+// An error proves nothing either way.
+func gone(persisted uint64, entry *filer_pb.Entry, status fuse.Status) bool {
 	if status == fuse.ENOENT {
 		return true
 	}
 	stored := entry.GetAttributes().GetInode()
-	return status == fuse.OK && stored != 0 && stored != inode
+	return status == fuse.OK && stored != 0 && stored != persisted
 }
 
 // isLocalOnlyEntry reports whether entry holds local-only state not yet on the
