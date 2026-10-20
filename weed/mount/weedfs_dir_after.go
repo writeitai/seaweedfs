@@ -38,7 +38,8 @@ type ListedEntry struct {
 // ReadDirectoryAfter lists the directory dir from the first name after
 // `after` ("" for the start), in the store's name order, calling add for
 // each entry until add returns false or the directory ends, which eof
-// reports. "." and ".." are not listed.
+// reports. "." and ".." are not listed. add is never called with the meta
+// cache locked.
 //
 // It reads what a readdir reads: the cached listing, or for a directory
 // too large to cache the filer, a batch at a time. On a plus listing each
@@ -69,7 +70,11 @@ func (wfs *WFS) ReadDirectoryAfter(dir uint64, after string, plus bool, add func
 }
 
 // listCachedAfter lists from the meta cache. cached is false when the
-// directory has to be read from the filer instead.
+// directory has to be read from the filer instead. Each batch is read out
+// of the cache first and handed on only if the cache stayed the same
+// meanwhile: a reset or rebuild between batches (an eviction, say) would
+// otherwise show as a short batch, read as the end. Then the listing goes
+// on from the filer, from where that batch started.
 func (wfs *WFS) listCachedAfter(dirPath util.FullPath, after string, each func(*filer.Entry) bool) (eof bool, code fuse.Status, cached bool) {
 	if err := meta_cache.EnsureListingFresh(context.Background(), wfs.metaCache, wfs, dirPath, after); err != nil {
 		if errors.Is(err, meta_cache.ErrRefreshRangeTooLarge) {
@@ -79,24 +84,32 @@ func (wfs *WFS) listCachedAfter(dirPath util.FullPath, after string, each func(*
 		// Serve the maintained-but-unverified cache if the filer is unreachable.
 		glog.V(1).Infof("refresh %s sections: %v", dirPath, err)
 	}
+	generation, ok := wfs.inodeToPath.ChildrenCacheGeneration(dirPath)
+	if !ok {
+		return false, fuse.OK, false
+	}
 	for {
-		stopped := false
+		var batch []*filer.Entry
 		// The store reaching nothing is the end: a batch can come back short
 		// because entries expired, so page from where the store got to.
 		last, err := wfs.metaCache.ListDirectoryEntries(readdirContext, dirPath, after, false, batchSize, func(entry *filer.Entry) (bool, error) {
-			if !each(entry) {
-				stopped = true
-				return false, nil
-			}
+			batch = append(batch, entry)
 			return true, nil
 		})
-		switch {
-		case err != nil:
+		if err != nil {
 			glog.Errorf("list meta cache: %v", err)
 			return false, fuse.EIO, true
-		case stopped:
-			return false, fuse.OK, true
-		case last == "":
+		}
+		if now, ok := wfs.inodeToPath.ChildrenCacheGeneration(dirPath); !ok || now != generation {
+			eof, code := wfs.listDirectAfter(dirPath, after, each)
+			return eof, code, true
+		}
+		for _, entry := range batch {
+			if !each(entry) {
+				return false, fuse.OK, true
+			}
+		}
+		if last == "" {
 			return true, fuse.OK, true
 		}
 		after = last
@@ -139,18 +152,31 @@ func (wfs *WFS) listEntryAfter(dirPath util.FullPath, entry *filer.Entry, plus b
 		return add(listed)
 	}
 	isHardlink := len(entry.HardLinkId) > 0
-	inode := wfs.inodeToPath.Lookup(childPath, entry.Crtime.Unix(), entry.IsDirectory(), isHardlink, entry.Inode, false)
+	// The reference is taken now and given back if add refuses the entry,
+	// so a refused entry leaves nothing behind in the inode table.
+	inode := wfs.inodeToPath.Lookup(childPath, entry.Crtime.Unix(), entry.IsDirectory(), isHardlink, entry.Inode, true)
 	if fh, found := wfs.fhMap.FindFileHandle(inode); found {
-		entry = filer.FromPbEntry(string(dirPath), fh.GetEntry().GetEntry())
+		entry = wfs.openEntry(fh, dirPath, entry)
 	}
 	listed.Inode, listed.Out = inode, &fuse.EntryOut{}
 	wfs.outputFilerEntry(listed.Out, inode, entry)
 	if !add(listed) {
+		wfs.Forget(inode, 1)
 		return false
 	}
-	// The fallback covers a racing Forget, as in doReadDirectory.
-	if !wfs.inodeToPath.IncrementNlookup(inode) {
-		wfs.inodeToPath.Lookup(childPath, entry.Crtime.Unix(), entry.IsDirectory(), isHardlink, entry.Inode, true)
-	}
 	return true
+}
+
+// openEntry is an open file's entry as its handle has it, read under the
+// locks GetAttr takes: async uploads change it under the entry's lock,
+// writes and metadata flushes under the handle's.
+func (wfs *WFS) openEntry(fh *FileHandle, dirPath util.FullPath, listed *filer.Entry) *filer.Entry {
+	fhActiveLock := wfs.fhLockTable.AcquireLock("ReadDirectoryAfter", fh.fh, util.SharedLock)
+	defer wfs.fhLockTable.ReleaseLock(fh.fh, fhActiveLock)
+	fh.entry.RLock()
+	defer fh.entry.RUnlock()
+	if fh.entry.Entry == nil {
+		return listed
+	}
+	return filer.FromPbEntry(string(dirPath), fh.entry.Entry)
 }

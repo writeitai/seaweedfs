@@ -43,9 +43,13 @@ type dirState struct {
 	lastRefresh        time.Time
 	lastRebuildAttempt time.Time
 	subdirCount        int32 // tracked in-memory for POSIX directory nlink
+	// generation counts the cache's resets and rebuilds (Mountable, for
+	// ChildrenCacheGeneration).
+	generation uint64
 }
 
 func (d *dirState) resetCacheState() {
+	d.generation++
 	d.isChildrenCached = false
 	d.readDirDirect = false
 	d.cachedExpiresTime = time.Time{}
@@ -341,6 +345,7 @@ func (i *InodeToPath) MarkChildrenCached(fullpath util.FullPath) {
 		return
 	}
 	d.isChildrenCached = true
+	d.generation++
 	d.readDirDirect = false
 	now := time.Now()
 	d.lastAccess = now
@@ -572,6 +577,23 @@ func (i *InodeToPath) PromotePath(inode uint64, gone, alias util.FullPath) bool 
 		delete(i.path2inode, gone)
 	}
 	return true
+}
+
+// ChildrenCacheGeneration reports whether a directory's children are
+// cached, and a generation that changes whenever that cache is reset or
+// rebuilt, so a reader can tell a cache it paged through stayed the same.
+//
+// Mountable (writeitai/seaweedfs, branch mountable): added for
+// ReadDirectoryAfter; see weedfs_dir_after.go.
+func (i *InodeToPath) ChildrenCacheGeneration(fullpath util.FullPath) (generation uint64, cached bool) {
+	i.RLock()
+	defer i.RUnlock()
+	d := i.dirStateOf(fullpath)
+	if d == nil {
+		return 0, false
+	}
+	cached = d.isChildrenCached && (d.cachedExpiresTime.IsZero() || time.Now().Before(d.cachedExpiresTime))
+	return d.generation, cached
 }
 
 // RemovePath drops the name. onStillReferenced, if given, runs under the
