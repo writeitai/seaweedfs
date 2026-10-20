@@ -283,3 +283,45 @@ func TestProbedInodeThroughLinks(t *testing.T) {
 		t.Fatal("the probe's record outlived the inode")
 	}
 }
+
+// A path overwritten by another object (its persisted inode differs) is
+// detached even when it was the inode's only path: the newcomer gets its
+// own inode, the old one keeps no path.
+func TestOverwrittenSinglePathDetaches(t *testing.T) {
+	m := NewInodeToPath(util.FullPath("/"), 0)
+	old := m.Lookup("/a", 1, false, false, 100, true)
+	if fresh := m.Lookup("/a", 2, false, false, 9999, true); fresh == old || fresh != 9999 {
+		t.Fatalf("newcomer inode %d (old %d)", fresh, old)
+	}
+	if _, st := m.GetPath(old); st != fuse.ENOENT {
+		t.Fatal("the old inode kept the path")
+	}
+	// Overwritten by a hard link: both of its names share one inode.
+	m.Lookup("/b", 3, false, true, 4242, true)
+	if a := m.Lookup("/a", 3, false, true, 4242, true); a != 4242 {
+		t.Fatalf("the overwriting link got %d, its other name 4242", a)
+	}
+}
+
+// Two inodes carry persisted 77: the original (77) and an unrelated file
+// the probe moved to 78. A link of the original joins the inode known to
+// be a link, never the unrelated one; when neither is known to be, a link
+// joins neither.
+func TestLinksJoinTheirOwnInode(t *testing.T) {
+	m := NewInodeToPath(util.FullPath("/"), 0)
+	orig := m.Lookup("/orig", 1, false, false, 77, true)
+	unrelated := m.Lookup("/other", 1, false, false, 77, true)
+	if orig != 77 || unrelated == 77 {
+		t.Fatalf("inodes %d %d", orig, unrelated)
+	}
+	if m.Lookup("/fresh-link", 1, false, true, 77, true) == unrelated {
+		t.Fatal("an unknown link joined the unrelated file")
+	}
+	m.Lookup("/orig", 1, false, true, 77, true) // the original, now a link
+	if got := m.Lookup("/new-link", 1, false, true, 77, true); got != orig {
+		t.Fatalf("the original's new link got %d, want %d", got, orig)
+	}
+	if paths := m.GetAllPaths(unrelated); !slices.Equal(paths, []util.FullPath{"/other"}) {
+		t.Fatalf("the unrelated file gained %v", paths)
+	}
+}

@@ -29,6 +29,10 @@ type InodeToPath struct {
 	// with persisted identities; see PersistedInode.
 	stored map[uint64]uint64
 	probed map[uint64]uint64
+	// linked holds the inodes known to be hard links (looked up as one, or
+	// linked here), which tells a link which of two inodes sharing a
+	// persisted number is its own. Mountable, sparse like stored.
+	linked map[uint64]bool
 }
 
 // InodeEntry exists per inode the kernel references. Directory cache state is
@@ -182,31 +186,31 @@ func (i *InodeToPath) Lookup(path util.FullPath, unixTime int64, isDirectory boo
 	defer i.Unlock()
 	inode, found := i.path2inode[path]
 	if found && possibleInode != 0 && possibleInode != i.persistedLocked(inode) {
-		// The path names another object now than the hard link it was an
-		// alias of (overwritten, say by a rename): detach it, so the
-		// newcomer gets its own inode and the surviving links keep theirs.
-		// Mountable, for the macOS NFS mount: design/designs/macos-mount.md §4
-		// in writeitai/fsit.
-		if ie := i.inode2path[inode]; ie != nil && ie.extraPaths != nil && ie.hasPath(path) {
+		// The path holds another object now (overwritten, say by a rename):
+		// detach it, so the newcomer gets its own inode and the old one keeps
+		// only its other links, or none. Mountable, for the macOS NFS mount:
+		// design/designs/macos-mount.md §4 in writeitai/fsit.
+		if ie := i.inode2path[inode]; ie != nil && ie.hasPath(path) {
 			ie.removeOnePath(path)
-			delete(i.path2inode, path)
-			found = false
+			i.dropDirPath(inode)
 		}
+		delete(i.path2inode, path)
+		found = false
 	}
 	if !found {
 		if possibleInode == 0 {
 			inode = path.AsInode(unixTime)
 		} else {
 			inode = possibleInode
-			if probed, ok := i.probed[possibleInode]; ok && isHardlink {
-				inode = probed // another link of an object the probe moved
+			if isHardlink {
+				inode = i.linkInodeLocked(possibleInode)
 			}
 		}
 		// A hard link shares its inode with its other links, unless the
 		// inode holds another object (Mountable: compared by persisted
 		// identity), when it is probed like any other.
 		_, taken := i.inode2path[inode]
-		if !isHardlink || taken && possibleInode != 0 && i.persistedLocked(inode) != possibleInode {
+		if !isHardlink || taken && possibleInode != 0 && (i.persistedLocked(inode) != possibleInode || !i.linked[inode] && i.ambiguousLocked(possibleInode)) {
 			for _, found := i.inode2path[inode]; found; inode++ {
 				_, found = i.inode2path[inode+1]
 			}
@@ -220,6 +224,12 @@ func (i *InodeToPath) Lookup(path util.FullPath, unixTime int64, isDirectory boo
 	}
 	i.path2inode[path] = inode
 
+	if isHardlink {
+		if i.linked == nil {
+			i.linked = map[uint64]bool{}
+		}
+		i.linked[inode] = true
+	}
 	if ie, found := i.inode2path[inode]; found {
 		// Hard links share one inode: remember every alias looked up, so
 		// the inode can still be reached through a survivor once the path
@@ -553,6 +563,11 @@ func (i *InodeToPath) CollectEvictableDirs(now time.Time, idle time.Duration) []
 func (i *InodeToPath) AddPath(inode uint64, path util.FullPath) {
 	i.Lock()
 	defer i.Unlock()
+	// A second path makes a hard link (Mountable: see linked).
+	if i.linked == nil {
+		i.linked = map[uint64]bool{}
+	}
+	i.linked[inode] = true
 	i.path2inode[path] = inode
 
 	ie, found := i.inode2path[inode]
@@ -608,6 +623,24 @@ func (i *InodeToPath) PersistedInode(inode uint64) uint64 {
 	i.RLock()
 	defer i.RUnlock()
 	return i.persistedLocked(inode)
+}
+
+// linkInodeLocked is the inode a hard link with that persisted number
+// joins: the one inode carrying the number that is known to be a link, or
+// else the number itself.
+func (i *InodeToPath) linkInodeLocked(persisted uint64) uint64 {
+	if probed, ok := i.probed[persisted]; ok && i.linked[probed] && !i.linked[persisted] {
+		return probed
+	}
+	return persisted
+}
+
+// ambiguousLocked reports whether two inodes carry the persisted number,
+// neither known to be a hard link: a link cannot tell which is its own,
+// and joins neither.
+func (i *InodeToPath) ambiguousLocked(persisted uint64) bool {
+	probed, ok := i.probed[persisted]
+	return ok && !i.linked[probed] && !i.linked[persisted]
 }
 
 func (i *InodeToPath) persistedLocked(inode uint64) uint64 {
@@ -729,6 +762,7 @@ func (i *InodeToPath) Forget(inode, nlookup uint64, onRelease func(inode uint64)
 				}
 			}
 			delete(i.inode2path, inode)
+			delete(i.linked, inode)
 			if stored, ok := i.stored[inode]; ok {
 				delete(i.stored, inode)
 				if i.probed[stored] == inode {
