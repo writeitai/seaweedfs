@@ -143,3 +143,23 @@ func TestRecoveryVerifiesTheSurvivor(t *testing.T) {
 		t.Fatalf("with the only other link unreadable: %v, want EIO", st)
 	}
 }
+
+// NamespaceEntry answers from the namespace even while a handle holds the
+// file open: deleted is ENOENT, and a survivor answers for a hard link.
+func TestNamespaceEntryIgnoresOpenHandles(t *testing.T) {
+	wfs, filer, inode := linkedWFS(t)
+	wfs.fhMap.AcquireFileHandle(wfs, inode, linkEntry("one", inode, "link", "shared"), 0, 0)
+	filer.set("/d/one", nil)
+	if e, st := wfs.NamespaceEntry(inode); st != fuse.OK || e.GetAttributes().GetInode() != inode {
+		t.Fatalf("with a survivor: %v", st)
+	}
+	filer.set("/d/two", nil)
+	filer.set("/d/three", nil)
+	if _, st := wfs.NamespaceEntry(inode); st != fuse.ENOENT {
+		t.Fatalf("every link deleted, the handle open: %v", st)
+	}
+	var out fuse.AttrOut
+	if st := wfs.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{NodeId: inode}}, &out); st != fuse.OK {
+		t.Fatalf("GetAttr still answers from the open handle: %v", st)
+	}
+}

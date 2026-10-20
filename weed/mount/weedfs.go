@@ -579,6 +579,23 @@ func (wfs *WFS) loadInodeEntry(inode uint64, path util.FullPath) (util.FullPath,
 	return path, entry, version, status
 }
 
+// NamespaceEntry is the inode's entry as the namespace has it now: through
+// its path, or a surviving hard link, ignoring what any open handle holds.
+// GetAttr prefers an open handle's entry, which outlives a deletion; a
+// front end that must tell whether the object still exists asks this.
+//
+// Mountable (writeitai/seaweedfs, branch mountable): added for the macOS
+// NFS mount, which retires a file handle once its object is gone; see
+// design/designs/macos-mount.md §4 in writeitai/fsit.
+func (wfs *WFS) NamespaceEntry(inode uint64) (*filer_pb.Entry, fuse.Status) {
+	path, status := wfs.inodeToPath.GetPath(inode)
+	if status != fuse.OK {
+		return nil, status
+	}
+	_, entry, _, status := wfs.loadInodeEntry(inode, path)
+	return entry, status
+}
+
 // gone reports whether a loaded entry is not the object with the persisted
 // inode: missing, or storing another inode (the path was overwritten).
 // An error proves nothing either way.
