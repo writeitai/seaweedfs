@@ -25,20 +25,18 @@ func (wfs *WFS) Lookup(cancel <-chan struct{}, header *fuse.InHeader, name strin
 
 	// What the path led to before asking, so a miss detaches only that, and
 	// never a binding a newer lookup made meanwhile (Mountable).
-	before, nlookup, bound := wfs.inodeToPath.Binding(fullFilePath)
+	before, bound, generation := wfs.inodeToPath.Watch(fullFilePath)
 
 	// Use shared lookup logic that checks cache first, then filer if needed
 	localEntry, _, status := wfs.lookupEntry(fullFilePath)
-	if status == fuse.ENOENT && bound {
-		// Gone: the path no longer leads to the inode it named, so a
-		// newcomer there gets an inode of its own (Mountable).
-		wfs.inodeToPath.DetachPathIf(before, nlookup, fullFilePath)
-	}
+	// On ENOENT the path no longer leads to the inode it named, so a
+	// newcomer there gets an inode of its own (Mountable).
+	wfs.inodeToPath.Unwatch(fullFilePath, before, generation, status == fuse.ENOENT && bound)
 	if status != fuse.OK {
 		return status
 	}
 
-	inode := wfs.inodeToPath.LookupLinked(fullFilePath, localEntry.Crtime.Unix(), localEntry.IsDirectory(), string(localEntry.HardLinkId), localEntry.Inode, true)
+	inode := wfs.inodeToPath.LookupLinked(fullFilePath, localEntry.Crtime.Unix(), EntryKind(localEntry.IsDirectory(), localEntry.Mode), string(localEntry.HardLinkId), localEntry.Inode, true)
 
 	if fh, found := wfs.fhMap.FindFileHandle(inode); found {
 		localEntry = wfs.openEntry(fh, dirPath, localEntry)

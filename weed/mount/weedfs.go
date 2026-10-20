@@ -542,14 +542,29 @@ func (wfs *WFS) maybeReadEntry(inode uint64) (path util.FullPath, fh *FileHandle
 // a surviving hard link. See design/designs/macos-mount.md §4 in
 // writeitai/fsit.
 func (wfs *WFS) loadInodeEntry(inode uint64, path util.FullPath) (util.FullPath, *filer_pb.Entry, entryVersion, fuse.Status) {
-	nlookup := wfs.inodeToPath.Lookups(inode)
 	// gone: missing, or another object by the identity rule. An error
 	// proves nothing either way.
 	gone := func(entry *filer_pb.Entry, status fuse.Status) bool {
 		return status == fuse.ENOENT || status == fuse.OK && !wfs.inodeToPath.HoldsEntry(inode, entry)
 	}
-	entry, version, status := wfs.maybeLoadEntry(path)
+	// Each path is watched from before it is loaded, so that once the
+	// object proves gone everywhere, a path is detached only if no lookup
+	// bound it again meanwhile.
+	watched := map[util.FullPath]uint64{}
 	invalid := map[util.FullPath]bool{} // conclusively not the object
+	detach := false
+	defer func() {
+		for p, generation := range watched {
+			wfs.inodeToPath.Unwatch(p, inode, generation, detach && invalid[p])
+		}
+	}()
+	load := func(p util.FullPath) (*filer_pb.Entry, entryVersion, fuse.Status) {
+		if _, ok := watched[p]; !ok {
+			_, _, watched[p] = wfs.inodeToPath.Watch(p)
+		}
+		return wfs.maybeLoadEntry(p)
+	}
+	entry, version, status := load(path)
 	for range 4 {
 		if !gone(entry, status) {
 			return path, entry, version, status
@@ -561,7 +576,7 @@ func (wfs *WFS) loadInodeEntry(inode uint64, path util.FullPath) (util.FullPath,
 			if alias == path || invalid[alias] {
 				continue
 			}
-			aliasEntry, aliasVersion, aliasStatus := wfs.maybeLoadEntry(alias)
+			aliasEntry, aliasVersion, aliasStatus := load(alias)
 			switch {
 			case !gone(aliasEntry, aliasStatus) && aliasStatus == fuse.OK:
 				// Only a verified survivor stands in for the object.
@@ -584,15 +599,12 @@ func (wfs *WFS) loadInodeEntry(inode uint64, path util.FullPath) (util.FullPath,
 			}
 			// The object is gone from path and from every alias: whatever
 			// is there now is another object, never answered for this inode,
-			// and none of those paths leads to the inode any more, unless a
-			// lookup bound one again meanwhile.
-			for p := range invalid {
-				wfs.inodeToPath.DetachPathIf(inode, nlookup, p)
-			}
+			// and none of those paths leads to the inode any more.
+			detach = true
 			return path, nil, entryVersion{}, fuse.ENOENT
 		}
 		path = current
-		entry, version, status = wfs.maybeLoadEntry(path)
+		entry, version, status = load(path)
 	}
 	return path, nil, entryVersion{}, fuse.ENOENT
 }

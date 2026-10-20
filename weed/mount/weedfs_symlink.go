@@ -78,7 +78,8 @@ func (wfs *WFS) Symlink(cancel <-chan struct{}, header *fuse.InHeader, target st
 		return fuse.EIO
 	}
 
-	inode = wfs.inodeToPath.Lookup(entryFullPath, request.Entry.Attributes.Crtime, false, false, inode, true)
+	// As a symlink (Mountable: see LookupLinked).
+	inode = wfs.inodeToPath.LookupLinked(entryFullPath, request.Entry.Attributes.Crtime, os.ModeSymlink, "", inode, true)
 
 	wfs.outputPbEntry(out, inode, request.Entry)
 

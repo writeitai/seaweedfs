@@ -137,9 +137,24 @@ func (wfs *WFS) Link(cancel <-chan struct{}, in *fuse.LinkIn, name string, out *
 	// apply changes to the filer, and also apply to local metaCache
 	wfs.mapPbIdFromLocalToFiler(request.Entry)
 
+	// While a standalone source turns into a hard link, a lookup may see it
+	// either way: both are the source, not a replacement (Mountable: see
+	// LookupLinked).
+	converting, group := len(origHardLinkId) == 0, oldEntry.HardLinkId
+	if converting {
+		wfs.inodeToPath.BeginLink(sourceInode, group)
+	}
+	linked := false // whether the source is a hard link now
+	defer func() {
+		if converting {
+			wfs.inodeToPath.EndLink(sourceInode, group, linked)
+		}
+	}()
+
 	ctx := context.Background()
 	updateResp, err := wfs.streamUpdateEntry(ctx, updateOldEntryRequest)
 	if err == nil {
+		linked = true
 		updateEvent := updateResp.GetMetadataEvent()
 		if updateEvent == nil {
 			updateEvent = metadataUpdateEvent(oldParentPath, updateOldEntryRequest.Entry)
@@ -163,6 +178,8 @@ func (wfs *WFS) Link(cancel <-chan struct{}, in *fuse.LinkIn, name string, out *
 			}
 			if _, rollbackErr := wfs.streamUpdateEntry(ctx, rollbackReq); rollbackErr != nil {
 				glog.Warningf("link rollback %s: %v", oldEntryPath, rollbackErr)
+			} else {
+				linked = false
 			}
 		} else {
 			createEvent := createResp.GetMetadataEvent()
@@ -188,7 +205,6 @@ func (wfs *WFS) Link(cancel <-chan struct{}, in *fuse.LinkIn, name string, out *
 	}
 
 	wfs.inodeToPath.AddPath(sourceInode, newEntryPath)
-	wfs.inodeToPath.SetLinkID(sourceInode, oldEntry.HardLinkId) // Mountable: see LookupLinked
 
 	// Propagate the new HardLinkCounter to sibling cache entries and
 	// invalidate the kernel's inode attr cache. Without this, `stat` on any

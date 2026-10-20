@@ -51,7 +51,7 @@ func (wfs *WFS) Create(cancel <-chan struct{}, in *fuse.CreateIn, name string, o
 				entryFullPath, newEntry.Attributes.Uid, newEntry.Attributes.Gid, newEntry.Attributes.FileMode)
 			return fuse.Status(syscall.EEXIST)
 		}
-		inode = wfs.inodeToPath.LookupLinked(entryFullPath, newEntry.Attributes.Crtime, false, string(newEntry.HardLinkId), newEntry.Attributes.Inode, true)
+		inode = wfs.inodeToPath.LookupLinked(entryFullPath, newEntry.Attributes.Crtime, PbEntryKind(newEntry), string(newEntry.HardLinkId), newEntry.Attributes.Inode, true)
 		fileHandle, status := wfs.AcquireHandle(inode, in.Flags, in.Uid, in.Gid)
 		if status != fuse.OK {
 			return status
@@ -100,7 +100,7 @@ func (wfs *WFS) Create(cancel <-chan struct{}, in *fuse.CreateIn, name string, o
 		if newEntry == nil || newEntry.Attributes == nil {
 			return fuse.EIO
 		}
-		inode = wfs.inodeToPath.LookupLinked(entryFullPath, newEntry.Attributes.Crtime, false, string(newEntry.HardLinkId), newEntry.Attributes.Inode, true)
+		inode = wfs.inodeToPath.LookupLinked(entryFullPath, newEntry.Attributes.Crtime, PbEntryKind(newEntry), string(newEntry.HardLinkId), newEntry.Attributes.Inode, true)
 		fileHandle, status := wfs.AcquireHandle(inode, in.Flags, in.Uid, in.Gid)
 		if status != fuse.OK {
 			return status
@@ -184,7 +184,9 @@ func (wfs *WFS) Mknod(cancel <-chan struct{}, in *fuse.MknodIn, name string, out
 
 	// this is to increase nlookup counter
 	entryFullPath := dirFullPath.Child(name)
-	inode = wfs.inodeToPath.Lookup(entryFullPath, newEntry.Attributes.Crtime, false, false, inode, true)
+	// With its file type, which a node made here need not be a regular file
+	// of (Mountable: see LookupLinked).
+	inode = wfs.inodeToPath.LookupLinked(entryFullPath, newEntry.Attributes.Crtime, PbEntryKind(newEntry), "", inode, true)
 
 	wfs.outputPbEntry(out, inode, newEntry)
 

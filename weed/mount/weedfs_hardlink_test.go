@@ -2,6 +2,7 @@ package mount
 
 import (
 	"context"
+	"os"
 	"sync"
 	"syscall"
 	"testing"
@@ -72,7 +73,7 @@ func linkedWFS(t *testing.T) (*WFS, *linkFiler, uint64) {
 	startFakeFiler(t, wfs, filer)
 	for _, name := range []string{"one", "two", "three"} {
 		filer.set(dir.Child(name), linkEntry(name, 4242, "link", "shared"))
-		wfs.inodeToPath.LookupLinked(dir.Child(name), 1, false, "link", 4242, true)
+		wfs.inodeToPath.LookupLinked(dir.Child(name), 1, 0, "link", 4242, true)
 	}
 	return wfs, filer, 4242
 }
@@ -278,7 +279,7 @@ func TestEveryLinkGoneDetachesThemAll(t *testing.T) {
 // link is the only name of its inode the mount knows.
 func TestStandaloneWhereALinkWas(t *testing.T) {
 	wfs, filer, _ := linkedWFS(t)
-	inode := wfs.inodeToPath.LookupLinked("/d/solo", 1, false, "solo-link", 500, true)
+	inode := wfs.inodeToPath.LookupLinked("/d/solo", 1, 0, "solo-link", 500, true)
 	filer.set("/d/solo", linkEntry("solo", 500, "", "newcomer"))
 	dir, _ := wfs.inodeToPath.GetInode("/d")
 	var entry fuse.EntryOut
@@ -320,6 +321,9 @@ func TestDelayedLookupMissKeepsANewerLookup(t *testing.T) {
 	if st := wfs.Lookup(nil, &fuse.InHeader{NodeId: dir}, "f", &out); st != fuse.OK || out.NodeId != inode {
 		t.Fatalf("lookup meanwhile %v: inode %d (was %d)", st, out.NodeId, inode)
 	}
+	// The newer lookup's reference is returned: the count is what the slow
+	// lookup saw, but the binding is newer.
+	wfs.Forget(inode, 1)
 	close(release)
 	if st := <-slow; st != fuse.ENOENT {
 		t.Fatalf("slow lookup: %v", st)
@@ -341,5 +345,61 @@ func TestSurvivorOfAnotherGroupIsPassedOver(t *testing.T) {
 	}
 	if p, _ := wfs.inodeToPath.GetPath(inode); p != "/d/three" {
 		t.Fatalf("promoted %s", p)
+	}
+}
+
+// A standalone file replaced by a hard link of a group this mount never
+// saw, with the same stored inode, is another object: the file's inode is
+// gone, a handle holding the link reads nothing, and the name gets an
+// inode of its own.
+func TestStandaloneReplacedByAnUnseenLink(t *testing.T) {
+	wfs, filer, _ := linkedWFS(t)
+	dir, _ := wfs.inodeToPath.GetInode("/d")
+	filer.set("/d/a", linkEntry("a", 500, "", "AAAA"))
+	var out fuse.EntryOut
+	if st := wfs.Lookup(nil, &fuse.InHeader{NodeId: dir}, "a", &out); st != fuse.OK {
+		t.Fatalf("lookup: %v", st)
+	}
+	old := out.NodeId
+	filer.set("/d/a", linkEntry("a", 500, "unseen", "BBBBBBBB"))
+	filer.set("/d/b-elsewhere", linkEntry("b-elsewhere", 500, "unseen", "BBBBBBBB")) // never looked up
+	if _, st := wfs.NamespaceEntry(old); st != fuse.ENOENT {
+		t.Fatalf("NamespaceEntry of the replaced file: %v", st)
+	}
+	fh, _ := wfs.fhMap.AcquireFileHandle(wfs, old, linkEntry("a", 500, "unseen", "BBBBBBBB"), 0, 0)
+	buf := make([]byte, 16)
+	if _, st := wfs.ReadAs(nil, &fuse.ReadIn{InHeader: fuse.InHeader{NodeId: old}, Fh: uint64(fh.fh), Size: 16}, buf, 500); st != fuse.Status(syscall.ESTALE) {
+		t.Fatalf("ReadAs of the link through the file's inode: %v", st)
+	}
+	if st := wfs.Lookup(nil, &fuse.InHeader{NodeId: dir}, "a", &out); st != fuse.OK || out.NodeId == old || out.Size != 8 {
+		t.Fatalf("lookup of the link %v: inode %d (old %d), size %d", st, out.NodeId, old, out.Size)
+	}
+}
+
+// A regular file replaced by a symlink with the same stored inode, while a
+// handle holds the file open: the name gets an inode of its own, and is
+// listed as the symlink, with none of the open file's attributes.
+func TestFileReplacedByASymlink(t *testing.T) {
+	wfs, filer, _ := linkedWFS(t)
+	dir, _ := wfs.inodeToPath.GetInode("/d")
+	filer.set("/d/s", linkEntry("s", 600, "", "regular file"))
+	var out fuse.EntryOut
+	if st := wfs.Lookup(nil, &fuse.InHeader{NodeId: dir}, "s", &out); st != fuse.OK {
+		t.Fatalf("lookup: %v", st)
+	}
+	old := out.NodeId
+	wfs.fhMap.AcquireFileHandle(wfs, old, linkEntry("s", 600, "", "regular file"), 0, 0)
+	symlink := linkEntry("s", 600, "", "")
+	symlink.Attributes.FileMode = uint32(os.ModeSymlink | 0o777)
+	symlink.Attributes.SymlinkTarget = "target"
+	filer.set("/d/s", symlink)
+	if st := wfs.Lookup(nil, &fuse.InHeader{NodeId: dir}, "s", &out); st != fuse.OK || out.NodeId == old || out.Mode&syscall.S_IFMT != syscall.S_IFLNK {
+		t.Fatalf("lookup of the symlink %v: inode %d (old %d), mode %o", st, out.NodeId, old, out.Mode)
+	}
+	if _, st := wfs.NamespaceEntry(old); st != fuse.ENOENT {
+		t.Fatalf("NamespaceEntry of the replaced file: %v", st)
+	}
+	if wfs.inodeToPath.Holds(out.NodeId, 0, "", 600) || !wfs.inodeToPath.Holds(out.NodeId, os.ModeSymlink, "", 600) {
+		t.Fatal("Holds tells a symlink from a regular file wrongly")
 	}
 }

@@ -162,7 +162,7 @@ func (wfs *WFS) listEntryAfter(dirPath util.FullPath, entry *filer.Entry, plus b
 	}
 	// The reference is taken now and given back if add refuses the entry,
 	// so a refused entry leaves nothing behind in the inode table.
-	inode := wfs.inodeToPath.LookupLinked(childPath, entry.Crtime.Unix(), entry.IsDirectory(), string(entry.HardLinkId), entry.Inode, true)
+	inode := wfs.inodeToPath.LookupLinked(childPath, entry.Crtime.Unix(), EntryKind(entry.IsDirectory(), entry.Mode), string(entry.HardLinkId), entry.Inode, true)
 	if fh, found := wfs.fhMap.FindFileHandle(inode); found {
 		entry = wfs.openEntry(fh, dirPath, entry)
 	}
@@ -189,9 +189,10 @@ func (wfs *WFS) openEntry(fh *FileHandle, dirPath util.FullPath, listed *filer.E
 	// that held this name. Stored inode, type and hard-link group must all
 	// agree.
 	open := fh.entry.Entry
-	if open == nil || !wfs.inodeToPath.Holds(fh.inode, listed.IsDirectory(), string(listed.HardLinkId), listed.Inode) ||
+	kind := EntryKind(listed.IsDirectory(), listed.Mode)
+	if open == nil || !wfs.inodeToPath.Holds(fh.inode, kind, string(listed.HardLinkId), listed.Inode) ||
 		listed.Inode != 0 && open.GetAttributes().GetInode() != listed.Inode ||
-		open.GetIsDirectory() != listed.IsDirectory() || !bytes.Equal(open.GetHardLinkId(), listed.HardLinkId) {
+		PbEntryKind(open) != kind || !bytes.Equal(open.GetHardLinkId(), listed.HardLinkId) {
 		return listed
 	}
 	return filer.FromPbEntry(string(dirPath), open)
