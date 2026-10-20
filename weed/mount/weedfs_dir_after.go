@@ -38,20 +38,27 @@ type ListedEntry struct {
 // ReadDirectoryAfter lists the directory dir from the first name after
 // `after` ("" for the start), in the store's name order, calling add for
 // each entry until add returns false or the directory ends, which eof
-// reports. "." and ".." are not listed. add is never called with the meta
+// reports. fits, if not nil, is asked before an entry is looked at, and
+// ends the listing when it returns false, leaving that entry untouched. "." and ".." are not listed. add is never called with the meta
 // cache locked.
 //
 // It reads what a readdir reads: the cached listing, or for a directory
 // too large to cache the filer, a batch at a time. On a plus listing each
 // entry add accepts is entered in the inode table and holds one lookup
 // reference, returned with Forget; an entry add refuses takes none.
-func (wfs *WFS) ReadDirectoryAfter(dir uint64, after string, plus bool, add func(*ListedEntry) bool) (eof bool, code fuse.Status) {
+func (wfs *WFS) ReadDirectoryAfter(dir uint64, after string, plus bool, fits func(name string) bool, add func(*ListedEntry) bool) (eof bool, code fuse.Status) {
 	dirPath, code := wfs.inodeToPath.GetPath(dir)
 	if code != fuse.OK {
 		return false, code
 	}
 	wfs.inodeToPath.TouchDirectory(dirPath)
-	each := func(entry *filer.Entry) bool { return wfs.listEntryAfter(dirPath, entry, plus, add) }
+	each := func(entry *filer.Entry) bool {
+		// Asked first, so an entry that does not fit is never entered.
+		if fits != nil && !fits(entry.Name()) {
+			return false
+		}
+		return wfs.listEntryAfter(dirPath, entry, plus, add)
+	}
 	if !wfs.inodeToPath.ShouldReadDirectoryDirect(dirPath) {
 		err := wfs.ensureDirectoryVisited(dirPath)
 		var tooLarge *meta_cache.DirectoryTooLargeError

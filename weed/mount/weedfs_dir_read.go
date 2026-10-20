@@ -497,6 +497,10 @@ func loadDirectoryEntriesDirect(ctx context.Context, client filer_pb.FilerClient
 	entries := make([]*filer.Entry, 0, prealloc)
 	var actualSnapshotTsNs int64
 	err := client.WithFilerClient(false, func(sc filer_pb.SeaweedFilerClient) error {
+		// A retried attempt starts its batch over: what an interrupted
+		// stream delivered would otherwise come twice. (Mountable,
+		// writeitai/seaweedfs branch mountable.)
+		entries = entries[:0]
 		var innerErr error
 		actualSnapshotTsNs, innerErr = filer_pb.DoSeaweedListWithSnapshot(ctx, sc, dirPath, "", func(entry *filer_pb.Entry, isLast bool) error {
 			if !includeSystemEntries && meta_cache.IsHiddenSystemEntry(string(dirPath), entry.Name) {

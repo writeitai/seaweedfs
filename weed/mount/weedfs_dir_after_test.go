@@ -7,9 +7,12 @@ import (
 	"time"
 
 	"github.com/seaweedfs/go-fuse/v2/fuse"
+	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/util"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // Paging by name over a cached directory of more than one store batch: each
@@ -28,7 +31,7 @@ func TestReadDirectoryAfterPagesByName(t *testing.T) {
 	after := ""
 	for {
 		page := 0
-		eof, status := wfs.ReadDirectoryAfter(dirInode, after, true, func(e *ListedEntry) bool {
+		eof, status := wfs.ReadDirectoryAfter(dirInode, after, true, nil, func(e *ListedEntry) bool {
 			if page == 700 {
 				return false
 			}
@@ -68,7 +71,7 @@ func TestReadDirectoryAfterPlainTakesNoReferences(t *testing.T) {
 	wfs := newPagingWFS(t, dir, []string{"a", "b", "c"}, 0)
 	dirInode, _ := wfs.inodeToPath.GetInode(dir)
 	var got []string
-	eof, _ := wfs.ReadDirectoryAfter(dirInode, "a", false, func(e *ListedEntry) bool {
+	eof, _ := wfs.ReadDirectoryAfter(dirInode, "a", false, nil, func(e *ListedEntry) bool {
 		got = append(got, e.Name)
 		return e.Inode != 0 && e.Out == nil
 	})
@@ -89,7 +92,7 @@ func TestReadDirectoryAfterPastExpiredEntries(t *testing.T) {
 	}
 	wfs := newPagingWFS(t, dir, names, 30)
 	dirInode, _ := wfs.inodeToPath.GetInode(dir)
-	eof, status := wfs.ReadDirectoryAfter(dirInode, "", false, func(*ListedEntry) bool { return true })
+	eof, status := wfs.ReadDirectoryAfter(dirInode, "", false, nil, func(*ListedEntry) bool { return true })
 	if status != 0 || !eof {
 		t.Fatalf("status %v eof %v", status, eof)
 	}
@@ -100,9 +103,14 @@ type listFiler struct {
 	filer_pb.UnimplementedSeaweedFilerServer
 	dir   util.FullPath
 	names []string
+	// breakAfter, when not zero, ends the next listing with a transient
+	// error after that many entries.
+	breakAfter int
 }
 
 func (f *listFiler) ListEntries(r *filer_pb.ListEntriesRequest, stream grpc.ServerStreamingServer[filer_pb.ListEntriesResponse]) error {
+	breakAfter := f.breakAfter
+	f.breakAfter = 0
 	sent := uint32(0)
 	for _, name := range f.names {
 		if name < r.StartFromFileName || name == r.StartFromFileName && !r.InclusiveStartFrom {
@@ -112,6 +120,9 @@ func (f *listFiler) ListEntries(r *filer_pb.ListEntriesRequest, stream grpc.Serv
 			break
 		}
 		attr := &filer_pb.FuseAttributes{FileMode: 0o644, Inode: f.dir.Child(name).AsInode(1), Crtime: 1, Mtime: 1}
+		if breakAfter != 0 && int(sent) == breakAfter {
+			return status.Error(codes.Unavailable, "connection reset")
+		}
 		if err := stream.Send(&filer_pb.ListEntriesResponse{Entry: &filer_pb.Entry{Name: name, Attributes: attr}}); err != nil {
 			return err
 		}
@@ -132,7 +143,7 @@ func TestReadDirectoryAfterSurvivesAPurge(t *testing.T) {
 	startFakeFiler(t, wfs, &listFiler{dir: dir, names: names})
 	dirInode, _ := wfs.inodeToPath.GetInode(dir)
 	var got []string
-	eof, status := wfs.ReadDirectoryAfter(dirInode, "", false, func(e *ListedEntry) bool {
+	eof, status := wfs.ReadDirectoryAfter(dirInode, "", false, nil, func(e *ListedEntry) bool {
 		if len(got) == 500 {
 			wfs.purgeDirectoryCache(dir)
 			deadline := time.Now().Add(5 * time.Second)
@@ -156,7 +167,7 @@ func TestReadDirectoryAfterRefusedEntryLeavesNoTrace(t *testing.T) {
 	dir := util.FullPath("/d")
 	wfs := newPagingWFS(t, dir, []string{"a", "b"}, 0)
 	dirInode, _ := wfs.inodeToPath.GetInode(dir)
-	wfs.ReadDirectoryAfter(dirInode, "", true, func(e *ListedEntry) bool { return e.Name == "a" })
+	wfs.ReadDirectoryAfter(dirInode, "", true, nil, func(e *ListedEntry) bool { return e.Name == "a" })
 	if !wfs.inodeToPath.HasPath(dir.Child("a")) || wfs.inodeToPath.HasPath(dir.Child("b")) {
 		t.Fatal("the refused entry stayed in the inode table, or the accepted one is missing")
 	}
@@ -184,8 +195,44 @@ func TestReadDirectoryAfterReadsOpenEntriesUnderLock(t *testing.T) {
 		}
 	}()
 	for range 200 {
-		wfs.ReadDirectoryAfter(dirInode, "", true, func(*ListedEntry) bool { return true })
+		wfs.ReadDirectoryAfter(dirInode, "", true, nil, func(*ListedEntry) bool { return true })
 	}
 	close(stop)
 	<-done
+}
+
+// A filer listing interrupted part-way and retried yields each name once.
+func TestReadDirectoryAfterRetriedStream(t *testing.T) {
+	dir := util.FullPath("/d")
+	var names []string
+	for i := range 30 {
+		names = append(names, fmt.Sprintf("f%02d", i))
+	}
+	wfs := newPagingWFS(t, dir, nil, 0)
+	startFakeFiler(t, wfs, &listFiler{dir: dir, names: names, breakAfter: 9})
+	var got []string
+	eof, st := wfs.listDirectAfter(dir, "", func(e *filer.Entry) bool {
+		got = append(got, e.Name())
+		return true
+	})
+	if st != fuse.OK || !eof || !slices.Equal(got, names) {
+		t.Fatalf("status %v, eof %v, %d names for %d", st, eof, len(got), len(names))
+	}
+}
+
+// An entry fits refuses is never entered, not even for a moment.
+func TestReadDirectoryAfterAsksFitsFirst(t *testing.T) {
+	dir := util.FullPath("/d")
+	wfs := newPagingWFS(t, dir, []string{"a", "b"}, 0)
+	dirInode, _ := wfs.inodeToPath.GetInode(dir)
+	entered := 0
+	wfs.ReadDirectoryAfter(dirInode, "", true, func(name string) bool {
+		if name == "b" && wfs.inodeToPath.HasPath(dir.Child("b")) {
+			t.Fatal("b was entered before fits was asked")
+		}
+		return name == "a"
+	}, func(*ListedEntry) bool { entered++; return true })
+	if entered != 1 || wfs.inodeToPath.HasPath(dir.Child("b")) {
+		t.Fatalf("%d entered; b in the table: %v", entered, wfs.inodeToPath.HasPath(dir.Child("b")))
+	}
 }
