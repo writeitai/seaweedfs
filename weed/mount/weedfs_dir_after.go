@@ -190,7 +190,8 @@ func (wfs *WFS) openEntry(fh *FileHandle, dirPath util.FullPath, listed *filer.E
 	// agree.
 	open := fh.entry.Entry
 	kind := EntryKind(listed.IsDirectory(), listed.Mode)
-	if open == nil || !wfs.inodeToPath.Holds(fh.inode, kind, string(listed.HardLinkId), listed.Inode) ||
+	if open == nil || !wfs.inodeToPath.HoldsEntry(fh.inode, open) ||
+		!wfs.inodeToPath.Holds(fh.inode, kind, string(listed.HardLinkId), listed.Inode) ||
 		listed.Inode != 0 && open.GetAttributes().GetInode() != listed.Inode ||
 		PbEntryKind(open) != kind || !bytes.Equal(open.GetHardLinkId(), listed.HardLinkId) {
 		return listed

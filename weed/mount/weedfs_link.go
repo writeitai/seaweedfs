@@ -205,6 +205,19 @@ func (wfs *WFS) Link(cancel <-chan struct{}, in *fuse.LinkIn, name string, out *
 	}
 
 	wfs.inodeToPath.AddPath(sourceInode, newEntryPath)
+	if converting {
+		// An open handle of the source holds it as a hard link now, before
+		// EndLink makes only that form the source's (Mountable).
+		if fh, found := wfs.fhMap.FindFileHandle(sourceInode); found {
+			fhActiveLock := wfs.fhLockTable.AcquireLock("Link", fh.fh, util.ExclusiveLock)
+			fh.UpdateEntry(func(entry *filer_pb.Entry) {
+				if entry != nil {
+					entry.HardLinkId, entry.HardLinkCounter = group, oldEntry.HardLinkCounter
+				}
+			})
+			wfs.fhLockTable.ReleaseLock(fh.fh, fhActiveLock)
+		}
+	}
 
 	// Propagate the new HardLinkCounter to sibling cache entries and
 	// invalidate the kernel's inode attr cache. Without this, `stat` on any

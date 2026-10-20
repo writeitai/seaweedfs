@@ -510,12 +510,19 @@ func (wfs *WFS) maybeReadEntry(inode uint64) (path util.FullPath, fh *FileHandle
 	var found bool
 	if fh, found = wfs.fhMap.FindFileHandle(inode); found {
 		path, _ = wfs.inodeToPath.GetPath(inode)
+		// The handle's entry answers only while it is the inode's object
+		// (Mountable: see InodeToPath.Holds); otherwise the namespace does.
+		holds := false
 		entry = fh.UpdateEntry(func(entry *filer_pb.Entry) {
 			if entry != nil && fh.entry.Attributes == nil {
 				entry.Attributes = &filer_pb.FuseAttributes{}
 			}
+			holds = entry != nil && wfs.inodeToPath.HoldsEntry(inode, entry)
 		})
-		return path, fh, entry, fuse.OK
+		if holds {
+			return path, fh, entry, fuse.OK
+		}
+		fh, entry = nil, nil
 	}
 	path, status = wfs.inodeToPath.GetPath(inode)
 	if status != fuse.OK {
@@ -1058,6 +1065,19 @@ func (wfs *WFS) invalidateOpenFileHandle(invalidation meta_cache.EntryInvalidati
 		if !fh.dirtyMetadata {
 			fh.dirtyPages.Destroy()
 			fh.dirtyPages = newPageWriter(fh, wfs.option.ChunkSizeLimit)
+		}
+		fh.advanceEntryVersion(eventTsNs, 0)
+		return
+	}
+	if !wfs.inodeToPath.HoldsEntry(inode, candidate) {
+		// Another object took the path (Mountable: see InodeToPath.Holds).
+		// The handle keeps its own object, and the path no longer leads to
+		// the inode; with no other path left, the object is unlinked, and
+		// no flush may write it over the newcomer.
+		wfs.inodeToPath.DetachPath(inode, filePath)
+		if _, st := wfs.inodeToPath.GetPath(inode); st != fuse.OK {
+			fh.isDeleted = true
+			fh.deleteEpoch++
 		}
 		fh.advanceEntryVersion(eventTsNs, 0)
 		return

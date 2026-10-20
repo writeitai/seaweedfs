@@ -2075,3 +2075,41 @@ func TestAckFromAnotherFilerIsNotDroppedBehindForeignFence(t *testing.T) {
 		t.Fatal("an older ack from the fencing filer was installed; within one clock domain it must be refused")
 	}
 }
+
+// An event putting another object at an open file's path (another stored
+// inode: an overwrite) leaves the handle its own entry, and the path no
+// longer leads to the inode; with no other path left, no flush may write
+// the old file over the newcomer.
+func TestOverwriteEventLeavesTheHandleItsObject(t *testing.T) {
+	wfs := newInvalidateTestWFS(t)
+	inode := wfs.inodeToPath.Lookup(util.FullPath("/dir/file"), time.Now().Unix(), false, false, 500, false)
+	fh, _ := wfs.fhMap.AcquireFileHandle(wfs, inode, &filer_pb.Entry{
+		Name:       "file",
+		Attributes: &filer_pb.FuseAttributes{FileSize: 88, Inode: 500},
+	}, 0, 0)
+	overwrite := &filer_pb.SubscribeMetadataResponse{
+		Directory: "/dir",
+		TsNs:      1000,
+		EventNotification: &filer_pb.EventNotification{
+			OldEntry: &filer_pb.Entry{Name: "file"},
+			NewEntry: &filer_pb.Entry{
+				Name:       "file",
+				Attributes: &filer_pb.FuseAttributes{FileSize: 7, Inode: 9999},
+			},
+			NewParentPath: "/dir",
+		},
+	}
+	if err := wfs.metaCache.ApplyMetadataResponse(context.Background(), overwrite, meta_cache.SubscriberMetadataResponseApplyOptions); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	wfs.metaCache.WaitForEntryInvalidations()
+	if entry := fh.GetEntry().GetEntry(); entry.Attributes.FileSize != 88 || entry.Attributes.Inode != 500 {
+		t.Fatalf("the handle took the newcomer: %+v", entry.Attributes)
+	}
+	if _, st := wfs.inodeToPath.GetPath(inode); st == fuse.OK {
+		t.Fatal("the path still leads to the overwritten file's inode")
+	}
+	if !fh.isDeleted {
+		t.Fatal("the overwritten file's handle may still flush over the newcomer")
+	}
+}

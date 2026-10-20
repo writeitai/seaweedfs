@@ -403,3 +403,29 @@ func TestFileReplacedByASymlink(t *testing.T) {
 		t.Fatal("Holds tells a symlink from a regular file wrongly")
 	}
 }
+
+// An open handle holding another object than its inode's (another group
+// with the same stored inode) answers for nothing: GetAttr goes by the
+// namespace, and a fresh open puts the inode's own object back on the
+// handle, so it reads that.
+func TestHandleOfAnotherObjectAnswersForNothing(t *testing.T) {
+	wfs, _, inode := linkedWFS(t)
+	wfs.openMtimeCache = map[uint64][2]int64{}
+	fh, _ := wfs.fhMap.AcquireFileHandle(wfs, inode, linkEntry("one", 4242, "other", "intruder"), 0, 0)
+	var out fuse.AttrOut
+	if st := wfs.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{NodeId: inode}}, &out); st != fuse.OK || out.Size != 6 {
+		t.Fatalf("GetAttr %v: size %d", st, out.Size)
+	}
+	var opened fuse.OpenOut
+	if st := wfs.Open(nil, &fuse.OpenIn{InHeader: fuse.InHeader{NodeId: inode}}, &opened); st != fuse.OK || opened.Fh != uint64(fh.fh) {
+		t.Fatalf("Open %v: handle %d (existing %d)", st, opened.Fh, fh.fh)
+	}
+	buf := make([]byte, 16)
+	r, st := wfs.ReadAs(nil, &fuse.ReadIn{InHeader: fuse.InHeader{NodeId: inode}, Fh: opened.Fh, Size: 16}, buf, 4242)
+	if st != fuse.OK {
+		t.Fatalf("ReadAs: %v", st)
+	}
+	if data, _ := r.Bytes(buf); string(data) != "shared" {
+		t.Fatalf("read %q", data)
+	}
+}

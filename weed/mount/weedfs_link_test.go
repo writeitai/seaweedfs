@@ -254,3 +254,27 @@ func TestLinkSyncsHardLinkSiblingsOnThirdLink(t *testing.T) {
 		}
 	}
 }
+
+// Turning a standalone file into a hard link here keeps it its own object
+// throughout, and an open handle of it holds it as the link afterwards, so
+// it still reads.
+func TestLinkKeepsAnOpenSourceItsOwn(t *testing.T) {
+	wfs, _ := newCreateTestWFS(t)
+	_, sourceInode := linkTestSource(t, wfs, "open.txt", 0)
+	fh, _ := wfs.fhMap.AcquireFileHandle(wfs, sourceInode, &filer_pb.Entry{
+		Name: "open.txt", Content: []byte("hello"),
+		Attributes: &filer_pb.FuseAttributes{FileMode: 0o644, FileSize: 5, Crtime: 1, Mtime: 1},
+	}, 0, 0)
+	doLink(t, wfs, sourceInode, "second.txt")
+	if !wfs.handleHolds(fh) {
+		t.Fatal("the open source's handle no longer holds it")
+	}
+	buf := make([]byte, 16)
+	r, st := wfs.ReadAs(nil, &fuse.ReadIn{InHeader: fuse.InHeader{NodeId: sourceInode}, Fh: uint64(fh.fh), Size: 16}, buf, 0)
+	if st != fuse.OK {
+		t.Fatalf("ReadAs after the link: %v", st)
+	}
+	if data, _ := r.Bytes(buf); string(data) != "hello" {
+		t.Fatalf("read %q", data)
+	}
+}

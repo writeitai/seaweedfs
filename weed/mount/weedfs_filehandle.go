@@ -8,6 +8,8 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/cluster/lock_manager"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/util"
+	"google.golang.org/protobuf/proto"
 )
 
 func (wfs *WFS) AcquireHandle(inode uint64, flags, uid, gid uint32) (fileHandle *FileHandle, status fuse.Status) {
@@ -30,7 +32,18 @@ func (wfs *WFS) AcquireHandle(inode uint64, flags, uid, gid uint32) (fileHandle 
 	var entry *filer_pb.Entry
 	var entryVersionTsNs entryVersion
 	freshLookup := false
-	if existingFh, found := wfs.fhMap.FindFileHandle(inode); found {
+	existingFh, found := wfs.fhMap.FindFileHandle(inode)
+	if found && !wfs.handleHolds(existingFh) {
+		// The handle holds another object than the inode's (Mountable: see
+		// InodeToPath.Holds): it gets the inode's own back, if it can.
+		var loaded *filer_pb.Entry
+		var loadedVersion entryVersion
+		if path, loaded, loadedVersion, status = wfs.loadInodeEntry(inode, path); status != fuse.OK {
+			return nil, status
+		}
+		wfs.reclaimHandle(existingFh, loaded, loadedVersion)
+	}
+	if found {
 		entry = existingFh.UpdateEntry(func(entry *filer_pb.Entry) {
 			if entry != nil && existingFh.entry.Attributes == nil {
 				entry.Attributes = &filer_pb.FuseAttributes{}
@@ -138,4 +151,29 @@ func (wfs *WFS) waitForPendingAsyncFlush(inode uint64) {
 
 func (wfs *WFS) GetHandle(handleId FileHandleId) *FileHandle {
 	return wfs.fhMap.GetFileHandle(handleId)
+}
+
+// handleHolds reports whether an open handle's entry is its inode's object
+// by the identity rule (Mountable: see InodeToPath.Holds).
+func (wfs *WFS) handleHolds(fh *FileHandle) bool {
+	fh.entry.RLock()
+	defer fh.entry.RUnlock()
+	return fh.entry.Entry != nil && wfs.inodeToPath.HoldsEntry(fh.inode, fh.entry.Entry)
+}
+
+// reclaimHandle installs the inode's own entry on a handle that holds
+// another object, under the handle lock, unless the handle has local
+// writes, which only a flush may settle (Mountable).
+func (wfs *WFS) reclaimHandle(fh *FileHandle, entry *filer_pb.Entry, version entryVersion) {
+	fhActiveLock := wfs.fhLockTable.AcquireLock("reclaimHandle", fh.fh, util.ExclusiveLock)
+	defer wfs.fhLockTable.ReleaseLock(fh.fh, fhActiveLock)
+	if fh.dirtyMetadata || wfs.handleHolds(fh) {
+		return
+	}
+	entry = proto.Clone(entry).(*filer_pb.Entry)
+	fh.dirtyPages.Destroy()
+	fh.dirtyPages = newPageWriter(fh, wfs.option.ChunkSizeLimit)
+	fh.SetEntry(entry)
+	fh.baseEntry.Store(proto.Clone(entry).(*filer_pb.Entry))
+	fh.advanceEntryVersion(version.tsNs, version.signature)
 }
