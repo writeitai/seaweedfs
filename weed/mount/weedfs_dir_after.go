@@ -1,0 +1,156 @@
+package mount
+
+// ReadDirectoryAfter: a directory listing that resumes after a name.
+//
+// Mountable (writeitai/seaweedfs, branch mountable): added for the macOS
+// NFS mount, whose directory cookies stand for the last name a page
+// returned rather than a position in a readdir stream, so a listing
+// survives entries being added or removed between pages and a restarted
+// listing elsewhere. It reads from the same source as doReadDirectory,
+// enters entries and takes lookup references the same way, and only for
+// what the caller accepts. See design/designs/macos-mount.md §4,
+// "Directories", in writeitai/fsit.
+
+import (
+	"context"
+	"errors"
+	"strings"
+
+	"github.com/seaweedfs/go-fuse/v2/fuse"
+	"github.com/seaweedfs/seaweedfs/weed/filer"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/mount/meta_cache"
+	"github.com/seaweedfs/seaweedfs/weed/util"
+)
+
+// ListedEntry is one entry ReadDirectoryAfter lists.
+type ListedEntry struct {
+	Name string
+	// Inode is the mount's inode for the entry; StoredInode is the inode
+	// the store keeps with it, the object's own identity. They differ when
+	// another object has taken a path the mount already knew.
+	Inode, StoredInode uint64
+	// Out holds the entry's attributes on a plus listing, as a readdirplus
+	// reports them.
+	Out *fuse.EntryOut
+}
+
+// ReadDirectoryAfter lists the directory dir from the first name after
+// `after` ("" for the start), in the store's name order, calling add for
+// each entry until add returns false or the directory ends, which eof
+// reports. "." and ".." are not listed.
+//
+// It reads what a readdir reads: the cached listing, or for a directory
+// too large to cache the filer, a batch at a time. On a plus listing each
+// entry add accepts is entered in the inode table and holds one lookup
+// reference, returned with Forget; an entry add refuses takes none.
+func (wfs *WFS) ReadDirectoryAfter(dir uint64, after string, plus bool, add func(*ListedEntry) bool) (eof bool, code fuse.Status) {
+	dirPath, code := wfs.inodeToPath.GetPath(dir)
+	if code != fuse.OK {
+		return false, code
+	}
+	wfs.inodeToPath.TouchDirectory(dirPath)
+	each := func(entry *filer.Entry) bool { return wfs.listEntryAfter(dirPath, entry, plus, add) }
+	if !wfs.inodeToPath.ShouldReadDirectoryDirect(dirPath) {
+		err := wfs.ensureDirectoryVisited(dirPath)
+		var tooLarge *meta_cache.DirectoryTooLargeError
+		switch {
+		case errors.As(err, &tooLarge):
+		case err != nil:
+			glog.Errorf("dir ReadDirectoryAfter %s: %v", dirPath, err)
+			return false, fuse.EIO
+		default:
+			if eof, code, cached := wfs.listCachedAfter(dirPath, after, each); cached {
+				return eof, code
+			}
+		}
+	}
+	return wfs.listDirectAfter(dirPath, after, each)
+}
+
+// listCachedAfter lists from the meta cache. cached is false when the
+// directory has to be read from the filer instead.
+func (wfs *WFS) listCachedAfter(dirPath util.FullPath, after string, each func(*filer.Entry) bool) (eof bool, code fuse.Status, cached bool) {
+	if err := meta_cache.EnsureListingFresh(context.Background(), wfs.metaCache, wfs, dirPath, after); err != nil {
+		if errors.Is(err, meta_cache.ErrRefreshRangeTooLarge) {
+			wfs.purgeDirectoryCache(dirPath)
+			return false, fuse.OK, false
+		}
+		// Serve the maintained-but-unverified cache if the filer is unreachable.
+		glog.V(1).Infof("refresh %s sections: %v", dirPath, err)
+	}
+	for {
+		stopped := false
+		// The store reaching nothing is the end: a batch can come back short
+		// because entries expired, so page from where the store got to.
+		last, err := wfs.metaCache.ListDirectoryEntries(readdirContext, dirPath, after, false, batchSize, func(entry *filer.Entry) (bool, error) {
+			if !each(entry) {
+				stopped = true
+				return false, nil
+			}
+			return true, nil
+		})
+		switch {
+		case err != nil:
+			glog.Errorf("list meta cache: %v", err)
+			return false, fuse.EIO, true
+		case stopped:
+			return false, fuse.OK, true
+		case last == "":
+			return true, fuse.OK, true
+		}
+		after = last
+	}
+}
+
+// listDirectAfter lists from the filer, for a directory too large to cache.
+func (wfs *WFS) listDirectAfter(dirPath util.FullPath, after string, each func(*filer.Entry) bool) (eof bool, code fuse.Status) {
+	for {
+		entries, _, err := loadDirectoryEntriesDirect(readdirContext, wfs, wfs.option.UidGidMapper, dirPath, after, false, batchSize, 0, wfs.option.IncludeSystemEntries)
+		if err != nil {
+			glog.Errorf("list filer directory: %v", err)
+			return false, fuse.EIO
+		}
+		for _, entry := range entries {
+			if !each(entry) {
+				return false, fuse.OK
+			}
+			after = entry.Name()
+		}
+		if len(entries) < batchSize {
+			return true, fuse.OK
+		}
+	}
+}
+
+// listEntryAfter hands one entry to add, as doReadDirectory's per-entry
+// step does: a plain listing reports the inode a listing shows; a plus
+// listing enters the entry and takes its reference once add accepts it.
+func (wfs *WFS) listEntryAfter(dirPath util.FullPath, entry *filer.Entry, plus bool, add func(*ListedEntry) bool) bool {
+	name := entry.Name()
+	// Rebuild only for a sanitized name: that is the one a LOOKUP carries.
+	childPath := entry.FullPath
+	if !strings.HasSuffix(string(childPath), name) {
+		childPath = dirPath.Child(name)
+	}
+	listed := &ListedEntry{Name: name, StoredInode: entry.Inode}
+	if !plus {
+		listed.Inode = wfs.inodeToPath.InodeForListing(childPath, entry.Crtime.Unix(), entry.Inode)
+		return add(listed)
+	}
+	isHardlink := len(entry.HardLinkId) > 0
+	inode := wfs.inodeToPath.Lookup(childPath, entry.Crtime.Unix(), entry.IsDirectory(), isHardlink, entry.Inode, false)
+	if fh, found := wfs.fhMap.FindFileHandle(inode); found {
+		entry = filer.FromPbEntry(string(dirPath), fh.GetEntry().GetEntry())
+	}
+	listed.Inode, listed.Out = inode, &fuse.EntryOut{}
+	wfs.outputFilerEntry(listed.Out, inode, entry)
+	if !add(listed) {
+		return false
+	}
+	// The fallback covers a racing Forget, as in doReadDirectory.
+	if !wfs.inodeToPath.IncrementNlookup(inode) {
+		wfs.inodeToPath.Lookup(childPath, entry.Crtime.Unix(), entry.IsDirectory(), isHardlink, entry.Inode, true)
+	}
+	return true
+}
