@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/seaweedfs/go-fuse/v2/fuse"
+	"github.com/seaweedfs/seaweedfs/weed/cluster"
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/mount/meta_cache"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
@@ -809,6 +810,35 @@ func TestDelayedCreateOfAFileDeletedElsewhere(t *testing.T) {
 	var looked fuse.EntryOut
 	if st := wfs.Lookup(nil, &h, "new", &looked); st != fuse.ENOENT {
 		t.Fatalf("lookup of the deleted name: %v", st)
+	}
+}
+
+// A deferred Create whose write lease cannot be taken, another creator's
+// file having taken the name in the cache meanwhile: the create fails, and
+// a lookup then finds the other creator's file.
+func TestDeferredCreateLeaseFailureKeepsAnotherCreatorsFile(t *testing.T) {
+	f := newStoreFiler()
+	wfs := newLinkTestWFS(t, f)
+	wfs.option.EagerFilerCreate = false
+	wfs.inodeToPath.MarkChildrenCached("/")
+	saved := newWriteLease
+	defer func() { newWriteLease = saved }()
+	newWriteLease = func(*cluster.LockClient, string, string) *cluster.LiveLock {
+		theirs := plainEntry("new", 9100, "theirs")
+		f.put(theirs)
+		if err := wfs.metaCache.InsertEntry(context.Background(), filer.FromPbEntry("/", f.lookup("/new")), f.logTsNs); err != nil {
+			t.Errorf("insert: %v", err)
+		}
+		return nil // no lock server
+	}
+	h := fuse.InHeader{NodeId: 1, Caller: fuse.Caller{Owner: fuse.Owner{Uid: 99, Gid: 100}}}
+	var out fuse.CreateOut
+	if st := wfs.Create(nil, &fuse.CreateIn{InHeader: h, Flags: syscall.O_WRONLY | syscall.O_CREAT, Mode: 0o644}, "new", &out); st != fuse.Status(syscall.EAGAIN) {
+		t.Fatalf("Create: %v", st)
+	}
+	var found fuse.EntryOut
+	if st := wfs.Lookup(nil, &h, "new", &found); st != fuse.OK || found.Attr.Size != uint64(len("theirs")) {
+		t.Fatalf("lookup %v, size %d", st, found.Attr.Size)
 	}
 }
 

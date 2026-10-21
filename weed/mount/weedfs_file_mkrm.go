@@ -12,6 +12,7 @@ import (
 	"github.com/seaweedfs/go-fuse/v2/fuse"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/seaweedfs/seaweedfs/weed/cluster"
 	"github.com/seaweedfs/seaweedfs/weed/cluster/lock_manager"
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
@@ -219,10 +220,10 @@ func (wfs *WFS) Create(cancel <-chan struct{}, in *fuse.CreateIn, name string, o
 	if code := wfs.acquireWriteLease(fileHandle, entryFullPath); code != fuse.OK {
 		wfs.ReleaseHandle(fileHandle.fh)
 		if !wfs.option.EagerFilerCreate {
-			// The filer never had it: its placeholder goes too.
-			if err := wfs.metaCache.DeleteEntry(context.Background(), entryFullPath); err != nil {
-				glog.Warningf("create %s: drop the placeholder: %v", entryFullPath, err)
-			}
+			// The filer never had it, but its placeholder in the cache may
+			// have been replaced by another creator's file meanwhile: the
+			// directory is read from the filer again instead.
+			wfs.inodeToPath.InvalidateChildrenCache(dirFullPath)
 		}
 		wfs.Forget(inode, 1)
 		return code
@@ -232,6 +233,12 @@ func (wfs *WFS) Create(cancel <-chan struct{}, in *fuse.CreateIn, name string, o
 	out.OpenFlags = 0
 
 	return fuse.OK
+}
+
+// newWriteLease takes a write lease, waiting for it; nil when no lock
+// server is reachable. A variable for tests (Mountable).
+var newWriteLease = func(lc *cluster.LockClient, key, owner string) *cluster.LiveLock {
+	return lc.NewBlockingLongLivedLock(key, owner, lock_manager.LiveLockTTL)
 }
 
 // acquireWriteLease gives fh the distributed lock's lease on path for
@@ -247,8 +254,7 @@ func (wfs *WFS) acquireWriteLease(fh *FileHandle, path util.FullPath) fuse.Statu
 	if fh.dlmLock != nil {
 		return fuse.OK
 	}
-	owner := fmt.Sprintf("mount-%d", wfs.signature)
-	fh.dlmLock = wfs.lockClient.NewBlockingLongLivedLock(string(path), owner, lock_manager.LiveLockTTL)
+	fh.dlmLock = newWriteLease(wfs.lockClient, string(path), fmt.Sprintf("mount-%d", wfs.signature))
 	if fh.dlmLock == nil {
 		// No lock server is reachable: proceeding would silently drop
 		// cross-mount write serialization, so fail instead.
