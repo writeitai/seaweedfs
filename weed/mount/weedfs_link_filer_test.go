@@ -37,6 +37,7 @@ type storeFiler struct {
 	beforeCreate func(*filer_pb.CreateEntryRequest)
 	afterCreate  func(*filer_pb.CreateEntryRequest) (*filer_pb.CreateEntryResponse, error)
 	locks        map[string]string // lock name -> token
+	locked       []string          // every lock name taken, in order
 }
 
 func newStoreFiler() *storeFiler {
@@ -175,6 +176,9 @@ func (f *storeFiler) DistributedLock(_ context.Context, r *filer_pb.LockRequest)
 		return &filer_pb.LockResponse{Error: "lock already owned"}, nil
 	}
 	token := r.Name + "/" + r.Owner + "/" + time.Now().String()
+	if r.RenewToken == "" {
+		f.locked = append(f.locked, r.Name)
+	}
 	f.locks[r.Name] = token
 	return &filer_pb.LockResponse{RenewToken: token, LockOwner: r.Owner}, nil
 }

@@ -49,7 +49,6 @@ func (wfs *WFS) Link(cancel <-chan struct{}, in *fuse.LinkIn, name string, out *
 	if code != fuse.OK {
 		return
 	}
-	oldParentPath, _ := oldEntryPath.DirAndName()
 
 	// The new link has to be reported with the node id the kernel already holds
 	// for the source, which is what makes the two names share one file.
@@ -84,20 +83,36 @@ func (wfs *WFS) Link(cancel <-chan struct{}, in *fuse.LinkIn, name string, out *
 	// A standalone source's group is allocated here, and locked before the
 	// promotion makes it visible: another mount linking into it waits until
 	// the new name exists, or the counter is back.
+	// When the cache was wrong about the source's group, the group the
+	// filer has is locked, and the source read again under it.
 	group := oldEntry.HardLinkId
 	if len(group) == 0 {
 		group = filer.NewHardLinkId()
 	}
+	for range 3 {
+		code, other := wfs.linkLocked(in, sourceInode, oldEntryPath, newParentPath, name, group, out)
+		if other == nil {
+			return code
+		}
+		group = other
+	}
+	return fuse.Status(syscall.EAGAIN)
+}
+
+// linkLocked is Link with the group's locks: group is the source's, or
+// the one allocated for it. When the filer has the source in another
+// group, it returns that group and changes nothing.
+func (wfs *WFS) linkLocked(in *fuse.LinkIn, sourceInode uint64, oldEntryPath, newParentPath util.FullPath, name string, group []byte, out *fuse.EntryOut) (fuse.Status, []byte) {
 	release, code := wfs.lockHardLinkGroup(group)
 	if code != fuse.OK {
-		return code
+		return code, nil
 	}
 	defer release()
 	inodeLock := wfs.inodeLocks().AcquireLock("link", sourceInode, util.ExclusiveLock)
 	defer wfs.inodeLocks().ReleaseLock(sourceInode, inodeLock)
 	fh, fhLock, code := wfs.lockFlushedHandle(sourceInode, in.Uid, in.Gid)
 	if code != fuse.OK {
-		return code
+		return code, nil
 	}
 	if fh != nil {
 		defer wfs.fhLockTable.ReleaseLock(fh.fh, fhLock)
@@ -111,21 +126,21 @@ func (wfs *WFS) Link(cancel <-chan struct{}, in *fuse.LinkIn, name string, out *
 	// async flush, which would need the handle lock held here.
 	oldEntryPath, code = wfs.inodeToPath.GetPath(sourceInode)
 	if code != fuse.OK {
-		return code
+		return code, nil
 	}
-	oldParentPath, _ = oldEntryPath.DirAndName()
+	oldParentPath, _ := oldEntryPath.DirAndName()
 	read, _, _, err := filer_pb.GetEntry(context.Background(), wfs, oldEntryPath)
 	if err != nil {
 		if errors.Is(err, filer_pb.ErrNotFound) {
-			return fuse.ENOENT
+			return fuse.ENOENT, nil
 		}
-		return fuse.EIO
+		return fuse.EIO, nil
 	}
 	if read == nil || !wfs.inodeToPath.HoldsEntry(sourceInode, read) {
-		return fuse.ENOENT
+		return fuse.ENOENT, nil
 	}
 	if len(read.HardLinkId) > 0 && !bytes.Equal(read.HardLinkId, group) {
-		return fuse.ENOENT // made a hard link of another group meanwhile
+		return fuse.OK, read.HardLinkId
 	}
 
 	// Promote the source: hard-link mode, its counter raised, before the new
@@ -162,9 +177,9 @@ func (wfs *WFS) Link(cancel <-chan struct{}, in *fuse.LinkIn, name string, out *
 	if err != nil {
 		glog.V(0).Infof("Link %v: promoting the source: %v", oldEntryPath, err)
 		if code := status.Code(err); code == codes.FailedPrecondition || isNotFound(err) {
-			return fuse.ENOENT
+			return fuse.ENOENT, nil
 		}
-		return fuse.EIO
+		return fuse.EIO, nil
 	}
 	linked = true
 	acked := promoted
@@ -177,6 +192,7 @@ func (wfs *WFS) Link(cancel <-chan struct{}, in *fuse.LinkIn, name string, out *
 	updateEvent := updateResp.GetMetadataEvent()
 	if updateEvent == nil {
 		updateEvent = metadataUpdateEvent(oldParentPath, acked)
+		updateEvent.TsNs = ackVersionTsNs(updateResp)
 	}
 	if applyErr := wfs.applyLocalMetadataEvent(ctx, updateEvent); applyErr != nil {
 		glog.Warningf("link %s: best-effort metadata apply failed: %v", oldEntryPath, applyErr)
@@ -211,7 +227,7 @@ func (wfs *WFS) Link(cancel <-chan struct{}, in *fuse.LinkIn, name string, out *
 		})
 		if rollbackErr != nil {
 			glog.Warningf("link rollback %s: %v", oldEntryPath, rollbackErr)
-			return fuse.Status(syscall.EEXIST)
+			return fuse.Status(syscall.EEXIST), nil
 		}
 		// The mount takes the rolled-back source, as acknowledged, before
 		// the conversion ends: the cache, and the open handle, fenced.
@@ -223,22 +239,24 @@ func (wfs *WFS) Link(cancel <-chan struct{}, in *fuse.LinkIn, name string, out *
 		rollbackEvent := rollbackResp.GetMetadataEvent()
 		if rollbackEvent == nil {
 			rollbackEvent = metadataUpdateEvent(oldParentPath, rollback)
+			rollbackEvent.TsNs = ackVersionTsNs(rollbackResp)
 		}
 		if applyErr := wfs.applyLocalMetadataEvent(ctx, rollbackEvent); applyErr != nil {
 			glog.Warningf("link rollback %s: best-effort metadata apply failed: %v", oldEntryPath, applyErr)
 			wfs.inodeToPath.InvalidateChildrenCache(util.FullPath(oldParentPath))
 		}
-		return fuse.Status(syscall.EEXIST)
+		return fuse.Status(syscall.EEXIST), nil
 	case err != nil || createResp.GetError() != "":
 		// Ambiguous: the name may exist although the reply says otherwise.
 		// The extra reference stays, which keeps chunks longer, never too
 		// short, and Link fails.
 		glog.V(0).Infof("Link %v -> %s: %v %s", oldEntryPath, newEntryPath, err, createResp.GetError())
-		return fuse.EIO
+		return fuse.EIO, nil
 	}
 	createEvent := createResp.GetMetadataEvent()
 	if createEvent == nil {
 		createEvent = metadataCreateEvent(string(newParentPath), alias)
+		createEvent.TsNs = ackVersionTsNs(createResp)
 	}
 	if applyErr := wfs.applyLocalMetadataEvent(ctx, createEvent); applyErr != nil {
 		glog.Warningf("link %s: best-effort metadata apply failed: %v", newEntryPath, applyErr)
@@ -260,7 +278,8 @@ func (wfs *WFS) Link(cancel <-chan struct{}, in *fuse.LinkIn, name string, out *
 	wfs.mapPbIdFromFilerToLocal(reported)
 	wfs.outputPbEntry(out, sourceInode, reported)
 
-	return fuse.OK
+	return fuse.OK, nil
+
 }
 
 // syncHardLinkSiblings rewrites the cached HardLinkCounter (and ctime) on

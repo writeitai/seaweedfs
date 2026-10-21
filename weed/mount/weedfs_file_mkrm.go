@@ -1,6 +1,7 @@
 package mount
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -87,7 +88,8 @@ func (wfs *WFS) Create(cancel <-chan struct{}, in *fuse.CreateIn, name string, o
 		}
 	}
 
-	inode, newEntry, code = wfs.createRegularFile(dirFullPath, name, in.Mode, in.Uid, in.Gid, 0, !wfs.option.EagerFilerCreate, true)
+	var version entryVersion
+	inode, newEntry, version, code = wfs.createRegularFileAt(dirFullPath, name, in.Mode, in.Uid, in.Gid, 0, !wfs.option.EagerFilerCreate, true)
 	if code == fuse.Status(syscall.EEXIST) && in.Flags&syscall.O_EXCL == 0 {
 		// Race: another process created the file between our check and create.
 		// Reopen the winner's entry; AcquireHandle takes its own lock.
@@ -131,9 +133,9 @@ func (wfs *WFS) Create(cancel <-chan struct{}, in *fuse.CreateIn, name string, o
 		inodeLock := wfs.inodeLocks().AcquireLock("create", inode, util.SharedLock)
 		defer wfs.inodeLocks().ReleaseLock(inode, inodeLock)
 		if wfs.option.EagerFilerCreate {
-			if latest, _, st := wfs.maybeLoadEntry(entryFullPath); st == fuse.OK && len(latest.HardLinkId) > 0 &&
+			if latest, latestVersion, st := wfs.maybeLoadEntry(entryFullPath); st == fuse.OK && len(latest.HardLinkId) > 0 &&
 				latest.GetAttributes().GetInode() == newEntry.Attributes.Inode {
-				newEntry = latest
+				newEntry, version = latest, latestVersion
 			}
 		}
 		inode = wfs.inodeToPath.LookupLinked(entryFullPath, newEntry.Attributes.Crtime, PbEntryKind(newEntry), string(newEntry.HardLinkId), inode, true)
@@ -144,7 +146,11 @@ func (wfs *WFS) Create(cancel <-chan struct{}, in *fuse.CreateIn, name string, o
 	// For deferred creates, bypass AcquireHandle (which calls maybeReadEntry
 	// and would fail since the entry is not yet on the filer or in the meta cache).
 	// We already have the entry from createRegularFile, so create the handle directly.
-	fileHandle, existed := wfs.fhMap.AcquireFileHandle(wfs, inode, newEntry, 0, 0)
+	// The handle is fenced at the create's acknowledgement (Mountable), so
+	// no older event replaces its entry; a handle that outlived a previous
+	// incarnation takes the new entry as its base, under its lock, and
+	// nothing of that one's state carries over.
+	fileHandle, existed := wfs.fhMap.AcquireFileHandle(wfs, inode, newEntry, version.tsNs, version.signature)
 	fhActiveLock := wfs.fhLockTable.AcquireLock("create", fileHandle.fh, util.ExclusiveLock)
 	if existed {
 		// A create is authoritative for the entry it just made, so it takes
@@ -154,8 +160,8 @@ func (wfs *WFS) Create(cancel <-chan struct{}, in *fuse.CreateIn, name string, o
 		fileHandle.SetEntry(newEntry)
 		fileHandle.setAuthoritativeBase(proto.Clone(newEntry).(*filer_pb.Entry))
 		fileHandle.isDeleted, fileHandle.isRenamed, fileHandle.persistErr = false, false, 0
-		fileHandle.entryVersionTsNs.Store(0)
-		fileHandle.entryVersionSignature.Store(0)
+		fileHandle.entryVersionTsNs.Store(version.tsNs)
+		fileHandle.entryVersionSignature.Store(version.signature)
 	}
 	fileHandle.RememberPath(entryFullPath)
 	// Mark dirty so the deferred filer create happens on Flush, even if the
@@ -257,12 +263,28 @@ func (wfs *WFS) Unlink(cancel <-chan struct{}, header *fuse.InHeader, name strin
 	// changes to the group too, and the entry is read again from the filer
 	// under it, the shared record included (architecture §4 obligation 13
 	// in writeitai/fsit).
-	if entry != nil && len(entry.HardLinkId) > 0 {
-		release, lockCode := wfs.lockHardLinkGroup(entry.HardLinkId)
+	//
+	// When the cache was wrong about the group, the filer's is locked and
+	// the entry read again under it. A name the cache took for standalone
+	// is unlinked without a group lock: a Link of it elsewhere then fails
+	// its promotion's condition, or keeps a counter one too high, never too
+	// low.
+	var releaseGroup func()
+	defer func() {
+		if releaseGroup != nil {
+			releaseGroup()
+		}
+	}()
+	for group := entry.GetHardLinkId(); len(group) > 0; {
+		if releaseGroup != nil {
+			releaseGroup() // the cache's group, which it is not
+			releaseGroup = nil
+		}
+		release, lockCode := wfs.lockHardLinkGroup(group)
 		if lockCode != fuse.OK {
 			return lockCode
 		}
-		defer release()
+		releaseGroup = release
 		// If another thread unlinked the entry while we waited for the
 		// lock, the file is already gone — return OK like the initial
 		// maybeLoadEntry path above. Do not fall back to the stale
@@ -277,6 +299,10 @@ func (wfs *WFS) Unlink(cancel <-chan struct{}, header *fuse.InHeader, name strin
 		}
 		wfs.mapPbIdFromFilerToLocal(fresh)
 		entry = fresh
+		if len(fresh.HardLinkId) == 0 || bytes.Equal(fresh.HardLinkId, group) {
+			break
+		}
+		group = fresh.HardLinkId
 	}
 
 	// POSIX: enforce sticky bit on the parent directory.
@@ -371,8 +397,16 @@ func (wfs *WFS) Unlink(cancel <-chan struct{}, header *fuse.InHeader, name strin
 }
 
 func (wfs *WFS) createRegularFile(dirFullPath util.FullPath, name string, mode uint32, uid, gid, rdev uint32, deferFilerCreate bool, skipExistenceCheck bool) (inode uint64, newEntry *filer_pb.Entry, code fuse.Status) {
+	inode, newEntry, _, code = wfs.createRegularFileAt(dirFullPath, name, mode, uid, gid, rdev, deferFilerCreate, skipExistenceCheck)
+	return inode, newEntry, code
+}
+
+// createRegularFileAt is createRegularFile that also returns the log
+// position the filer acknowledged the create at, zero for one not sent
+// yet: a handle made from the entry takes it as its fence (Mountable).
+func (wfs *WFS) createRegularFileAt(dirFullPath util.FullPath, name string, mode uint32, uid, gid, rdev uint32, deferFilerCreate bool, skipExistenceCheck bool) (inode uint64, newEntry *filer_pb.Entry, version entryVersion, code fuse.Status) {
 	if wfs.IsOverQuotaWithUncommitted() {
-		return 0, nil, fuse.Status(syscall.ENOSPC)
+		return 0, nil, entryVersion{}, fuse.Status(syscall.ENOSPC)
 	}
 
 	// Load the parent directory to validate it exists (the create RPC sets
@@ -381,10 +415,10 @@ func (wfs *WFS) createRegularFile(dirFullPath util.FullPath, name string, mode u
 	// Create/Mknod, so skip only the mode-bit check and its group lookup.
 	parentEntry, _, parentStatus := wfs.maybeLoadEntry(dirFullPath)
 	if parentStatus != fuse.OK {
-		return 0, nil, parentStatus
+		return 0, nil, entryVersion{}, parentStatus
 	}
 	if parentEntry == nil || parentEntry.Attributes == nil {
-		return 0, nil, fuse.EIO
+		return 0, nil, entryVersion{}, fuse.EIO
 	}
 	if !wfs.option.DefaultPermissions {
 		// Map parent dir uid/gid from filer-space to local-space so the
@@ -394,16 +428,16 @@ func (wfs *WFS) createRegularFile(dirFullPath util.FullPath, name string, mode u
 			parentUid, parentGid = wfs.option.UidGidMapper.FilerToLocal(parentUid, parentGid)
 		}
 		if !hasAccess(uid, gid, parentUid, parentGid, parentEntry.Attributes.FileMode, fuse.W_OK|fuse.X_OK) {
-			return 0, nil, fuse.Status(syscall.EACCES)
+			return 0, nil, entryVersion{}, fuse.Status(syscall.EACCES)
 		}
 	}
 
 	entryFullPath := dirFullPath.Child(name)
 	if !skipExistenceCheck {
 		if _, _, status := wfs.maybeLoadEntry(entryFullPath); status == fuse.OK {
-			return 0, nil, fuse.Status(syscall.EEXIST)
+			return 0, nil, entryVersion{}, fuse.Status(syscall.EEXIST)
 		} else if status != fuse.ENOENT {
-			return 0, nil, status
+			return 0, nil, entryVersion{}, status
 		}
 	}
 	fileMode := toOsFileMode(mode)
@@ -449,7 +483,7 @@ func (wfs *WFS) createRegularFile(dirFullPath util.FullPath, name string, mode u
 			wfs.asyncCreateEntry(dirFullPath, newEntry)
 			glog.V(3).Infof("createFile %s: async create", entryFullPath)
 		}
-		return inode, newEntry, fuse.OK
+		return inode, newEntry, entryVersion{}, fuse.OK
 	}
 
 	wfs.mapPbIdFromLocalToFiler(newEntry)
@@ -487,10 +521,10 @@ func (wfs *WFS) createRegularFile(dirFullPath util.FullPath, name string, mode u
 	glog.V(3).Infof("createFile %s: %v", entryFullPath, err)
 
 	if err != nil {
-		return 0, nil, grpcErrorToFuseStatus(err)
+		return 0, nil, entryVersion{}, grpcErrorToFuseStatus(err)
 	}
 
-	return inode, newEntry, fuse.OK
+	return inode, newEntry, entryVersion{tsNs: ackVersionTsNs(resp), signature: resp.GetLogSignature()}, fuse.OK
 }
 
 // markHandleDeleted flags the inode's open handle so its flushes stop writing

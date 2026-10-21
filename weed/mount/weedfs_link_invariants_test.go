@@ -2,6 +2,7 @@ package mount
 
 import (
 	"context"
+	"slices"
 	"sync"
 	"syscall"
 	"testing"
@@ -78,6 +79,96 @@ func TestLinkDestinationCreatedFirst(t *testing.T) {
 	}
 	if !wfs.inodeToPath.Holds(src, 0, "", 8001) {
 		t.Fatal("the source is no longer itself")
+	}
+	var attr fuse.AttrOut
+	if st := wfs.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{NodeId: src}}, &attr); st != fuse.OK || attr.Nlink != 1 {
+		t.Fatalf("GetAttr after the failed link %v: nlink %d", st, attr.Nlink)
+	}
+}
+
+// The cache's entry for the source behind the filer's (another mount made
+// it a hard link): Link locks the group the filer has, reads the source
+// again under it, and links.
+func TestLinkLocksTheGroupTheFilerHas(t *testing.T) {
+	f := newStoreFiler()
+	wfs := newLinkTestWFS(t, f)
+	stale := plainEntry("a", 8001, "source")
+	if err := wfs.metaCache.InsertEntry(context.Background(), filer.FromPbEntry("/", stale), 0); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	src := wfs.inodeToPath.Lookup("/a", 1, false, true, 8001, true) // a link, of a group not known
+	for _, name := range []string{"a", "z"} {
+		e := plainEntry(name, 8001, "source")
+		e.HardLinkId, e.HardLinkCounter = []byte("theirs"), 2
+		f.put(e)
+	}
+	if st := tryLink(wfs, src, "b"); st != fuse.OK {
+		t.Fatalf("Link: %v", st)
+	}
+	if a := f.lookup("/a"); string(a.HardLinkId) != "theirs" || a.HardLinkCounter != 3 {
+		t.Fatalf("source %q/%d", a.HardLinkId, a.HardLinkCounter)
+	}
+	f.mu.Lock()
+	locked := f.locked
+	f.mu.Unlock()
+	if want := HardLinkLockKey([]byte("theirs")); !slices.Contains(locked, want) {
+		t.Fatalf("locked %v, not %s", locked, want)
+	}
+}
+
+// Unlink whose cached entry names another group than the filer has: the
+// filer's group is locked, the entry read again, and the name unlinked.
+func TestUnlinkLocksTheGroupTheFilerHas(t *testing.T) {
+	f := newStoreFiler()
+	wfs := newLinkTestWFS(t, f)
+	stale := plainEntry("x", 8001, "shared")
+	stale.HardLinkId, stale.HardLinkCounter = []byte("old"), 2
+	if err := wfs.metaCache.InsertEntry(context.Background(), filer.FromPbEntry("/", stale), 0); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	for _, name := range []string{"x", "y"} {
+		e := plainEntry(name, 8001, "shared")
+		e.HardLinkId, e.HardLinkCounter = []byte("new"), 2
+		f.put(e)
+	}
+	if st := wfs.Unlink(nil, &fuse.InHeader{NodeId: 1, Caller: fuse.Caller{Owner: fuse.Owner{Uid: 99, Gid: 100}}}, "x"); st != fuse.OK {
+		t.Fatalf("Unlink: %v", st)
+	}
+	if y := f.lookup("/y"); y.HardLinkCounter != 1 || f.lookup("/x") != nil {
+		t.Fatalf("after the unlink: y %d, x %v", y.HardLinkCounter, f.lookup("/x"))
+	}
+	f.mu.Lock()
+	locked := f.locked
+	f.mu.Unlock()
+	if want := HardLinkLockKey([]byte("new")); !slices.Contains(locked, want) {
+		t.Fatalf("locked %v, not %s", locked, want)
+	}
+}
+
+// An eagerly created file's handle is fenced at the create's
+// acknowledgement: an older event for the name does not replace its entry.
+func TestCreatedHandleIsFencedAtItsCreate(t *testing.T) {
+	f := newStoreFiler()
+	wfs := newLinkTestWFS(t, f)
+	wfs.option.EagerFilerCreate = true
+	h := fuse.InHeader{NodeId: 1, Caller: fuse.Caller{Owner: fuse.Owner{Uid: 99, Gid: 100}}}
+	var out fuse.CreateOut
+	if st := wfs.Create(nil, &fuse.CreateIn{InHeader: h, Flags: syscall.O_WRONLY | syscall.O_CREAT, Mode: 0o644}, "new", &out); st != fuse.OK {
+		t.Fatalf("Create: %v", st)
+	}
+	fh := wfs.GetHandle(FileHandleId(out.Fh))
+	older := proto.Clone(fh.GetEntry().GetEntry()).(*filer_pb.Entry)
+	older.Attributes.FileSize = 4242
+	wfs.inodeToPath.InvalidateChildrenCache("/")
+	late := &filer_pb.SubscribeMetadataResponse{Directory: "/", TsNs: 1, EventNotification: &filer_pb.EventNotification{
+		OldEntry: &filer_pb.Entry{Name: "new"}, NewEntry: older, NewParentPath: "/",
+	}}
+	if err := wfs.metaCache.ApplyMetadataResponse(context.Background(), late, meta_cache.SubscriberMetadataResponseApplyOptions); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	wfs.metaCache.WaitForEntryInvalidations()
+	if size := fh.GetEntry().GetEntry().GetAttributes().GetFileSize(); size == 4242 {
+		t.Fatal("an older event replaced the created file's handle entry")
 	}
 }
 
