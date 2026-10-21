@@ -51,6 +51,10 @@ type FileHandle struct {
 	// back, and the loss is reported rather than silent (Mountable). Set
 	// under the handle lock.
 	persistErr syscall.Errno
+	// pendingCreate is set for a file created here whose create waits for
+	// its first flush: only that flush may expect no entry at the filer
+	// (Mountable). Set and cleared under the handle lock.
+	pendingCreate bool
 
 	// entryVersionTsNs is the filer log position the handle's entry reflects.
 	// State at or below it must not replace the entry — that rolls it back.

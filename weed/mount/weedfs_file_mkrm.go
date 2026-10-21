@@ -131,16 +131,22 @@ func (wfs *WFS) Create(cancel <-chan struct{}, in *fuse.CreateIn, name string, o
 	// and would fail since the entry is not yet on the filer or in the meta cache).
 	// We already have the entry from createRegularFile, so create the handle directly.
 	fileHandle, existed := wfs.fhMap.AcquireFileHandle(wfs, inode, newEntry, 0, 0)
+	fhActiveLock := wfs.fhLockTable.AcquireLock("create", fileHandle.fh, util.ExclusiveLock)
 	if existed {
 		// A create is authoritative for the entry it just made, so it takes
-		// effect even on a handle that outlived a previous incarnation.
+		// effect even on a handle that outlived a previous incarnation,
+		// and nothing of that one's state carries over (Mountable).
 		fileHandle.SetEntry(newEntry)
+		fileHandle.setAuthoritativeBase(proto.Clone(newEntry).(*filer_pb.Entry))
+		fileHandle.isDeleted, fileHandle.isRenamed, fileHandle.persistErr = false, false, 0
 	}
 	fileHandle.RememberPath(entryFullPath)
 	// Mark dirty so the deferred filer create happens on Flush, even if the
 	// file is closed without any writes. An eager create has already
 	// persisted the entry, so its handle starts clean.
 	fileHandle.dirtyMetadata = !wfs.option.EagerFilerCreate
+	fileHandle.pendingCreate = !wfs.option.EagerFilerCreate
+	wfs.fhLockTable.ReleaseLock(fileHandle.fh, fhActiveLock)
 
 	// Create bypasses AcquireHandle, so attach the lock acquired above.
 	// A surviving handle may already hold one; ours is redundant then.

@@ -42,6 +42,10 @@ type InodeToPath struct {
 	// linking holds the group a Link here is turning a standalone file into
 	// a hard link of, while it does. Mountable, sparse as above.
 	linking map[uint64]string
+	// listedAt keeps, per path, the number a listing moved on to because
+	// another object had the one it would have taken, so the path keeps it
+	// until a lookup binds it. Mountable, holding only such paths.
+	listedAt map[util.FullPath]listedInode
 	// watches counts, per path a caller is watching (Watch), the bindings
 	// made since. Mountable, holding only paths being watched.
 	watches map[util.FullPath]*pathWatch
@@ -261,6 +265,12 @@ func (i *InodeToPath) LookupLinked(path util.FullPath, unixTime int64, kind os.F
 		} else {
 			inode = possibleInode
 		}
+		// The number a listing already reported for this object at this
+		// path (Mountable: see InodeForListing).
+		if a, ok := i.listedAt[path]; ok && a.id == (ListedIdentity{kind: kind, linkID: linkID, persisted: possibleInode}) && !isHardlink {
+			inode = a.inode
+		}
+		delete(i.listedAt, path)
 		joined := false
 		if isHardlink && possibleInode != 0 {
 			inode, joined = i.linkGroupLocked(possibleInode, linkID)
@@ -341,22 +351,57 @@ func (i *InodeToPath) IncrementNlookup(inode uint64) bool {
 // (Holds), as a lookup would choose. The path's inode is reported only if
 // it holds the listed object, and a number another object holds is
 // probed past, so two objects never share one in a listing.
-func (i *InodeToPath) InodeForListing(path util.FullPath, unixTime int64, kind os.FileMode, linkID string, possibleInode uint64) uint64 {
-	i.RLock()
-	defer i.RUnlock()
+//
+// listed holds the numbers this listing already reported, and for which
+// object: another object listed with the same number moves on too. A
+// number moved on to is kept for the path (listedAt), so later listings,
+// and the lookup that binds the path, report the same one.
+func (i *InodeToPath) InodeForListing(path util.FullPath, unixTime int64, kind os.FileMode, linkID string, possibleInode uint64, listed map[uint64]ListedIdentity) uint64 {
+	i.Lock()
+	defer i.Unlock()
 	if inode, found := i.path2inode[path]; found && !i.replacedLocked(inode, kind, linkID, possibleInode) {
 		return inode
 	}
+	id := ListedIdentity{kind: kind, linkID: linkID, persisted: possibleInode}
 	inode := possibleInode
 	if inode == 0 {
 		inode = path.AsInode(unixTime)
 	}
+	first := inode
+	if a, ok := i.listedAt[path]; ok && a.id == id {
+		inode = a.inode
+	}
 	for {
-		if _, taken := i.inode2path[inode]; inode > 1 && (!taken || !i.replacedLocked(inode, kind, linkID, possibleInode)) {
-			return inode
+		_, taken := i.inode2path[inode]
+		other, reported := listed[inode]
+		if inode > 1 && (!taken || !i.replacedLocked(inode, kind, linkID, possibleInode)) && (!reported || other == id) {
+			break
 		}
 		inode++
 	}
+	if inode != first {
+		if i.listedAt == nil {
+			i.listedAt = map[util.FullPath]listedInode{}
+		}
+		i.listedAt[path] = listedInode{inode: inode, id: id}
+	}
+	if listed != nil {
+		listed[inode] = id
+	}
+	return inode
+}
+
+// ListedIdentity is what a listing tells an object by: its type,
+// hard-link group and persisted inode (Mountable).
+type ListedIdentity struct {
+	kind      os.FileMode
+	linkID    string
+	persisted uint64
+}
+
+type listedInode struct {
+	inode uint64
+	id    ListedIdentity
 }
 
 func (i *InodeToPath) AllocateInode(path util.FullPath, unixTime int64) uint64 {

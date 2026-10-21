@@ -1,6 +1,7 @@
 package mount
 
 import (
+	"os"
 	"slices"
 	"testing"
 	"time"
@@ -435,5 +436,28 @@ func TestBindingsMoveWatchesOn(t *testing.T) {
 	m.MovePath("/q", "/p")
 	if m.Unwatch("/p", inode, generation, true) || !m.Bound("/p", inode) {
 		t.Fatal("a slow miss undid a Rename's binding")
+	}
+}
+
+// A first plain listing of objects that share a stored inode but differ
+// in type or hard-link group gives each its own fileid, the same in a
+// later listing, and the lookup that binds one keeps it.
+func TestFirstListingTellsObjectsApart(t *testing.T) {
+	m := NewInodeToPath(util.FullPath("/"), 0)
+	list := func() (uint64, uint64, uint64) {
+		reported := map[uint64]ListedIdentity{}
+		return m.InodeForListing("/f", 1, 0, "", 500, reported),
+			m.InodeForListing("/s", 1, os.ModeSymlink, "", 500, reported),
+			m.InodeForListing("/l", 1, 0, "group", 500, reported)
+	}
+	f, s, l := list()
+	if f == s || f == l || s == l {
+		t.Fatalf("fileids %d %d %d", f, s, l)
+	}
+	if f2, s2, l2 := list(); f2 != f || s2 != s || l2 != l {
+		t.Fatalf("the second listing gave %d %d %d, the first %d %d %d", f2, s2, l2, f, s, l)
+	}
+	if got := m.LookupLinked("/s", 1, os.ModeSymlink, "", 500, true); got != s {
+		t.Fatalf("the lookup of the symlink gave %d, the listing %d", got, s)
 	}
 }

@@ -57,6 +57,14 @@ func (wfs *WFS) Link(cancel <-chan struct{}, in *fuse.LinkIn, name string, out *
 	// probe can move the two apart even for an entry that does carry one.
 	sourceInode := in.Oldnodeid
 
+	// The source inode's lock, which an open shares from loading the entry
+	// to registering its handle, is held to the end, and taken before the
+	// source is loaded: no handle is left with the entry from before the
+	// link, and a concurrent Link of the same file sees this one's result
+	// (Mountable: see inodeLocks).
+	inodeLock := wfs.inodeLocks().AcquireLock("link", sourceInode, util.ExclusiveLock)
+	defer wfs.inodeLocks().ReleaseLock(sourceInode, inodeLock)
+
 	oldEntry, _, status := wfs.maybeLoadEntry(oldEntryPath)
 	if status != fuse.OK {
 		return status
@@ -96,11 +104,20 @@ func (wfs *WFS) Link(cancel <-chan struct{}, in *fuse.LinkIn, name string, out *
 		oldEntry = fresh
 	}
 
-	// The source inode's lock, which an open shares from loading the entry
-	// to registering its handle, is held to the end: no handle is left with
-	// the entry from before the link (Mountable: see inodeLocks).
-	inodeLock := wfs.inodeLocks().AcquireLock("link", sourceInode, util.ExclusiveLock)
-	defer wfs.inodeLocks().ReleaseLock(sourceInode, inodeLock)
+	// And the open handle's lock, which every flush of it holds: no flush
+	// is in flight with the entry from before the promotion, nor starts
+	// until the handle has the promoted one. The source is loaded again
+	// under it, any flush that came first included.
+	sourceFh, sourceFhFound := wfs.fhMap.FindFileHandle(sourceInode)
+	if sourceFhFound {
+		fhActiveLock := wfs.fhLockTable.AcquireLock("Link", sourceFh.fh, util.ExclusiveLock)
+		defer wfs.fhLockTable.ReleaseLock(sourceFh.fh, fhActiveLock)
+		// The namespace's entry: the local stand-in would take the handle
+		// lock held here.
+		if oldEntry, _, status = wfs.maybeLoadNamespaceEntry(oldEntryPath); status != fuse.OK {
+			return status
+		}
+	}
 
 	// update old file to hardlink mode
 	origHardLinkId := oldEntry.HardLinkId
@@ -186,7 +203,7 @@ func (wfs *WFS) Link(cancel <-chan struct{}, in *fuse.LinkIn, name string, out *
 				glog.Warningf("link rollback %s: %v", oldEntryPath, rollbackErr)
 			} else {
 				linked = false
-				wfs.settleLinkRollback(ctx, sourceInode, oldParentPath, rollbackReq.Entry, rollbackResp, group)
+				wfs.settleLinkRollback(ctx, sourceFh, oldParentPath, rollbackReq.Entry, rollbackResp, group)
 			}
 		} else {
 			createEvent := createResp.GetMetadataEvent()
@@ -215,14 +232,12 @@ func (wfs *WFS) Link(cancel <-chan struct{}, in *fuse.LinkIn, name string, out *
 	if converting {
 		// An open handle of the source holds it as a hard link now, before
 		// EndLink makes only that form the source's (Mountable).
-		if fh, found := wfs.fhMap.FindFileHandle(sourceInode); found {
-			fhActiveLock := wfs.fhLockTable.AcquireLock("Link", fh.fh, util.ExclusiveLock)
-			fh.UpdateEntry(func(entry *filer_pb.Entry) {
+		if sourceFhFound {
+			sourceFh.UpdateEntry(func(entry *filer_pb.Entry) {
 				if entry != nil {
 					entry.HardLinkId, entry.HardLinkCounter = group, oldEntry.HardLinkCounter
 				}
 			})
-			wfs.fhLockTable.ReleaseLock(fh.fh, fhActiveLock)
 		}
 	}
 
@@ -289,10 +304,11 @@ func (wfs *WFS) syncHardLinkSiblings(inode uint64, authoritativeEntry *filer_pb.
 
 // settleLinkRollback brings this mount back to the source as the rolled
 // back update left it, before the conversion ends: the cache takes the
-// acknowledgement, and an open handle that took the promoted entry
-// meanwhile (from the subscription) holds the source standalone again, so
-// neither a lookup nor a flush takes it for a hard link (Mountable).
-func (wfs *WFS) settleLinkRollback(ctx context.Context, inode uint64, dir string, entry *filer_pb.Entry, resp *filer_pb.UpdateEntryResponse, group []byte) {
+// acknowledgement, and the source's open handle, which Link holds locked,
+// holds the source standalone again if it took the promoted entry
+// meanwhile (from the subscription), so neither a lookup nor a flush
+// takes it for a hard link (Mountable).
+func (wfs *WFS) settleLinkRollback(ctx context.Context, fh *FileHandle, dir string, entry *filer_pb.Entry, resp *filer_pb.UpdateEntryResponse, group []byte) {
 	event := resp.GetMetadataEvent()
 	if event == nil {
 		event = metadataUpdateEvent(dir, entry)
@@ -301,13 +317,11 @@ func (wfs *WFS) settleLinkRollback(ctx context.Context, inode uint64, dir string
 		glog.Warningf("link rollback %s: best-effort metadata apply failed: %v", util.FullPath(dir).Child(entry.Name), applyErr)
 		wfs.inodeToPath.InvalidateChildrenCache(util.FullPath(dir))
 	}
-	if fh, found := wfs.fhMap.FindFileHandle(inode); found {
-		fhActiveLock := wfs.fhLockTable.AcquireLock("Link", fh.fh, util.ExclusiveLock)
+	if fh != nil { // held locked by Link
 		fh.UpdateEntry(func(open *filer_pb.Entry) {
 			if open != nil && bytes.Equal(open.HardLinkId, group) {
 				open.HardLinkId, open.HardLinkCounter = entry.HardLinkId, entry.HardLinkCounter
 			}
 		})
-		wfs.fhLockTable.ReleaseLock(fh.fh, fhActiveLock)
 	}
 }

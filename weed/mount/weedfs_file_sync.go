@@ -328,7 +328,7 @@ func (wfs *WFS) flushMetadataToFiler(ctx context.Context, fh *FileHandle, dir, n
 	// The filer acknowledged this state at the event's log position (or, for
 	// a no-op create, at the response's log position); older queued
 	// subscription events must not roll the handle back.
-	fh.setAuthoritativeBase(baseSnapshot)
+	wfs.holdFlushAck(fh, baseSnapshot, request.Entry, resp) // Mountable
 	fh.advanceEntryVersion(ackVersionTsNs(resp), resp.GetLogSignature())
 	if applyErr := wfs.applyLocalMetadataEvent(context.Background(), event); applyErr != nil {
 		glog.Warningf("flush %s: best-effort metadata apply failed: %v", fileFullPath, applyErr)
@@ -337,6 +337,7 @@ func (wfs *WFS) flushMetadataToFiler(ctx context.Context, fh *FileHandle, dir, n
 
 	if err == nil {
 		fh.dirtyMetadata = false
+		fh.pendingCreate = false
 	}
 
 	return err
@@ -459,10 +460,19 @@ func (wfs *WFS) persistDestination(fh *FileHandle, path util.FullPath) (util.Ful
 // (ESTALE), keeping its writes. Called under the handle lock (Mountable).
 func (wfs *WFS) persistEntry(ctx context.Context, fh *FileHandle, path util.FullPath, request *filer_pb.CreateEntryRequest) (*filer_pb.CreateEntryResponse, error) {
 	for range 3 {
+		// Only a create waiting for this flush expects no entry; any other
+		// handle expects its base, in the form the filer stores it.
 		var expected *filer_pb.Entry
-		if base := fh.baseEntry.Load(); base != nil && fh.entryVersionTsNs.Load() != 0 {
-			expected = proto.Clone(base).(*filer_pb.Entry)
+		if base := fh.baseEntry.Load(); base != nil && !fh.pendingCreate {
+			expected = storedForm(base)
+			expected.Name = request.Entry.Name // a rename moved the base too
 			wfs.mapPbIdFromLocalToFiler(expected)
+			// A hard link's counter is its group's, which other names
+			// change: the write keeps the one the filer had, never the
+			// handle's own copy, perhaps older.
+			if len(request.Entry.HardLinkId) > 0 {
+				request.Entry.HardLinkCounter = expected.HardLinkCounter
+			}
 		}
 		request.Condition = entryCondition(expected)
 		resp, err := wfs.createEntryOnce(ctx, request)
@@ -486,9 +496,51 @@ func (wfs *WFS) persistEntry(ctx context.Context, fh *FileHandle, path util.Full
 		}
 		wfs.mapPbIdFromFilerToLocal(current)
 		fh.setAuthoritativeBase(current)
-		fh.advanceEntryVersion(max(version, 1), 0)
+		fh.advanceEntryVersion(version, 0)
+		fh.pendingCreate = false // it is at the filer, as this handle's object
 	}
 	return nil, fmt.Errorf("create %s: the entry kept changing", path)
+}
+
+// holdFlushAck makes what the filer acknowledged for a flush the handle's
+// base: the stored entry its event carries, else the entry sent; the
+// group's counter as written, in the handle's entry too (Mountable).
+func (wfs *WFS) holdFlushAck(fh *FileHandle, sent, written *filer_pb.Entry, resp *filer_pb.CreateEntryResponse) {
+	base := sent
+	if stored := resp.GetMetadataEvent().GetEventNotification().GetNewEntry(); stored != nil {
+		base = proto.Clone(stored).(*filer_pb.Entry)
+		filer_pb.AfterEntryDeserialization(base.GetChunks())
+		wfs.mapPbIdFromFilerToLocal(base)
+	}
+	if len(written.GetHardLinkId()) > 0 {
+		base.HardLinkCounter = written.HardLinkCounter
+		fh.UpdateEntry(func(e *filer_pb.Entry) {
+			if e != nil {
+				e.HardLinkCounter = written.HardLinkCounter
+			}
+		})
+	}
+	fh.setAuthoritativeBase(base)
+}
+
+// storedForm is entry, cloned, as the filer store gives it back: chunk file
+// IDs both as strings and parsed, manifests first, no MIME type for an
+// octet stream, so an unchanged entry compares equal to what is stored
+// (Mountable).
+func storedForm(entry *filer_pb.Entry) *filer_pb.Entry {
+	stored := proto.Clone(entry).(*filer_pb.Entry)
+	filer_pb.BeforeEntrySerialization(stored.GetChunks())
+	filer_pb.AfterEntryDeserialization(stored.GetChunks())
+	// The filer stores manifests first (cleanupChunks), and no MIME type
+	// for an octet stream (normalizeEntryMimeForStore).
+	manifests, data := filer.SeparateManifestChunks(stored.GetChunks())
+	if len(manifests) > 0 {
+		stored.Chunks = append(manifests, data...)
+	}
+	if a := stored.GetAttributes(); a != nil && !stored.IsDirectory && a.Mime == "application/octet-stream" {
+		a.Mime = ""
+	}
+	return stored
 }
 
 // entryCondition is the condition that the stored entry is expected, or

@@ -23,6 +23,8 @@ import (
 // creates of names in failCreate. beforeCreate, when set, runs first.
 type recordFiler struct {
 	linkFiler
+	creates      int // create requests, refused ones included
+	lookups      int
 	created      []util.FullPath
 	failCreate   map[string]bool
 	beforeCreate func(*filer_pb.CreateEntryRequest)
@@ -38,6 +40,7 @@ func (f *recordFiler) CreateEntry(_ context.Context, r *filer_pb.CreateEntryRequ
 		return nil, status.Error(codes.Internal, "disk on fire")
 	}
 	p := util.FullPath(r.Directory).Child(r.Entry.Name)
+	f.creates++
 	for _, c := range r.GetCondition().GetClauses() {
 		current, expected := f.entries[p], c.GetExpectedEntry()
 		if c.Kind == filer_pb.WriteCondition_IF_ENTRY_EQUAL && (current == nil) != (expected == nil) ||
@@ -46,8 +49,15 @@ func (f *recordFiler) CreateEntry(_ context.Context, r *filer_pb.CreateEntryRequ
 		}
 	}
 	f.created = append(f.created, p)
-	f.entries[p] = r.Entry
+	f.entries[p] = storedForm(r.Entry) // as the filer store gives it back
 	return &filer_pb.CreateEntryResponse{}, nil
+}
+
+func (f *recordFiler) LookupDirectoryEntry(ctx context.Context, r *filer_pb.LookupDirectoryEntryRequest) (*filer_pb.LookupDirectoryEntryResponse, error) {
+	f.mu.Lock()
+	f.lookups++
+	f.mu.Unlock()
+	return f.linkFiler.LookupDirectoryEntry(ctx, r)
 }
 
 func (f *recordFiler) UpdateEntry(_ context.Context, r *filer_pb.UpdateEntryRequest) (*filer_pb.UpdateEntryResponse, error) {
@@ -73,6 +83,9 @@ func TestFlushWritesWhereThePathIsNow(t *testing.T) {
 	fh.RememberPath("/d/before")
 	fh.dirtyMetadata = true
 	afterFlushData = func(fh *FileHandle) {
+		filer.mu.Lock()
+		filer.entries["/d/after"] = linkEntry("after", 500, "", "AAAA") // the rename, at the filer
+		filer.mu.Unlock()
 		wfs.inodeToPath.MovePath("/d/before", "/d/after")
 		fh.RememberPath("/d/after")
 		wfs.inodeToPath.Lookup("/d/before", 1, false, false, 600, true) // another file
@@ -371,4 +384,150 @@ func TestLocalEntryUnderTheAppendersLock(t *testing.T) {
 		wfs.localEntry(fh)
 	}
 	<-done
+}
+
+// A Link of a file whose flush is in flight waits for the flush, which
+// holds the handle's lock; the flush cannot undo the promotion, nor the
+// promotion take what the flush wrote.
+func TestLinkWaitsForAFlushInFlight(t *testing.T) {
+	wfs, _ := newCreateTestWFS(t)
+	filer := newRecordFiler()
+	startFakeFiler(t, wfs, filer)
+	_, source := linkTestSource(t, wfs, "first.txt", 500)
+	stored := &filer_pb.Entry{Name: "first.txt", Content: []byte("hello world!"), Attributes: &filer_pb.FuseAttributes{FileMode: 0o644, FileSize: 12, Inode: 500, Crtime: 1, Mtime: 1, Uid: 99, Gid: 100}}
+	filer.entries["/first.txt"] = proto.Clone(stored).(*filer_pb.Entry)
+	fh, _ := wfs.fhMap.AcquireFileHandle(wfs, source, proto.Clone(stored).(*filer_pb.Entry), 10, 0)
+	fh.RememberPath("/first.txt")
+	fh.dirtyMetadata = true
+	var once sync.Once
+	linked := make(chan fuse.Status, 1)
+	filer.beforeCreate = func(r *filer_pb.CreateEntryRequest) {
+		if r.Entry.Name != "first.txt" {
+			return
+		}
+		once.Do(func() {
+			go func() {
+				linked <- wfs.Link(nil, &fuse.LinkIn{InHeader: fuse.InHeader{NodeId: 1}, Oldnodeid: source}, "second.txt", &fuse.EntryOut{})
+			}()
+			select {
+			case st := <-linked:
+				t.Errorf("Link ran during the flush: %v", st)
+				linked <- st
+			case <-time.After(200 * time.Millisecond):
+			}
+		})
+	}
+	if st := wfs.Fsync(nil, &fuse.FsyncIn{InHeader: fuse.InHeader{NodeId: source}, Fh: uint64(fh.fh)}); st != fuse.OK {
+		t.Fatalf("fsync: %v", st)
+	}
+	if st := <-linked; st != fuse.OK {
+		t.Fatalf("Link: %v", st)
+	}
+	filer.mu.Lock()
+	group := filer.entries["/first.txt"].GetHardLinkId()
+	filer.mu.Unlock()
+	if len(group) == 0 || len(fh.GetEntry().GetEntry().HardLinkId) == 0 {
+		t.Fatalf("the source's group: at the filer %x, in the handle %x", group, fh.GetEntry().GetEntry().HardLinkId)
+	}
+}
+
+// Only a create waiting for its first flush expects no entry: a file
+// created eagerly, its handle at version zero, and deleted elsewhere before
+// its first flush is not brought back by it.
+func TestFlushDoesNotResurrectAnEagerCreate(t *testing.T) {
+	for _, pending := range []bool{false, true} {
+		wfs, _, _ := linkedWFS(t)
+		filer := newRecordFiler()
+		startFakeFiler(t, wfs, filer)
+		inode := wfs.inodeToPath.Lookup("/d/new", 1, false, false, 700, true)
+		fh, _ := wfs.fhMap.AcquireFileHandle(wfs, inode, linkEntry("new", 700, "", "data"), 0, 0)
+		fh.RememberPath("/d/new")
+		fh.dirtyMetadata, fh.pendingCreate = true, pending
+		st := wfs.Fsync(nil, &fuse.FsyncIn{InHeader: fuse.InHeader{NodeId: inode}, Fh: uint64(fh.fh)})
+		switch {
+		case pending && (st != fuse.OK || len(filer.created) != 1):
+			t.Fatalf("the deferred create's first flush: %v, created %v", st, filer.created)
+		case !pending && (st != fuse.Status(syscall.ESTALE) || len(filer.created) != 0):
+			t.Fatalf("the deleted eager create's flush: %v, created %v", st, filer.created)
+		}
+	}
+}
+
+// An unchanged second flush is one create: the base is compared in the form
+// the filer store gives entries back, chunk IDs parsed.
+func TestUnchangedFlushIsOneCreate(t *testing.T) {
+	wfs, _, _ := linkedWFS(t)
+	filer := newRecordFiler()
+	startFakeFiler(t, wfs, filer)
+	e := linkEntry("c", 800, "", "")
+	e.Content = nil
+	e.Chunks = []*filer_pb.FileChunk{{FileId: "3,01637037d6", Size: 4, ModifiedTsNs: 1}}
+	e.Attributes.FileSize = 4
+	filer.entries["/d/c"] = storedForm(e)
+	inode := wfs.inodeToPath.Lookup("/d/c", 1, false, false, 800, true)
+	fh, _ := wfs.fhMap.AcquireFileHandle(wfs, inode, proto.Clone(e).(*filer_pb.Entry), 10, 0)
+	fh.RememberPath("/d/c")
+	fh.contentType = "application/octet-stream" // which the filer stores as none
+	for flush := range 2 {
+		fh.dirtyMetadata = true
+		filer.mu.Lock()
+		filer.creates, filer.lookups = 0, 0
+		filer.mu.Unlock()
+		if st := wfs.Fsync(nil, &fuse.FsyncIn{InHeader: fuse.InHeader{NodeId: inode}, Fh: uint64(fh.fh)}); st != fuse.OK {
+			t.Fatalf("flush %d: %v", flush, st)
+		}
+		if flush == 1 && (filer.creates != 1 || filer.lookups != 0) {
+			t.Fatalf("the unchanged flush: %d creates, %d lookups", filer.creates, filer.lookups)
+		}
+	}
+}
+
+// A dirty handle of a hard link whose group another name changed meanwhile
+// writes the group's counter as the filer has it, never its own older copy.
+func TestFlushKeepsTheGroupsCounter(t *testing.T) {
+	wfs, _, _ := linkedWFS(t)
+	filer := newRecordFiler()
+	startFakeFiler(t, wfs, filer)
+	e := linkEntry("a", 900, "group", "data")
+	inode := wfs.inodeToPath.LookupLinked("/d/a", 1, 0, "group", 900, true)
+	fh, _ := wfs.fhMap.AcquireFileHandle(wfs, inode, proto.Clone(e).(*filer_pb.Entry), 10, 0)
+	fh.RememberPath("/d/a")
+	fh.dirtyMetadata = true
+	third := storedForm(e)
+	third.HardLinkCounter = 3 // a third name, made elsewhere
+	filer.entries["/d/a"] = third
+	if st := wfs.Fsync(nil, &fuse.FsyncIn{InHeader: fuse.InHeader{NodeId: inode}, Fh: uint64(fh.fh)}); st != fuse.OK {
+		t.Fatalf("fsync: %v", st)
+	}
+	if c := filer.entries["/d/a"].GetHardLinkCounter(); c != 3 {
+		t.Fatalf("the flush wrote counter %d over 3", c)
+	}
+}
+
+// Two Links of one standalone file at once make one group, not two.
+func TestConcurrentLinksMakeOneGroup(t *testing.T) {
+	wfs, _ := newCreateTestWFS(t)
+	filer := newRecordFiler()
+	startFakeFiler(t, wfs, filer)
+	_, source := linkTestSource(t, wfs, "first.txt", 500)
+	filer.entries["/first.txt"] = &filer_pb.Entry{Name: "first.txt", Content: []byte("hello world!"), Attributes: &filer_pb.FuseAttributes{FileMode: 0o644, FileSize: 12, Inode: 500, Crtime: 1, Mtime: 1, Uid: 99, Gid: 100}}
+	var wg sync.WaitGroup
+	for _, name := range []string{"second.txt", "third.txt"} {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if st := wfs.Link(nil, &fuse.LinkIn{InHeader: fuse.InHeader{NodeId: 1}, Oldnodeid: source}, name, &fuse.EntryOut{}); st != fuse.OK {
+				t.Errorf("Link %s: %v", name, st)
+			}
+		}()
+	}
+	wg.Wait()
+	filer.mu.Lock()
+	defer filer.mu.Unlock()
+	group := string(filer.entries["/first.txt"].GetHardLinkId())
+	for _, p := range []util.FullPath{"/second.txt", "/third.txt"} {
+		if got := string(filer.entries[p].GetHardLinkId()); got != group || group == "" {
+			t.Fatalf("%s in group %x, the source in %x", p, got, group)
+		}
+	}
 }

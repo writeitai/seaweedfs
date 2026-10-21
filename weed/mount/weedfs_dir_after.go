@@ -53,12 +53,13 @@ func (wfs *WFS) ReadDirectoryAfter(dir uint64, after string, plus bool, fits fun
 		return false, code
 	}
 	wfs.inodeToPath.TouchDirectory(dirPath)
+	reported := map[uint64]ListedIdentity{} // the numbers this listing gave out
 	each := func(entry *filer.Entry) bool {
 		// Asked first, so an entry that does not fit is never entered.
 		if fits != nil && !fits(entry.Name()) {
 			return false
 		}
-		return wfs.listEntryAfter(dirPath, entry, plus, add)
+		return wfs.listEntryAfter(dirPath, entry, plus, reported, add)
 	}
 	if !wfs.inodeToPath.ShouldReadDirectoryDirect(dirPath) {
 		err := wfs.ensureDirectoryVisited(dirPath)
@@ -148,7 +149,7 @@ func (wfs *WFS) listDirectAfter(dirPath util.FullPath, after string, each func(*
 // listEntryAfter hands one entry to add, as doReadDirectory's per-entry
 // step does: a plain listing reports the inode a listing shows; a plus
 // listing enters the entry and takes its reference once add accepts it.
-func (wfs *WFS) listEntryAfter(dirPath util.FullPath, entry *filer.Entry, plus bool, add func(*ListedEntry) bool) bool {
+func (wfs *WFS) listEntryAfter(dirPath util.FullPath, entry *filer.Entry, plus bool, reported map[uint64]ListedIdentity, add func(*ListedEntry) bool) bool {
 	name := entry.Name()
 	// Rebuild only for a sanitized name: that is the one a LOOKUP carries.
 	childPath := entry.FullPath
@@ -157,7 +158,7 @@ func (wfs *WFS) listEntryAfter(dirPath util.FullPath, entry *filer.Entry, plus b
 	}
 	listed := &ListedEntry{Name: name, StoredInode: entry.Inode}
 	if !plus {
-		listed.Inode = wfs.inodeToPath.InodeForListing(childPath, entry.Crtime.Unix(), EntryKind(entry.IsDirectory(), entry.Mode), string(entry.HardLinkId), entry.Inode)
+		listed.Inode = wfs.inodeToPath.InodeForListing(childPath, entry.Crtime.Unix(), EntryKind(entry.IsDirectory(), entry.Mode), string(entry.HardLinkId), entry.Inode, reported)
 		return add(listed)
 	}
 	// The reference is taken now and given back if add refuses the entry,
