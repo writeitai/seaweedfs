@@ -49,7 +49,7 @@ func (f *recordFiler) CreateEntry(_ context.Context, r *filer_pb.CreateEntryRequ
 		}
 	}
 	f.created = append(f.created, p)
-	f.entries[p] = storedForm(r.Entry) // as the filer store gives it back
+	f.entries[p] = filerStoreRoundTrip(r.Directory, r.Entry)
 	return &filer_pb.CreateEntryResponse{}, nil
 }
 
@@ -463,7 +463,7 @@ func TestUnchangedFlushIsOneCreate(t *testing.T) {
 	e.Content = nil
 	e.Chunks = []*filer_pb.FileChunk{{FileId: "3,01637037d6", Size: 4, ModifiedTsNs: 1}}
 	e.Attributes.FileSize = 4
-	filer.entries["/d/c"] = storedForm(e)
+	filer.entries["/d/c"] = filerStoreRoundTrip("/d", e)
 	inode := wfs.inodeToPath.Lookup("/d/c", 1, false, false, 800, true)
 	fh, _ := wfs.fhMap.AcquireFileHandle(wfs, inode, proto.Clone(e).(*filer_pb.Entry), 10, 0)
 	fh.RememberPath("/d/c")
@@ -500,7 +500,7 @@ func testFlushKeepsTheGroupsCounter(t *testing.T, counter int32) {
 	fh, _ := wfs.fhMap.AcquireFileHandle(wfs, inode, proto.Clone(e).(*filer_pb.Entry), 10, 0)
 	fh.RememberPath("/d/a")
 	fh.dirtyMetadata = true
-	changed := storedForm(e)
+	changed := filerStoreRoundTrip("/d", e)
 	changed.HardLinkCounter = counter // a third name made, or a sibling unlinked, elsewhere
 	filer.entries["/d/a"] = changed
 	if st := wfs.Fsync(nil, &fuse.FsyncIn{InHeader: fuse.InHeader{NodeId: inode}, Fh: uint64(fh.fh)}); st != fuse.OK {
@@ -536,5 +536,119 @@ func TestConcurrentLinksMakeOneGroup(t *testing.T) {
 		if got := string(filer.entries[p].GetHardLinkId()); got != group || group == "" {
 			t.Fatalf("%s in group %x, the source in %x", p, got, group)
 		}
+	}
+}
+
+// filerStoreRoundTrip is entry as the filer gives it back once stored,
+// done as the filer does it, not by the mount's own normalisation:
+// cleanupChunks puts manifests first, the store wrapper drops an
+// octet-stream MIME and parses chunk IDs, the store encodes the entry, and
+// a read decodes it and fills the IDs in again.
+func filerStoreRoundTrip(dir string, pb *filer_pb.Entry) *filer_pb.Entry {
+	pb = proto.Clone(pb).(*filer_pb.Entry)
+	manifests, data := filer.SeparateManifestChunks(pb.GetChunks())
+	pb.Chunks = append(manifests, data...)
+	entry := filer.FromPbEntry(dir, pb)
+	if !entry.IsDirectory() && entry.Mime == "application/octet-stream" {
+		entry.Mime = ""
+	}
+	filer_pb.BeforeEntrySerialization(entry.GetChunks())
+	blob, err := entry.EncodeAttributesAndChunks()
+	if err != nil {
+		panic(err)
+	}
+	decoded := &filer.Entry{FullPath: entry.FullPath}
+	if err := decoded.DecodeAttributesAndChunks(blob); err != nil {
+		panic(err)
+	}
+	filer_pb.AfterEntryDeserialization(decoded.GetChunks())
+	return decoded.ToProtoEntry()
+}
+
+// Two objects sharing a stored inode but not a type, listed plainly one
+// page at a time, cached and read-through: each page gives its own
+// fileid, as no page knows the other.
+func TestPlainListingPagesTellObjectsApart(t *testing.T) {
+	for _, direct := range []bool{false, true} {
+		dir := util.FullPath("/d")
+		wfs := newPagingWFS(t, dir, nil, 0)
+		startFakeFiler(t, wfs, pairListFiler{})
+		if direct {
+			wfs.inodeToPath.MarkDirectoryReadThrough(dir, time.Now())
+		} else {
+			for _, e := range pairEntries() {
+				if err := wfs.metaCache.InsertEntry(context.Background(), filer.FromPbEntry(string(dir), e), 0); err != nil {
+					t.Fatalf("insert: %v", err)
+				}
+			}
+		}
+		dirInode, _ := wfs.inodeToPath.GetInode(dir)
+		got := map[string]uint64{}
+		after := ""
+		for range 2 {
+			taken := 0
+			if _, st := wfs.ReadDirectoryAfter(dirInode, after, false, func(string) bool { return taken < 1 }, func(e *ListedEntry) bool {
+				taken++
+				got[e.Name], after = e.Inode, e.Name
+				return true
+			}); st != fuse.OK {
+				t.Fatalf("direct %v: list %v", direct, st)
+			}
+		}
+		if len(got) != 2 || got["f"] == got["s"] {
+			t.Fatalf("direct %v: pages gave %v", direct, got)
+		}
+	}
+}
+
+func pairEntries() []*filer_pb.Entry {
+	return []*filer_pb.Entry{
+		{Name: "f", Attributes: &filer_pb.FuseAttributes{FileMode: 0o644, Inode: 500, Crtime: 1, Mtime: 1}},
+		{Name: "s", Attributes: &filer_pb.FuseAttributes{FileMode: uint32(os.ModeSymlink | 0o777), Inode: 500, Crtime: 1, Mtime: 1, SymlinkTarget: "t"}},
+	}
+}
+
+// pairListFiler lists pairEntries.
+type pairListFiler struct {
+	filer_pb.UnimplementedSeaweedFilerServer
+}
+
+func (pairListFiler) ListEntries(r *filer_pb.ListEntriesRequest, stream grpc.ServerStreamingServer[filer_pb.ListEntriesResponse]) error {
+	for _, e := range pairEntries() {
+		if e.Name < r.StartFromFileName || e.Name == r.StartFromFileName && !r.InclusiveStartFrom {
+			continue
+		}
+		if err := stream.Send(&filer_pb.ListEntriesResponse{Entry: e}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// A deferred create first written by the periodic metadata flush is at the
+// filer from then on: deleted elsewhere, its next flush does not bring it
+// back.
+func TestPeriodicFirstFlushEndsThePendingCreate(t *testing.T) {
+	wfs, _, _ := linkedWFS(t)
+	filer := newRecordFiler()
+	startFakeFiler(t, wfs, filer)
+	inode := wfs.inodeToPath.Lookup("/d/new", 1, false, false, 700, true)
+	e := linkEntry("new", 700, "", "")
+	e.Content = nil
+	e.Chunks = []*filer_pb.FileChunk{{FileId: "3,01637037d6", Size: 4, ModifiedTsNs: 1}}
+	fh, _ := wfs.fhMap.AcquireFileHandle(wfs, inode, e, 0, 0)
+	fh.RememberPath("/d/new")
+	fh.dirtyMetadata, fh.pendingCreate = true, true
+	if err := wfs.flushFileMetadata(fh); err != nil || len(filer.created) != 1 {
+		t.Fatalf("periodic flush: %v, created %v", err, filer.created)
+	}
+	filer.mu.Lock()
+	delete(filer.entries, "/d/new") // elsewhere
+	filer.mu.Unlock()
+	if st := wfs.Fsync(nil, &fuse.FsyncIn{InHeader: fuse.InHeader{NodeId: inode}, Fh: uint64(fh.fh)}); st != fuse.Status(syscall.ESTALE) {
+		t.Fatalf("fsync of the deleted file: %v", st)
+	}
+	if len(filer.created) != 1 {
+		t.Fatalf("brought back: %v", filer.created)
 	}
 }

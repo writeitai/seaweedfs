@@ -441,14 +441,14 @@ func TestBindingsMoveWatchesOn(t *testing.T) {
 
 // A first plain listing of objects that share a stored inode but differ
 // in type or hard-link group gives each its own fileid, the same in a
-// later listing, and the lookup that binds one keeps it.
+// later listing, and the lookups that bind them keep them: a hard link
+// included, before or after the others are looked up.
 func TestFirstListingTellsObjectsApart(t *testing.T) {
 	m := NewInodeToPath(util.FullPath("/"), 0)
 	list := func() (uint64, uint64, uint64) {
-		reported := map[uint64]ListedIdentity{}
-		return m.InodeForListing("/f", 1, 0, "", 500, reported),
-			m.InodeForListing("/s", 1, os.ModeSymlink, "", 500, reported),
-			m.InodeForListing("/l", 1, 0, "group", 500, reported)
+		return m.InodeForListing("/f", 1, 0, "", 500),
+			m.InodeForListing("/s", 1, os.ModeSymlink, "", 500),
+			m.InodeForListing("/l", 1, 0, "group", 500)
 	}
 	f, s, l := list()
 	if f == s || f == l || s == l {
@@ -457,7 +457,17 @@ func TestFirstListingTellsObjectsApart(t *testing.T) {
 	if f2, s2, l2 := list(); f2 != f || s2 != s || l2 != l {
 		t.Fatalf("the second listing gave %d %d %d, the first %d %d %d", f2, s2, l2, f, s, l)
 	}
+	if got := m.LookupLinked("/l", 1, 0, "group", 500, true); got != l {
+		t.Fatalf("the lookup of the link gave %d, the listing %d", got, l)
+	}
 	if got := m.LookupLinked("/s", 1, os.ModeSymlink, "", 500, true); got != s {
 		t.Fatalf("the lookup of the symlink gave %d, the listing %d", got, s)
+	}
+	if f2, s2, l2 := list(); f2 != f || s2 != s || l2 != l {
+		t.Fatalf("after the lookups the listing gave %d %d %d, first %d %d %d", f2, s2, l2, f, s, l)
+	}
+	// Another link of the bound group is listed as the group.
+	if got := m.InodeForListing("/l2", 1, 0, "group", 500); got != l {
+		t.Fatalf("another link of the group listed as %d, the group is %d", got, l)
 	}
 }

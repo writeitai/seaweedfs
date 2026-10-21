@@ -136,9 +136,12 @@ func (wfs *WFS) Create(cancel <-chan struct{}, in *fuse.CreateIn, name string, o
 		// A create is authoritative for the entry it just made, so it takes
 		// effect even on a handle that outlived a previous incarnation,
 		// and nothing of that one's state carries over (Mountable).
+		fileHandle.ResetDirtyPages()
 		fileHandle.SetEntry(newEntry)
 		fileHandle.setAuthoritativeBase(proto.Clone(newEntry).(*filer_pb.Entry))
 		fileHandle.isDeleted, fileHandle.isRenamed, fileHandle.persistErr = false, false, 0
+		fileHandle.entryVersionTsNs.Store(0)
+		fileHandle.entryVersionSignature.Store(0)
 	}
 	fileHandle.RememberPath(entryFullPath)
 	// Mark dirty so the deferred filer create happens on Flush, even if the

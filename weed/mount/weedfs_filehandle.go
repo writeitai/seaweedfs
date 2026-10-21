@@ -192,7 +192,8 @@ func (wfs *WFS) reclaimHandle(fh *FileHandle, entry *filer_pb.Entry, version ent
 	fh.SetEntry(entry)
 	fh.baseEntry.Store(proto.Clone(entry).(*filer_pb.Entry))
 	// Nothing of the previous occupant's state carries over.
-	fh.isDeleted, fh.isRenamed, fh.persistErr = false, false, 0
+	fh.isDeleted, fh.isRenamed, fh.persistErr, fh.pendingCreate = false, false, 0, false
+	fh.contentType = ""
 	fh.entryVersionTsNs.Store(version.tsNs)
 	fh.entryVersionSignature.Store(version.signature)
 }

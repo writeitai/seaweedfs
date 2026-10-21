@@ -216,7 +216,6 @@ func (wfs *WFS) doReadDirectory(input *fuse.ReadIn, out DirEntrySink, isPlusMode
 	// one nothing ever arrives to take the entry back out again.
 	takesLookupRef := isPlusMode && out.TakesLookupRef()
 
-	reported := map[uint64]ListedIdentity{} // the numbers this call gave out
 	// index is the position in entryStream, used to calculate the offset for next readdir
 	processEachEntryFn := func(entry *filer.Entry, index int64) bool {
 		dirEntry.Name = entry.Name()
@@ -230,7 +229,7 @@ func (wfs *WFS) doReadDirectory(input *fuse.ReadIn, out DirEntrySink, isPlusMode
 		if takesLookupRef {
 			inode = wfs.inodeToPath.LookupLinked(childPath, entry.Crtime.Unix(), EntryKind(entry.IsDirectory(), entry.Mode), string(entry.HardLinkId), entry.Inode, false)
 		} else {
-			inode = wfs.inodeToPath.InodeForListing(childPath, entry.Crtime.Unix(), EntryKind(entry.IsDirectory(), entry.Mode), string(entry.HardLinkId), entry.Inode, reported)
+			inode = wfs.inodeToPath.InodeForListing(childPath, entry.Crtime.Unix(), EntryKind(entry.IsDirectory(), entry.Mode), string(entry.HardLinkId), entry.Inode)
 		}
 		dirEntry.Ino = inode
 

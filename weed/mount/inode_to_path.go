@@ -42,10 +42,12 @@ type InodeToPath struct {
 	// linking holds the group a Link here is turning a standalone file into
 	// a hard link of, while it does. Mountable, sparse as above.
 	linking map[uint64]string
-	// listedAt keeps, per path, the number a listing moved on to because
-	// another object had the one it would have taken, so the path keeps it
-	// until a lookup binds it. Mountable, holding only such paths.
-	listedAt map[util.FullPath]listedInode
+	// listed keeps, per path a plain listing reported without a reference,
+	// the number it reported, and listedBy the path per number, so another
+	// object is never given it, until a lookup binds the path. Mountable,
+	// bounded by maxListed.
+	listed   map[util.FullPath]listedInode
+	listedBy map[uint64]util.FullPath
 	// watches counts, per path a caller is watching (Watch), the bindings
 	// made since. Mountable, holding only paths being watched.
 	watches map[util.FullPath]*pathWatch
@@ -265,21 +267,22 @@ func (i *InodeToPath) LookupLinked(path util.FullPath, unixTime int64, kind os.F
 		} else {
 			inode = possibleInode
 		}
-		// The number a listing already reported for this object at this
-		// path (Mountable: see InodeForListing).
-		if a, ok := i.listedAt[path]; ok && a.id == (ListedIdentity{kind: kind, linkID: linkID, persisted: possibleInode}) && !isHardlink {
-			inode = a.inode
-		}
-		delete(i.listedAt, path)
 		joined := false
 		if isHardlink && possibleInode != 0 {
 			inode, joined = i.linkGroupLocked(possibleInode, linkID)
 		}
 		if !joined {
-			for _, found := i.inode2path[inode]; found; inode++ {
-				_, found = i.inode2path[inode+1]
+			// The number a listing already reported for this object at this
+			// path, and none a listing reported for another object
+			// (Mountable: see InodeForListing).
+			if a, ok := i.listed[path]; ok && a.id == (ListedIdentity{kind: kind, linkID: linkID, persisted: possibleInode}) {
+				inode = a.inode
+			}
+			for !i.freeForLocked(inode, path) {
+				inode++
 			}
 		}
+		i.unlistLocked(path)
 		if possibleInode != 0 && inode != possibleInode {
 			if i.stored == nil {
 				i.stored, i.probed = map[uint64]uint64{}, map[uint64][]uint64{}
@@ -348,47 +351,74 @@ func (i *InodeToPath) IncrementNlookup(inode uint64) bool {
 // Lookup does is skipped: the worst case is a repeated st_ino in one listing.
 //
 // Mountable (writeitai/seaweedfs, branch mountable): by the identity rule
-// (Holds), as a lookup would choose. The path's inode is reported only if
-// it holds the listed object, and a number another object holds is
-// probed past, so two objects never share one in a listing.
-//
-// listed holds the numbers this listing already reported, and for which
-// object: another object listed with the same number moves on too. A
-// number moved on to is kept for the path (listedAt), so later listings,
-// and the lookup that binds the path, report the same one.
-func (i *InodeToPath) InodeForListing(path util.FullPath, unixTime int64, kind os.FileMode, linkID string, possibleInode uint64, listed map[uint64]ListedIdentity) uint64 {
+// (Holds), as a lookup would choose: the path's inode only if it holds the
+// listed object, a bound hard link's group, and otherwise a number no other
+// object holds, in the table or as reported by a listing before. The
+// number is kept for the path (listed), so later listings, paged or not,
+// and the lookup that binds the path report the same one.
+func (i *InodeToPath) InodeForListing(path util.FullPath, unixTime int64, kind os.FileMode, linkID string, possibleInode uint64) uint64 {
 	i.Lock()
 	defer i.Unlock()
 	if inode, found := i.path2inode[path]; found && !i.replacedLocked(inode, kind, linkID, possibleInode) {
 		return inode
 	}
+	if linkID != "" && possibleInode != 0 {
+		if inode, joined := i.linkGroupLocked(possibleInode, linkID); joined {
+			return inode
+		}
+	}
 	id := ListedIdentity{kind: kind, linkID: linkID, persisted: possibleInode}
+	if a, ok := i.listed[path]; ok && a.id == id && i.freeForLocked(a.inode, path) {
+		return a.inode
+	}
 	inode := possibleInode
 	if inode == 0 {
 		inode = path.AsInode(unixTime)
 	}
-	first := inode
-	if a, ok := i.listedAt[path]; ok && a.id == id {
-		inode = a.inode
-	}
-	for {
-		_, taken := i.inode2path[inode]
-		other, reported := listed[inode]
-		if inode > 1 && (!taken || !i.replacedLocked(inode, kind, linkID, possibleInode)) && (!reported || other == id) {
-			break
+	for !i.freeForLocked(inode, path) {
+		if _, taken := i.inode2path[inode]; taken && !i.replacedLocked(inode, kind, linkID, possibleInode) {
+			break // the object, as the table has it
 		}
 		inode++
 	}
-	if inode != first {
-		if i.listedAt == nil {
-			i.listedAt = map[util.FullPath]listedInode{}
-		}
-		i.listedAt[path] = listedInode{inode: inode, id: id}
-	}
-	if listed != nil {
-		listed[inode] = id
-	}
+	i.listLocked(path, listedInode{inode: inode, id: id})
 	return inode
+}
+
+// freeForLocked reports whether path may take inode: neither in the table
+// nor reported by a listing for another path, and not one of the reserved
+// 0 and 1.
+func (i *InodeToPath) freeForLocked(inode uint64, path util.FullPath) bool {
+	if inode <= 1 {
+		return false
+	}
+	if _, taken := i.inode2path[inode]; taken {
+		return false
+	}
+	owner, listed := i.listedBy[inode]
+	return !listed || owner == path
+}
+
+// maxListed bounds the numbers kept for listed paths; past it they are
+// forgotten all at once, and a later listing may give out one again.
+const maxListed = 1 << 20
+
+func (i *InodeToPath) listLocked(path util.FullPath, a listedInode) {
+	if i.listed == nil || len(i.listed) >= maxListed {
+		i.listed, i.listedBy = map[util.FullPath]listedInode{}, map[uint64]util.FullPath{}
+	}
+	i.unlistLocked(path)
+	i.listed[path] = a
+	i.listedBy[a.inode] = path
+}
+
+func (i *InodeToPath) unlistLocked(path util.FullPath) {
+	if a, ok := i.listed[path]; ok {
+		delete(i.listed, path)
+		if i.listedBy[a.inode] == path {
+			delete(i.listedBy, a.inode)
+		}
+	}
 }
 
 // ListedIdentity is what a listing tells an object by: its type,
@@ -710,6 +740,10 @@ func (i *InodeToPath) AddPath(inode uint64, path util.FullPath) {
 func (i *InodeToPath) PromotePath(inode uint64, gone, alias util.FullPath) bool {
 	i.Lock()
 	defer i.Unlock()
+	return i.promotePathLocked(inode, gone, alias)
+}
+
+func (i *InodeToPath) promotePathLocked(inode uint64, gone, alias util.FullPath) bool {
 	ie, found := i.inode2path[inode]
 	if !found || gone == alias || !ie.hasPath(alias) || ie.path != gone && ie.path != alias {
 		return false
@@ -726,6 +760,31 @@ func (i *InodeToPath) PromotePath(inode uint64, gone, alias util.FullPath) bool 
 		delete(i.path2inode, gone)
 	}
 	return true
+}
+
+// PromotePathIf is PromotePath for a caller that watched gone (Watch): it
+// promotes nothing if a lookup bound gone again since, at generation.
+//
+// Mountable (writeitai/seaweedfs, branch mountable).
+func (i *InodeToPath) PromotePathIf(inode uint64, gone, alias util.FullPath, generation uint64) bool {
+	i.Lock()
+	defer i.Unlock()
+	return i.generationLocked(gone) == generation && i.promotePathLocked(inode, gone, alias)
+}
+
+// Generation is the binding generation of a watched path (see Watch), 0
+// for one not watched.
+func (i *InodeToPath) Generation(path util.FullPath) uint64 {
+	i.RLock()
+	defer i.RUnlock()
+	return i.generationLocked(path)
+}
+
+func (i *InodeToPath) generationLocked(path util.FullPath) uint64 {
+	if w := i.watches[path]; w != nil {
+		return w.generation
+	}
+	return 0
 }
 
 // PersistedInode is the inode the store keeps for the object at inode:

@@ -576,6 +576,11 @@ func (wfs *WFS) loadInodeEntry(inode uint64, path util.FullPath) (util.FullPath,
 		// The namespace's: never an open handle's entry.
 		return wfs.maybeLoadNamespaceEntry(p)
 	}
+	// rebound reports whether a lookup bound p again since it was watched:
+	// what was found there then no longer stands (Mountable).
+	rebound := func(p util.FullPath) bool {
+		return wfs.inodeToPath.Generation(p) != watched[p]
+	}
 	entry, version, status := load(path)
 	for range 4 {
 		if !gone(entry, status) {
@@ -591,8 +596,9 @@ func (wfs *WFS) loadInodeEntry(inode uint64, path util.FullPath) (util.FullPath,
 			aliasEntry, aliasVersion, aliasStatus := load(alias)
 			switch {
 			case !gone(aliasEntry, aliasStatus) && aliasStatus == fuse.OK:
-				// Only a verified survivor stands in for the object.
-				if wfs.inodeToPath.PromotePath(inode, path, alias) {
+				// Only a verified survivor stands in for the object, and
+				// only for a path no lookup bound again meanwhile.
+				if wfs.inodeToPath.PromotePathIf(inode, path, alias, watched[path]) {
 					return alias, aliasEntry, aliasVersion, aliasStatus
 				}
 			case aliasStatus != fuse.OK && aliasStatus != fuse.ENOENT:
@@ -600,6 +606,15 @@ func (wfs *WFS) loadInodeEntry(inode uint64, path util.FullPath) (util.FullPath,
 			default:
 				invalid[alias] = true
 			}
+		}
+		// A lookup bound the path again meanwhile, perhaps to the object
+		// linked back there: what was found there no longer stands, so it
+		// is read again.
+		if rebound(path) {
+			delete(invalid, path)
+			watched[path] = wfs.inodeToPath.Generation(path)
+			entry, version, status = wfs.maybeLoadNamespaceEntry(path)
+			continue
 		}
 		// No survivor, or another caller moved the primary meanwhile: in
 		// that case, start over from where it is now.

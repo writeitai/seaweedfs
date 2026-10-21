@@ -230,21 +230,29 @@ func (wfs *WFS) Link(cancel <-chan struct{}, in *fuse.LinkIn, name string, out *
 	}
 
 	wfs.inodeToPath.AddPath(sourceInode, newEntryPath)
-	if converting {
-		// An open handle of the source holds it as a hard link now, before
-		// EndLink makes only that form the source's (Mountable).
-		if sourceFhFound {
-			sourceFh.UpdateEntry(func(entry *filer_pb.Entry) {
-				if entry != nil {
-					entry.HardLinkId, entry.HardLinkCounter = group, oldEntry.HardLinkCounter
-				}
-			})
-			// Its base too, which a flush takes the group from.
-			if base := sourceFh.baseEntry.Load(); base != nil {
-				base = proto.Clone(base).(*filer_pb.Entry)
-				base.HardLinkId, base.HardLinkCounter = group, oldEntry.HardLinkCounter
-				sourceFh.setAuthoritativeBase(base)
+	// The source's open handle, and its base, which a flush takes the group
+	// from, hold the source as promoted: its group, counter and times, as
+	// the filer acknowledged them (Mountable).
+	if sourceFhFound {
+		acked := updateOldEntryRequest.Entry
+		if stored := updateResp.GetMetadataEvent().GetEventNotification().GetNewEntry(); stored != nil {
+			acked = stored
+		}
+		promote := func(e *filer_pb.Entry) {
+			if e == nil {
+				return
 			}
+			e.HardLinkId, e.HardLinkCounter = acked.HardLinkId, acked.HardLinkCounter
+			if e.Attributes != nil && acked.Attributes != nil {
+				e.Attributes.Mtime, e.Attributes.MtimeNs = acked.Attributes.Mtime, acked.Attributes.MtimeNs
+				e.Attributes.Ctime, e.Attributes.CtimeNs = acked.Attributes.Ctime, acked.Attributes.CtimeNs
+			}
+		}
+		sourceFh.UpdateEntry(promote)
+		if base := sourceFh.baseEntry.Load(); base != nil {
+			base = proto.Clone(base).(*filer_pb.Entry)
+			promote(base)
+			sourceFh.setAuthoritativeBase(base)
 		}
 	}
 

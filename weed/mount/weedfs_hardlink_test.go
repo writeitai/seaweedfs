@@ -488,3 +488,32 @@ func TestReclaimedHandleStartsAfresh(t *testing.T) {
 		t.Fatalf("deleted %v, renamed %v, refusal %v, version %d", fh.isDeleted, fh.isRenamed, fh.persistErr, fh.entryVersionTsNs.Load())
 	}
 }
+
+// Recovery found the primary missing and, while it verified a survivor,
+// the primary was linked back and looked up: it does not promote over that
+// newer binding, but reads the primary again and answers from it.
+func TestRecoveryKeepsAPrimaryBoundAgain(t *testing.T) {
+	wfs, filer, inode := linkedWFS(t)
+	filer.set("/d/one", nil)
+	var once sync.Once
+	filer.mu.Lock()
+	filer.delay = func(p util.FullPath) {
+		if p != "/d/two" {
+			return
+		}
+		once.Do(func() {
+			filer.mu.Unlock()
+			// /d/one is linked back and looked up meanwhile.
+			filer.set("/d/one", linkEntry("one", 4242, "link", "shared"))
+			wfs.inodeToPath.LookupLinked("/d/one", 1, 0, "link", 4242, true)
+			filer.mu.Lock()
+		})
+	}
+	filer.mu.Unlock()
+	if p, _, _, st := wfs.loadInodeEntry(inode, "/d/one"); st != fuse.OK || p != "/d/one" {
+		t.Fatalf("recovery answered %s, %v", p, st)
+	}
+	if p, _ := wfs.inodeToPath.GetPath(inode); p != "/d/one" {
+		t.Fatalf("primary %s", p)
+	}
+}

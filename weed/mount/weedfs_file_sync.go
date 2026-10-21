@@ -519,6 +519,7 @@ func (wfs *WFS) holdFlushAck(fh *FileHandle, sent, written *filer_pb.Entry, resp
 		})
 	}
 	fh.setAuthoritativeBase(base)
+	fh.pendingCreate = false // the filer has it now
 }
 
 // storedForm is entry, cloned, as the filer store gives it back: chunk file
