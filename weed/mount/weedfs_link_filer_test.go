@@ -60,10 +60,13 @@ func (f *storeFiler) find(p util.FullPath) *filer_pb.Entry {
 	}
 	e = proto.Clone(e).(*filer_pb.Entry)
 	if rec := f.shared[string(e.HardLinkId)]; len(e.HardLinkId) > 0 && rec != nil {
-		e.Attributes = proto.Clone(rec.Attributes).(*filer_pb.FuseAttributes)
+		rec = proto.Clone(rec).(*filer_pb.Entry)
+		e.Attributes = rec.Attributes
 		e.Chunks, e.Content, e.Extended = rec.Chunks, rec.Content, rec.Extended
 		e.HardLinkCounter = rec.HardLinkCounter
 	}
+	// The store keeps chunk file IDs parsed only; a read restores them.
+	filer_pb.AfterEntryDeserialization(e.GetChunks())
 	return e
 }
 
@@ -73,6 +76,7 @@ func (f *storeFiler) store(p util.FullPath, e *filer_pb.Entry) *filer_pb.Entry {
 	if old := f.find(p); old != nil && old.Attributes.GetInode() != 0 {
 		e.Attributes.Inode = old.Attributes.Inode
 	}
+	filer_pb.BeforeEntrySerialization(e.GetChunks())
 	f.entries[p] = e
 	if len(e.HardLinkId) > 0 {
 		f.shared[string(e.HardLinkId)] = proto.Clone(e).(*filer_pb.Entry)
@@ -81,7 +85,11 @@ func (f *storeFiler) store(p util.FullPath, e *filer_pb.Entry) *filer_pb.Entry {
 	return f.find(p)
 }
 
+// event is the metadata event of a write of e. As the filer's, it carries
+// the entry as it went into the store, chunk file IDs parsed only.
 func (f *storeFiler) event(dir string, e *filer_pb.Entry) *filer_pb.SubscribeMetadataResponse {
+	e = proto.Clone(e).(*filer_pb.Entry)
+	filer_pb.BeforeEntrySerialization(e.GetChunks())
 	return &filer_pb.SubscribeMetadataResponse{Directory: dir, TsNs: f.logTsNs, EventNotification: &filer_pb.EventNotification{
 		OldEntry: &filer_pb.Entry{Name: e.Name}, NewEntry: e, NewParentPath: dir,
 	}}

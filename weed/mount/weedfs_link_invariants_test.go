@@ -92,6 +92,34 @@ func TestLinkDestinationCreatedFirst(t *testing.T) {
 	}
 }
 
+// A source with chunks whose Link loses its alias create: the rollback's
+// condition holds against the stored entry, whose chunk file IDs the
+// store keeps parsed only, so the source is standalone again; its open
+// handle holds the chunks with their file IDs.
+func TestLinkRollbackOfAChunkedSource(t *testing.T) {
+	f := newStoreFiler()
+	wfs := newLinkTestWFS(t, f)
+	source := plainEntry("a", 8001, "")
+	source.Content = nil
+	source.Chunks = []*filer_pb.FileChunk{{FileId: "3,01637037d6", Size: 6, ModifiedTsNs: 1}}
+	source.Attributes.FileSize = 6
+	f.put(source)
+	f.put(plainEntry("b", 9000, "theirs"))
+	src := seen(t, wfs, f, "a")
+	fh, _ := wfs.fhMap.AcquireFileHandle(wfs, src, f.lookup("/a"), 0, 0)
+	if st := tryLink(wfs, src, "b"); st != fuse.Status(syscall.EEXIST) {
+		t.Fatalf("Link: %v", st)
+	}
+	if a := f.lookup("/a"); len(a.HardLinkId) != 0 || a.HardLinkCounter != 0 {
+		t.Fatalf("source left as %x/%d", a.HardLinkId, a.HardLinkCounter)
+	}
+	for _, c := range fh.GetEntry().GetEntry().GetChunks() {
+		if c.FileId != "3,01637037d6" {
+			t.Fatalf("the open handle holds chunk %q", c.FileId)
+		}
+	}
+}
+
 // A Link that loses its alias create to an existing name, and whose
 // rollback then fails, the source changed elsewhere meanwhile: EEXIST, and
 // the destination directory's cache no longer hides the name.
@@ -243,6 +271,44 @@ func TestLinkRollbackReachesTheMount(t *testing.T) {
 	}
 	if a := f.lookup("/a"); len(a.HardLinkId) != 0 {
 		t.Fatal("the flush made the source a hard link again")
+	}
+}
+
+// The same with the source and the destination in directories of their
+// own, both cached: the source's directory takes the rollback too, which
+// the destination's invalidation does not reach.
+func TestLinkRollbackReachesTheSourceDirectory(t *testing.T) {
+	f := newStoreFiler()
+	wfs := newLinkTestWFS(t, f)
+	dir := func(name string) *filer_pb.Entry {
+		return &filer_pb.Entry{Name: name, IsDirectory: true, Attributes: &filer_pb.FuseAttributes{FileMode: uint32(os.ModeDir | 0o755), Uid: 99, Gid: 100}}
+	}
+	f.mu.Lock()
+	f.store("/s", dir("s"))
+	f.store("/t", dir("t"))
+	f.store("/s/a", plainEntry("a", 8001, "source"))
+	f.store("/t/b", plainEntry("b", 9000, "theirs"))
+	f.mu.Unlock()
+	for _, d := range []util.FullPath{"/s", "/t"} {
+		wfs.inodeToPath.LookupLinked(d, 1, os.ModeDir, "", 0, true)
+		wfs.inodeToPath.MarkChildrenCached(d)
+	}
+	if err := wfs.metaCache.InsertEntry(context.Background(), filer.FromPbEntry("/s", f.lookup("/s/a")), 0); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	src := wfs.inodeToPath.LookupLinked("/s/a", 1, 0, "", 8001, true)
+	dest, _ := wfs.inodeToPath.GetInode("/t")
+	st := wfs.Link(nil, &fuse.LinkIn{InHeader: fuse.InHeader{NodeId: dest, Caller: fuse.Caller{Owner: fuse.Owner{Uid: 99, Gid: 100}}}, Oldnodeid: src}, "b", &fuse.EntryOut{})
+	if st != fuse.Status(syscall.EEXIST) {
+		t.Fatalf("Link: %v", st)
+	}
+	if cached, _, _ := wfs.metaCache.FindEntry(context.Background(), "/s/a"); cached == nil || len(cached.HardLinkId) != 0 {
+		t.Fatalf("the source's directory holds %v", cached)
+	}
+	sourceDir, _ := wfs.inodeToPath.GetInode("/s")
+	var out fuse.EntryOut
+	if st := wfs.Lookup(nil, &fuse.InHeader{NodeId: sourceDir}, "a", &out); st != fuse.OK || out.NodeId != src {
+		t.Fatalf("lookup %v: inode %d, want %d", st, out.NodeId, src)
 	}
 }
 

@@ -132,11 +132,16 @@ func (wfs *WFS) Create(cancel <-chan struct{}, in *fuse.CreateIn, name string, o
 		// the inode is in the table, and the file is what the namespace has
 		// under it now, on that inode, or nothing if it is gone.
 		known := false
-		if wfs.option.EagerFilerCreate && wfs.inodeToPath.HasInode(inode) {
-			// Whatever happened to it meanwhile decides: no name left, an
-			// error reading it, or another object on that inode, and the
-			// create fails, never rebinding the path to a second inode.
-			fail := func(code fuse.Status) fuse.Status { return code }
+		if wfs.option.EagerFilerCreate && wfs.inodeToPath.IncrementNlookup(inode) {
+			// The reply's reference, taken first, so the inode cannot be
+			// forgotten meanwhile. Whatever happened to the file decides:
+			// no name left, an error reading it, or another object on that
+			// inode, and the create fails, giving the reference back and
+			// never rebinding the path to a second inode.
+			fail := func(code fuse.Status) fuse.Status {
+				wfs.Forget(inode, 1)
+				return code
+			}
 			p, st := wfs.inodeToPath.GetPath(inode)
 			if st != fuse.OK {
 				return fail(fuse.ENOENT) // unlinked again before this reply
@@ -149,7 +154,6 @@ func (wfs *WFS) Create(cancel <-chan struct{}, in *fuse.CreateIn, name string, o
 				return fail(fuse.EIO)
 			}
 			newEntry, version, entryFullPath, known = latest, latestVersion, path, true
-			wfs.inodeToPath.IncrementNlookup(inode) // the reply's reference
 		}
 		if !known && wfs.metaCache.DeletedAfter(context.Background(), entryFullPath, version.tsNs) {
 			// Deleted elsewhere before anything here looked it up: created,
@@ -214,6 +218,12 @@ func (wfs *WFS) Create(cancel <-chan struct{}, in *fuse.CreateIn, name string, o
 	unlockInode()
 	if code := wfs.acquireWriteLease(fileHandle, entryFullPath); code != fuse.OK {
 		wfs.ReleaseHandle(fileHandle.fh)
+		if !wfs.option.EagerFilerCreate {
+			// The filer never had it: its placeholder goes too.
+			if err := wfs.metaCache.DeleteEntry(context.Background(), entryFullPath); err != nil {
+				glog.Warningf("create %s: drop the placeholder: %v", entryFullPath, err)
+			}
+		}
 		wfs.Forget(inode, 1)
 		return code
 	}

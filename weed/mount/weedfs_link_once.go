@@ -80,11 +80,12 @@ func (wfs *WFS) lockFlushedHandle(inode uint64, uid, gid uint32) (*FileHandle, *
 	return nil, nil, fuse.Status(syscall.EAGAIN) // written to all along
 }
 
-// entryEqual is the condition that the stored entry is still entry.
+// entryEqual is the condition that the stored entry is still entry, in the
+// form the filer compares it in (storedForm).
 func entryEqual(entry *filer_pb.Entry) *filer_pb.WriteCondition {
 	return &filer_pb.WriteCondition{Clauses: []*filer_pb.WriteCondition_Clause{{
 		Kind:          filer_pb.WriteCondition_IF_ENTRY_EQUAL,
-		ExpectedEntry: entry,
+		ExpectedEntry: storedForm(entry),
 	}}}
 }
 

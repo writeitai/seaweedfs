@@ -182,10 +182,7 @@ func (wfs *WFS) linkLocked(in *fuse.LinkIn, sourceInode uint64, oldEntryPath, ne
 		return fuse.EIO, nil
 	}
 	linked = true
-	acked := promoted
-	if ackedEntry := updateResp.GetMetadataEvent().GetEventNotification().GetNewEntry(); ackedEntry != nil {
-		acked = ackedEntry
-	}
+	acked := ackedEntry(promoted, updateResp)
 	// Every handle on the source holds the acknowledged entry from here,
 	// fenced against older events.
 	wfs.holdAcked(fh, acked, updateResp)
@@ -235,9 +232,7 @@ func (wfs *WFS) linkLocked(in *fuse.LinkIn, sourceInode uint64, oldEntryPath, ne
 		// The mount takes the rolled-back source, as acknowledged, before
 		// the conversion ends: the cache, and the open handle, fenced.
 		linked = !converting
-		if ackedRollback := rollbackResp.GetMetadataEvent().GetEventNotification().GetNewEntry(); ackedRollback != nil {
-			rollback = ackedRollback
-		}
+		rollback = ackedEntry(rollback, rollbackResp)
 		wfs.holdAcked(fh, rollback, rollbackResp)
 		rollbackEvent := rollbackResp.GetMetadataEvent()
 		if rollbackEvent == nil {
@@ -335,6 +330,19 @@ func (wfs *WFS) syncHardLinkSiblings(inode uint64, authoritativeEntry *filer_pb.
 	// writes onto the same /dev/fuse fd that the kernel is still waiting to
 	// read the Link reply from — causing a self-notify deadlock. The kernel
 	// will re-stat siblings once its attr-cache TTL expires.
+}
+
+// ackedEntry is the entry the filer acknowledged for an update of sent: the
+// stored entry its event carries, its chunks' file IDs restored as a lookup
+// returns them (the store keeps them parsed only), else sent (Mountable).
+func ackedEntry(sent *filer_pb.Entry, resp *filer_pb.UpdateEntryResponse) *filer_pb.Entry {
+	stored := resp.GetMetadataEvent().GetEventNotification().GetNewEntry()
+	if stored == nil {
+		return sent
+	}
+	acked := proto.Clone(stored).(*filer_pb.Entry)
+	filer_pb.AfterEntryDeserialization(acked.GetChunks())
+	return acked
 }
 
 // holdAcked puts an acknowledged entry into a handle Link holds locked, as
