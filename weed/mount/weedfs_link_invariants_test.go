@@ -66,8 +66,13 @@ func TestLinkDestinationCreatedFirst(t *testing.T) {
 	f.put(plainEntry("a", 8001, "source"))
 	f.put(plainEntry("b", 9000, "theirs"))
 	src := seen(t, wfs, f, "a")
+	wfs.inodeToPath.MarkChildrenCached("/") // without b
 	if st := tryLink(wfs, src, "b"); st != fuse.Status(syscall.EEXIST) {
 		t.Fatalf("Link: %v", st)
+	}
+	var found fuse.EntryOut
+	if st := wfs.Lookup(nil, &fuse.InHeader{NodeId: 1}, "b", &found); st != fuse.OK {
+		t.Fatalf("lookup of the name the link lost to: %v", st)
 	}
 	if a := f.lookup("/a"); len(a.HardLinkId) != 0 || a.HardLinkCounter != 0 {
 		t.Fatalf("source left as %x/%d", a.HardLinkId, a.HardLinkCounter)
@@ -108,6 +113,9 @@ func TestLinkLocksTheGroupTheFilerHas(t *testing.T) {
 	}
 	if a := f.lookup("/a"); string(a.HardLinkId) != "theirs" || a.HardLinkCounter != 3 {
 		t.Fatalf("source %q/%d", a.HardLinkId, a.HardLinkCounter)
+	}
+	if wfs.inodeToPath.Holds(src, 0, "another", 8001) {
+		t.Fatal("the source's group is still unknown here")
 	}
 	f.mu.Lock()
 	locked := f.locked
@@ -237,41 +245,56 @@ func TestLinkLocksANewGroupBeforeShowingIt(t *testing.T) {
 	}
 }
 
-// A Link of a file whose eager create's reply is still on its way: the
-// create then reports the file as that hard link, on the same inode, and
-// its handle holds it so.
+// A Link of a file whose eager create's reply is still on its way, here
+// or by another mount, whose result this mount then looks up: the create
+// reports the file as that hard link, on the same inode, its handle holds
+// it so, and the create's older acknowledgement does not replace it in
+// the cache.
 func TestCreateAfterALinkOfTheNewFile(t *testing.T) {
-	f := newStoreFiler()
-	wfs := newLinkTestWFS(t, f)
-	wfs.option.EagerFilerCreate = true
-	var linkedInode uint64
-	var once sync.Once
-	f.afterCreate = func(r *filer_pb.CreateEntryRequest) (*filer_pb.CreateEntryResponse, error) {
-		f.mu.Lock()
-		stored := f.find(util.FullPath(r.Directory).Child(r.Entry.Name))
-		resp := &filer_pb.CreateEntryResponse{MetadataEvent: f.event(r.Directory, stored), LogTsNs: f.logTsNs}
-		f.mu.Unlock()
-		if r.Entry.Name == "new" {
-			once.Do(func() {
-				// Another process looks the new file up and links it.
-				linkedInode = seen(t, wfs, f, "new")
-				if st := tryLink(wfs, linkedInode, "alias"); st != fuse.OK {
-					t.Errorf("Link: %v", st)
-				}
-			})
+	for _, elsewhere := range []bool{false, true} {
+		f := newStoreFiler()
+		wfs := newLinkTestWFS(t, f)
+		wfs.option.EagerFilerCreate = true
+		var linkedInode uint64
+		var once sync.Once
+		f.afterCreate = func(r *filer_pb.CreateEntryRequest) (*filer_pb.CreateEntryResponse, error) {
+			f.mu.Lock()
+			stored := f.find(util.FullPath(r.Directory).Child(r.Entry.Name))
+			resp := &filer_pb.CreateEntryResponse{MetadataEvent: f.event(r.Directory, stored), LogTsNs: f.logTsNs}
+			f.mu.Unlock()
+			if r.Entry.Name == "new" {
+				once.Do(func() {
+					if elsewhere {
+						other := newLinkTestWFS(t, f)
+						if st := tryLink(other, seen(t, other, f, "new"), "alias"); st != fuse.OK {
+							t.Errorf("Link elsewhere: %v", st)
+						}
+						linkedInode = seen(t, wfs, f, "new")
+						return
+					}
+					// Another process looks the new file up and links it.
+					linkedInode = seen(t, wfs, f, "new")
+					if st := tryLink(wfs, linkedInode, "alias"); st != fuse.OK {
+						t.Errorf("Link: %v", st)
+					}
+				})
+			}
+			return resp, nil
 		}
-		return resp, nil
-	}
-	h := fuse.InHeader{NodeId: 1, Caller: fuse.Caller{Owner: fuse.Owner{Uid: 99, Gid: 100}}}
-	var out fuse.CreateOut
-	if st := wfs.Create(nil, &fuse.CreateIn{InHeader: h, Flags: syscall.O_WRONLY | syscall.O_CREAT, Mode: 0o644}, "new", &out); st != fuse.OK {
-		t.Fatalf("Create: %v", st)
-	}
-	if out.NodeId != linkedInode {
-		t.Fatalf("Create reported inode %d, the link %d", out.NodeId, linkedInode)
-	}
-	if fh := wfs.GetHandle(FileHandleId(out.Fh)); len(fh.GetEntry().GetEntry().HardLinkId) == 0 {
-		t.Fatal("the created file's handle holds it standalone")
+		h := fuse.InHeader{NodeId: 1, Caller: fuse.Caller{Owner: fuse.Owner{Uid: 99, Gid: 100}}}
+		var out fuse.CreateOut
+		if st := wfs.Create(nil, &fuse.CreateIn{InHeader: h, Flags: syscall.O_WRONLY | syscall.O_CREAT, Mode: 0o644}, "new", &out); st != fuse.OK {
+			t.Fatalf("elsewhere %v: Create: %v", elsewhere, st)
+		}
+		if out.NodeId != linkedInode {
+			t.Fatalf("elsewhere %v: Create reported inode %d, the link %d", elsewhere, out.NodeId, linkedInode)
+		}
+		if fh := wfs.GetHandle(FileHandleId(out.Fh)); len(fh.GetEntry().GetEntry().HardLinkId) == 0 {
+			t.Fatalf("elsewhere %v: the created file's handle holds it standalone", elsewhere)
+		}
+		if cached, _, _ := wfs.metaCache.FindEntry(context.Background(), "/new"); cached == nil || len(cached.HardLinkId) == 0 {
+			t.Fatalf("elsewhere %v: the cache holds %v", elsewhere, cached)
+		}
 	}
 }
 
@@ -567,6 +590,67 @@ func TestDelayedCreateKeepsNewerHandleState(t *testing.T) {
 	}
 }
 
+// A write open of the new file, registered while the eager create's reply
+// is on its way: it waits for the create to give its handle, which it
+// shares, the path's lease, never for the lease itself, which that handle
+// keeps until both close. Then the lease is let go.
+func TestDelayedCreateWithAWriteOpen(t *testing.T) {
+	f := newStoreFiler()
+	wfs := newLinkTestWFS(t, f)
+	wfs.option.EagerFilerCreate = true
+	var once sync.Once
+	opened := make(chan fuse.Status, 1)
+	var openOut fuse.OpenOut
+	f.afterCreate = func(r *filer_pb.CreateEntryRequest) (*filer_pb.CreateEntryResponse, error) {
+		f.mu.Lock()
+		stored := f.find(util.FullPath(r.Directory).Child(r.Entry.Name))
+		resp := &filer_pb.CreateEntryResponse{MetadataEvent: f.event(r.Directory, stored), LogTsNs: f.logTsNs}
+		f.mu.Unlock()
+		if r.Entry.Name == "new" {
+			once.Do(func() {
+				inode := seen(t, wfs, f, "new")
+				go func() {
+					opened <- wfs.Open(nil, &fuse.OpenIn{InHeader: fuse.InHeader{NodeId: inode}, Flags: syscall.O_WRONLY}, &openOut)
+				}()
+				for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(time.Millisecond) {
+					if _, found := wfs.fhMap.FindFileHandle(inode); found {
+						break
+					}
+					if time.Now().After(deadline) {
+						t.Error("the open registered no handle")
+						break
+					}
+				}
+			})
+		}
+		return resp, nil
+	}
+	h := fuse.InHeader{NodeId: 1, Caller: fuse.Caller{Owner: fuse.Owner{Uid: 99, Gid: 100}}}
+	var out fuse.CreateOut
+	if st := wfs.Create(nil, &fuse.CreateIn{InHeader: h, Flags: syscall.O_WRONLY | syscall.O_CREAT, Mode: 0o644}, "new", &out); st != fuse.OK {
+		t.Fatalf("Create: %v", st)
+	}
+	select {
+	case st := <-opened:
+		if st != fuse.OK {
+			t.Fatalf("Open: %v", st)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the write open waits for the create's lease")
+	}
+	if openOut.Fh != out.Fh {
+		t.Fatalf("the open has handle %d, the create %d", openOut.Fh, out.Fh)
+	}
+	for range 2 {
+		wfs.Release(nil, &fuse.ReleaseIn{InHeader: fuse.InHeader{NodeId: out.NodeId}, Fh: out.Fh})
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, held := f.locks["/new"]; held {
+		t.Fatal("the lease outlived both closes")
+	}
+}
+
 // A chmod of the new file by path, no handle open, while the eager
 // create's reply is on its way: the create reports and opens the file as
 // the namespace has it now.
@@ -710,6 +794,9 @@ func TestDelayedCreateOfAFileLinkedAndUnlinked(t *testing.T) {
 	if out.NodeId != linked {
 		t.Fatalf("Create reported inode %d, the file is %d", out.NodeId, linked)
 	}
+	if cached, _, _ := wfs.metaCache.FindEntry(context.Background(), "/new"); cached != nil {
+		t.Fatal("the cache has the unlinked name back")
+	}
 	fh := wfs.GetHandle(FileHandleId(out.Fh))
 	fh.dirtyMetadata = true
 	if st := wfs.Fsync(nil, &fuse.FsyncIn{InHeader: fuse.InHeader{NodeId: out.NodeId}, Fh: out.Fh}); st != fuse.OK {
@@ -783,6 +870,9 @@ func TestDelayedCreateOfAFileGoneOrUnreadable(t *testing.T) {
 		}
 		if inode, found := wfs.inodeToPath.GetInode("/new"); found && inode != seenInode {
 			t.Fatalf("%s: the name was bound to a second inode %d", change, inode)
+		}
+		if cached, _, _ := wfs.metaCache.FindEntry(context.Background(), "/new"); change == "unlinked" && cached != nil {
+			t.Fatalf("%s: the cache has the name back", change)
 		}
 	}
 }

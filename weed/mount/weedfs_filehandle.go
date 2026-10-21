@@ -102,6 +102,10 @@ func (wfs *WFS) AcquireHandle(inode uint64, flags, uid, gid uint32) (fileHandle 
 	// auto-renewal until the file handle is released (close).
 	// Use the filer path as the lock key since inode numbers are
 	// assigned per-mount and differ across mount instances.
+	if wfs.lockClient != nil && flags&fuse.O_ANYWRITE != 0 {
+		// A Create here may hold the lease for this handle (Mountable).
+		wfs.waitForCreateLease(path)
+	}
 	if wfs.lockClient != nil && flags&fuse.O_ANYWRITE != 0 && fileHandle.dlmLock == nil {
 		owner := fmt.Sprintf("mount-%d", wfs.signature)
 		fileHandle.dlmLock = wfs.lockClient.NewBlockingLongLivedLock(
