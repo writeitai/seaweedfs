@@ -726,7 +726,13 @@ func (wfs *WFS) maybeLoadNamespaceEntry(fullpath util.FullPath) (*filer_pb.Entry
 	if string(fullpath) == wfs.option.FilerMountRootPath {
 		return wfs.maybeLoadEntry(fullpath)
 	}
-	entry, version, status := wfs.lookupEntryFrom(fullpath, false)
+	return wfs.loadNamespaceEntry(fullpath, true)
+}
+
+// loadNamespaceEntry is maybeLoadNamespaceEntry, which waits for a
+// pending async flush of the entry only with drain.
+func (wfs *WFS) loadNamespaceEntry(fullpath util.FullPath, drain bool) (*filer_pb.Entry, entryVersion, fuse.Status) {
+	entry, version, status := wfs.lookupEntryFrom(fullpath, false, drain)
 	if status != fuse.OK {
 		return nil, entryVersion{}, status
 	}
@@ -746,7 +752,7 @@ const expiredDirRebuildCooldown = 30 * time.Second
 // It also returns the log position the entry reflects: the entry's stored
 // version, the lookup response's, or zero if unknown.
 func (wfs *WFS) lookupEntry(fullpath util.FullPath) (*filer.Entry, entryVersion, fuse.Status) {
-	return wfs.lookupEntryFrom(fullpath, true)
+	return wfs.lookupEntryFrom(fullpath, true, true)
 }
 
 // lookupEntryFrom is lookupEntry; withLocal tells whether an entry the
@@ -754,7 +760,11 @@ func (wfs *WFS) lookupEntry(fullpath util.FullPath) (*filer.Entry, entryVersion,
 // mount. Mountable: the namespace never takes it (see NamespaceEntry), and
 // an open handle answers only while it holds its own object, unflushed,
 // neither unlinked nor refused (localEntry).
-func (wfs *WFS) lookupEntryFrom(fullpath util.FullPath, withLocal bool) (*filer.Entry, entryVersion, fuse.Status) {
+//
+// drain tells whether it waits for a pending async flush of the entry
+// before trusting the filer; a caller holding the entry's handle lock must
+// not, as the flush needs that lock to finish.
+func (wfs *WFS) lookupEntryFrom(fullpath util.FullPath, withLocal, drain bool) (*filer.Entry, entryVersion, fuse.Status) {
 	dir, _ := fullpath.DirAndName()
 	dirPath := util.FullPath(dir)
 
@@ -766,7 +776,7 @@ func (wfs *WFS) lookupEntryFrom(fullpath util.FullPath, withLocal bool) (*filer.
 		// The rebuild lists the parent from the filer; let any pending async
 		// flush of the target entry land first so the rebuilt cache does not
 		// capture pre-flush metadata and bypass the wait below.
-		if inode, found := wfs.inodeToPath.GetInode(fullpath); found {
+		if inode, found := wfs.inodeToPath.GetInode(fullpath); found && drain {
 			wfs.waitForPendingAsyncFlush(inode)
 		}
 		if err := wfs.ensureDirectoryVisited(dirPath); err != nil {
@@ -811,7 +821,7 @@ func (wfs *WFS) lookupEntryFrom(fullpath util.FullPath, withLocal bool) (*filer.
 	// handle land: it would otherwise answer with pre-close metadata, a
 	// truncate's old size or a write's old chunks. The cache paths above are
 	// already consistent and must not pay this wait.
-	if inode, found := wfs.inodeToPath.GetInode(fullpath); found {
+	if inode, found := wfs.inodeToPath.GetInode(fullpath); found && drain {
 		wfs.waitForPendingAsyncFlush(inode)
 	}
 

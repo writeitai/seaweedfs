@@ -165,6 +165,15 @@ func (wfs *WFS) waitForPendingAsyncFlush(inode uint64) {
 	}
 }
 
+// asyncFlushPending reports whether an async flush of inode is pending
+// (Mountable: see Link).
+func (wfs *WFS) asyncFlushPending(inode uint64) bool {
+	wfs.pendingAsyncFlushMu.Lock()
+	defer wfs.pendingAsyncFlushMu.Unlock()
+	_, found := wfs.pendingAsyncFlush[inode]
+	return found
+}
+
 func (wfs *WFS) GetHandle(handleId FileHandleId) *FileHandle {
 	return wfs.fhMap.GetFileHandle(handleId)
 }

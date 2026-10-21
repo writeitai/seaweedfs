@@ -652,3 +652,155 @@ func TestPeriodicFirstFlushEndsThePendingCreate(t *testing.T) {
 		t.Fatalf("brought back: %v", filer.created)
 	}
 }
+
+// A dirty open standalone file whose path another file took, a hard link
+// of some group with the same legacy stored inode: Link refuses it, and the
+// flush of the open file refuses to write over the newcomer.
+func TestLinkRefusesAReplacedSource(t *testing.T) {
+	wfs, _ := newCreateTestWFS(t)
+	store := newRecordFiler()
+	startFakeFiler(t, wfs, store)
+	_, source := linkTestSource(t, wfs, "first.txt", 500)
+	mine := &filer_pb.Entry{Name: "first.txt", Content: []byte("hello world!"), Attributes: &filer_pb.FuseAttributes{FileMode: 0o644, FileSize: 12, Inode: 500, Crtime: 1, Mtime: 1, Uid: 99, Gid: 100}}
+	fh, _ := wfs.fhMap.AcquireFileHandle(wfs, source, proto.Clone(mine).(*filer_pb.Entry), 10, 0)
+	fh.RememberPath("/first.txt")
+	fh.dirtyMetadata = true
+	theirs := proto.Clone(mine).(*filer_pb.Entry)
+	theirs.Content, theirs.HardLinkId, theirs.HardLinkCounter = []byte("their bytes!"), []byte("theirs"), 2
+	store.entries["/first.txt"] = proto.Clone(theirs).(*filer_pb.Entry)
+	if err := wfs.metaCache.InsertEntry(context.Background(), filer.FromPbEntry("/", theirs), 0); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	if st := wfs.Link(nil, &fuse.LinkIn{InHeader: fuse.InHeader{NodeId: 1}, Oldnodeid: source}, "second.txt", &fuse.EntryOut{}); st != fuse.ENOENT {
+		t.Fatalf("Link of the replaced source: %v", st)
+	}
+	if len(fh.GetEntry().GetEntry().HardLinkId) != 0 {
+		t.Fatal("the open file took the newcomer's group")
+	}
+	if st := wfs.Fsync(nil, &fuse.FsyncIn{InHeader: fuse.InHeader{NodeId: source}, Fh: uint64(fh.fh)}); st != fuse.Status(syscall.ESTALE) {
+		t.Fatalf("fsync of the replaced file: %v", st)
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if string(store.entries["/first.txt"].Content) != "their bytes!" {
+		t.Fatal("the newcomer was overwritten")
+	}
+}
+
+// With the writeback cache, an async flush that becomes pending while Link
+// takes the source's handle lock does not deadlock the two: Link lets the
+// lock go, drains it, and goes on.
+func TestLinkDoesNotDeadlockAnAsyncFlush(t *testing.T) {
+	wfs, _ := newCreateTestWFS(t)
+	filer := newRecordFiler()
+	startFakeFiler(t, wfs, filer)
+	wfs.option.WritebackCache = true
+	wfs.pendingAsyncFlush = map[uint64]chan struct{}{}
+	wfs.dirMtimeMap = map[uint64]time.Time{}
+	_, source := linkTestSource(t, wfs, "first.txt", 500)
+	filer.entries["/first.txt"] = &filer_pb.Entry{Name: "first.txt", Content: []byte("hello world!"), Attributes: &filer_pb.FuseAttributes{FileMode: 0o644, FileSize: 12, Inode: 500, Crtime: 1, Mtime: 1, Uid: 99, Gid: 100}}
+	fh, _ := wfs.fhMap.AcquireFileHandle(wfs, source, proto.Clone(filer.entries["/first.txt"]).(*filer_pb.Entry), 10, 0)
+	drain := func() {
+		done := make(chan struct{})
+		wfs.pendingAsyncFlushMu.Lock()
+		wfs.pendingAsyncFlush[source] = done
+		wfs.pendingAsyncFlushMu.Unlock()
+		go func() { // the drain's flush needs the handle lock
+			lock := wfs.fhLockTable.AcquireLock("drain", fh.fh, util.ExclusiveLock)
+			wfs.fhLockTable.ReleaseLock(fh.fh, lock)
+			wfs.pendingAsyncFlushMu.Lock()
+			delete(wfs.pendingAsyncFlush, source)
+			wfs.pendingAsyncFlushMu.Unlock()
+			close(done)
+		}()
+	}
+	var once sync.Once
+	beforeLinkReload = func() {
+		once.Do(func() {
+			drain()
+			wfs.inodeToPath.InvalidateChildrenCache("/") // the cache gone: the reload asks the filer
+		})
+	}
+	defer func() { beforeLinkReload = nil }()
+	linked := make(chan fuse.Status, 1)
+	go func() {
+		linked <- wfs.Link(nil, &fuse.LinkIn{InHeader: fuse.InHeader{NodeId: 1}, Oldnodeid: source}, "second.txt", &fuse.EntryOut{})
+	}()
+	select {
+	case st := <-linked:
+		if st != fuse.OK {
+			t.Fatalf("Link: %v", st)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Link and the async flush deadlocked")
+	}
+}
+
+// groupListFiler lists two names of one hard-link group.
+type groupListFiler struct {
+	filer_pb.UnimplementedSeaweedFilerServer
+}
+
+func groupEntries() []*filer_pb.Entry {
+	var es []*filer_pb.Entry
+	for _, name := range []string{"a", "b"} {
+		es = append(es, &filer_pb.Entry{Name: name, HardLinkId: []byte("group"), HardLinkCounter: 2,
+			Attributes: &filer_pb.FuseAttributes{FileMode: 0o644, Inode: 500, Crtime: 1, Mtime: 1}})
+	}
+	return es
+}
+
+func (groupListFiler) ListEntries(r *filer_pb.ListEntriesRequest, stream grpc.ServerStreamingServer[filer_pb.ListEntriesResponse]) error {
+	for _, e := range groupEntries() {
+		if e.Name < r.StartFromFileName || e.Name == r.StartFromFileName && !r.InclusiveStartFrom {
+			continue
+		}
+		if err := stream.Send(&filer_pb.ListEntriesResponse{Entry: e}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Two names of one hard-link group nothing looked up yet, listed plainly a
+// page each, cached and read-through: one fileid, the one their lookups
+// bind, in either order.
+func TestGroupNamesListAsOneAcrossPages(t *testing.T) {
+	for _, direct := range []bool{false, true} {
+		for _, order := range [][]string{{"a", "b"}, {"b", "a"}} {
+			dir := util.FullPath("/d")
+			wfs := newPagingWFS(t, dir, nil, 0)
+			startFakeFiler(t, wfs, groupListFiler{})
+			if direct {
+				wfs.inodeToPath.MarkDirectoryReadThrough(dir, time.Now())
+			} else {
+				for _, e := range groupEntries() {
+					if err := wfs.metaCache.InsertEntry(context.Background(), filer.FromPbEntry(string(dir), e), 0); err != nil {
+						t.Fatalf("insert: %v", err)
+					}
+				}
+			}
+			dirInode, _ := wfs.inodeToPath.GetInode(dir)
+			listed := map[string]uint64{}
+			after := ""
+			for range 2 {
+				taken := 0
+				if _, st := wfs.ReadDirectoryAfter(dirInode, after, false, func(string) bool { return taken < 1 }, func(e *ListedEntry) bool {
+					taken++
+					listed[e.Name], after = e.Inode, e.Name
+					return true
+				}); st != fuse.OK {
+					t.Fatalf("list: %v", st)
+				}
+			}
+			if listed["a"] != listed["b"] {
+				t.Fatalf("direct %v: the group listed as %v", direct, listed)
+			}
+			for _, name := range order {
+				if got := wfs.inodeToPath.LookupLinked(dir.Child(name), 1, 0, "group", 500, true); got != listed[name] {
+					t.Fatalf("direct %v, order %v: %s bound %d, listed %d", direct, order, name, got, listed[name])
+				}
+			}
+		}
+	}
+}

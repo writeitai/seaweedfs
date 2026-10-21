@@ -70,6 +70,11 @@ func (wfs *WFS) Link(cancel <-chan struct{}, in *fuse.LinkIn, name string, out *
 	if status != fuse.OK {
 		return status
 	}
+	// Each load of the source is checked against the inode: another object
+	// at its path is not the file being linked (Mountable).
+	if !wfs.inodeToPath.HoldsEntry(sourceInode, oldEntry) {
+		return fuse.ENOENT
+	}
 
 	// hardlink is not allowed in WORM mode
 	if wormEnforced, _ := wfs.wormEnforcedForEntry(oldEntryPath, oldEntry); wormEnforced {
@@ -102,6 +107,9 @@ func (wfs *WFS) Link(cancel <-chan struct{}, in *fuse.LinkIn, name string, out *
 		if freshStatus != fuse.OK {
 			return freshStatus
 		}
+		if !wfs.inodeToPath.HoldsEntry(sourceInode, fresh) {
+			return fuse.ENOENT
+		}
 		oldEntry = fresh
 	}
 
@@ -109,14 +117,35 @@ func (wfs *WFS) Link(cancel <-chan struct{}, in *fuse.LinkIn, name string, out *
 	// is in flight with the entry from before the promotion, nor starts
 	// until the handle has the promoted one. The source is loaded again
 	// under it, any flush that came first included.
+	//
+	// A pending async flush of the handle is drained first: it needs the
+	// lock to finish, so it is not waited for under it. One that became
+	// pending meanwhile has the lock let go and the drain done again.
 	sourceFh, sourceFhFound := wfs.fhMap.FindFileHandle(sourceInode)
 	if sourceFhFound {
-		fhActiveLock := wfs.fhLockTable.AcquireLock("Link", sourceFh.fh, util.ExclusiveLock)
+		var fhActiveLock *util.ActiveLock
+		for attempt := 0; ; attempt++ {
+			wfs.waitForPendingAsyncFlush(sourceInode)
+			fhActiveLock = wfs.fhLockTable.AcquireLock("Link", sourceFh.fh, util.ExclusiveLock)
+			if !wfs.asyncFlushPending(sourceInode) {
+				break
+			}
+			wfs.fhLockTable.ReleaseLock(sourceFh.fh, fhActiveLock)
+			if attempt == 2 {
+				return fuse.Status(syscall.EAGAIN)
+			}
+		}
 		defer wfs.fhLockTable.ReleaseLock(sourceFh.fh, fhActiveLock)
-		// The namespace's entry: the local stand-in would take the handle
-		// lock held here.
-		if oldEntry, _, status = wfs.maybeLoadNamespaceEntry(oldEntryPath); status != fuse.OK {
+		if beforeLinkReload != nil {
+			beforeLinkReload()
+		}
+		// The namespace's entry, without waiting for a flush: the local
+		// stand-in and a drain would both need the handle lock held here.
+		if oldEntry, _, status = wfs.loadNamespaceEntry(oldEntryPath, false); status != fuse.OK {
 			return status
+		}
+		if !wfs.inodeToPath.HoldsEntry(sourceInode, oldEntry) {
+			return fuse.ENOENT
 		}
 	}
 
@@ -340,3 +369,7 @@ func (wfs *WFS) settleLinkRollback(ctx context.Context, fh *FileHandle, dir stri
 		})
 	}
 }
+
+// beforeLinkReload, when set (by tests), runs in Link once it holds the
+// source handle's lock, before it loads the source again.
+var beforeLinkReload func()
