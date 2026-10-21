@@ -39,11 +39,13 @@ func (wfs *WFS) processAsyncFlushItem(item *asyncFlushItem) {
 	defer func() {
 		// Remove from fhMap first (so AcquireFileHandle creates a fresh handle).
 		wfs.fhMap.RemoveFileHandle(item.fh.fh, item.fh.inode)
-		// Then signal completion (unblocks waitForPendingAsyncFlush).
-		close(item.done)
+		// Then signal completion (unblocks waitForPendingAsyncFlush), the
+		// entry gone first, so no one who saw the signal still finds the
+		// flush pending (Mountable: see Link).
 		wfs.pendingAsyncFlushMu.Lock()
 		delete(wfs.pendingAsyncFlush, item.fh.inode)
 		wfs.pendingAsyncFlushMu.Unlock()
+		close(item.done)
 	}()
 	wfs.completeAsyncFlush(item.fh)
 }

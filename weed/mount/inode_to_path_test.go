@@ -1,7 +1,6 @@
 package mount
 
 import (
-	"os"
 	"slices"
 	"testing"
 	"time"
@@ -443,60 +442,5 @@ func TestBindingsMoveWatchesOn(t *testing.T) {
 	m.MovePath("/q", "/p")
 	if m.Unwatch("/p", inode, generation, true) || !m.Bound("/p", inode) {
 		t.Fatal("a slow miss undid a Rename's binding")
-	}
-}
-
-// A first plain listing of objects that share a stored inode but differ
-// in type or hard-link group gives each its own fileid, the same in a
-// later listing, and the lookups that bind them keep them: a hard link
-// included, before or after the others are looked up.
-func TestFirstListingTellsObjectsApart(t *testing.T) {
-	m := NewInodeToPath(util.FullPath("/"), 0)
-	list := func() (uint64, uint64, uint64) {
-		return m.InodeForListing("/f", 1, 0, "", 500),
-			m.InodeForListing("/s", 1, os.ModeSymlink, "", 500),
-			m.InodeForListing("/l", 1, 0, "group", 500)
-	}
-	f, s, l := list()
-	if f == s || f == l || s == l {
-		t.Fatalf("fileids %d %d %d", f, s, l)
-	}
-	if f2, s2, l2 := list(); f2 != f || s2 != s || l2 != l {
-		t.Fatalf("the second listing gave %d %d %d, the first %d %d %d", f2, s2, l2, f, s, l)
-	}
-	if got := m.LookupLinked("/l", 1, 0, "group", 500, true); got != l {
-		t.Fatalf("the lookup of the link gave %d, the listing %d", got, l)
-	}
-	if got := m.LookupLinked("/s", 1, os.ModeSymlink, "", 500, true); got != s {
-		t.Fatalf("the lookup of the symlink gave %d, the listing %d", got, s)
-	}
-	if f2, s2, l2 := list(); f2 != f || s2 != s || l2 != l {
-		t.Fatalf("after the lookups the listing gave %d %d %d, first %d %d %d", f2, s2, l2, f, s, l)
-	}
-	// Another link of the bound group is listed as the group.
-	if got := m.InodeForListing("/l2", 1, 0, "group", 500); got != l {
-		t.Fatalf("another link of the group listed as %d, the group is %d", got, l)
-	}
-}
-
-// Unreferenced names of one hard-link group are listed under one fileid,
-// the one their lookups then bind; a file whose stored inode another file
-// already holds in the table is listed past it, as its lookup probes.
-func TestListingAgreesWithLookups(t *testing.T) {
-	m := NewInodeToPath(util.FullPath("/"), 0)
-	l1, l2 := m.InodeForListing("/l1", 1, 0, "group", 500), m.InodeForListing("/l2", 1, 0, "group", 500)
-	if l1 != l2 {
-		t.Fatalf("one group listed as %d and %d", l1, l2)
-	}
-	if a, b := m.LookupLinked("/l1", 1, 0, "group", 500, true), m.LookupLinked("/l2", 1, 0, "group", 500, true); a != l1 || b != l1 {
-		t.Fatalf("lookups bound %d and %d, the listing gave %d", a, b, l1)
-	}
-	taken := m.LookupLinked("/a", 1, 0, "", 700, true)
-	listed := m.InodeForListing("/b", 1, 0, "", 700)
-	if listed == taken {
-		t.Fatalf("/b listed on /a's inode %d", taken)
-	}
-	if got := m.LookupLinked("/b", 1, 0, "", 700, true); got != listed {
-		t.Fatalf("/b's lookup bound %d, the listing gave %d", got, listed)
 	}
 }

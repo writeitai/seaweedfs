@@ -119,20 +119,30 @@ func (wfs *WFS) Link(cancel <-chan struct{}, in *fuse.LinkIn, name string, out *
 	// under it, any flush that came first included.
 	//
 	// A pending async flush of the handle is drained first: it needs the
-	// lock to finish, so it is not waited for under it. One that became
-	// pending meanwhile has the lock let go and the drain done again.
+	// lock to finish, so it is not waited for under it. A create still
+	// waiting for its flush is flushed first, which takes the lock too:
+	// the filer has no entry to promote until then. Either one found
+	// pending under the lock has it let go and is done again.
 	sourceFh, sourceFhFound := wfs.fhMap.FindFileHandle(sourceInode)
 	if sourceFhFound {
 		var fhActiveLock *util.ActiveLock
 		for attempt := 0; ; attempt++ {
 			wfs.waitForPendingAsyncFlush(sourceInode)
 			fhActiveLock = wfs.fhLockTable.AcquireLock("Link", sourceFh.fh, util.ExclusiveLock)
-			if !wfs.asyncFlushPending(sourceInode) {
+			pendingCreate := sourceFh.pendingCreate
+			if !pendingCreate && !wfs.asyncFlushPending(sourceInode) {
 				break
 			}
 			wfs.fhLockTable.ReleaseLock(sourceFh.fh, fhActiveLock)
 			if attempt == 2 {
 				return fuse.Status(syscall.EAGAIN)
+			}
+			if pendingCreate {
+				if code := wfs.doFlush(context.Background(), sourceFh, in.Uid, in.Gid, false); code == fuse.Status(syscall.ESTALE) {
+					return fuse.ENOENT // the path no longer leads to the source
+				} else if code != fuse.OK {
+					return code
+				}
 			}
 		}
 		defer wfs.fhLockTable.ReleaseLock(sourceFh.fh, fhActiveLock)
@@ -206,8 +216,10 @@ func (wfs *WFS) Link(cancel <-chan struct{}, in *fuse.LinkIn, name string, out *
 
 	ctx := context.Background()
 	updateResp, err := wfs.streamUpdateEntry(ctx, updateOldEntryRequest)
+	var promoted *filer_pb.Entry // the source as the filer acknowledged it
 	if err == nil {
 		linked = true
+		promoted = wfs.updateAck(updateOldEntryRequest.Entry, updateResp)
 		updateEvent := updateResp.GetMetadataEvent()
 		if updateEvent == nil {
 			updateEvent = metadataUpdateEvent(oldParentPath, updateOldEntryRequest.Entry)
@@ -259,30 +271,22 @@ func (wfs *WFS) Link(cancel <-chan struct{}, in *fuse.LinkIn, name string, out *
 	}
 
 	wfs.inodeToPath.AddPath(sourceInode, newEntryPath)
-	// The source's open handle, and its base, which a flush takes the group
-	// from, hold the source as promoted: its group, counter and times, as
-	// the filer acknowledged them (Mountable).
+	// The source's open handle holds the source as promoted: its group,
+	// counter and times, as the filer acknowledged them, and the whole
+	// acknowledged entry as its base, which a flush expects at the filer
+	// and takes the group from (Mountable).
 	if sourceFhFound {
-		acked := updateOldEntryRequest.Entry
-		if stored := updateResp.GetMetadataEvent().GetEventNotification().GetNewEntry(); stored != nil {
-			acked = stored
-		}
-		promote := func(e *filer_pb.Entry) {
+		sourceFh.UpdateEntry(func(e *filer_pb.Entry) {
 			if e == nil {
 				return
 			}
-			e.HardLinkId, e.HardLinkCounter = acked.HardLinkId, acked.HardLinkCounter
-			if e.Attributes != nil && acked.Attributes != nil {
-				e.Attributes.Mtime, e.Attributes.MtimeNs = acked.Attributes.Mtime, acked.Attributes.MtimeNs
-				e.Attributes.Ctime, e.Attributes.CtimeNs = acked.Attributes.Ctime, acked.Attributes.CtimeNs
+			e.HardLinkId, e.HardLinkCounter = promoted.HardLinkId, promoted.HardLinkCounter
+			if e.Attributes != nil && promoted.Attributes != nil {
+				e.Attributes.Mtime, e.Attributes.MtimeNs = promoted.Attributes.Mtime, promoted.Attributes.MtimeNs
+				e.Attributes.Ctime, e.Attributes.CtimeNs = promoted.Attributes.Ctime, promoted.Attributes.CtimeNs
 			}
-		}
-		sourceFh.UpdateEntry(promote)
-		if base := sourceFh.baseEntry.Load(); base != nil {
-			base = proto.Clone(base).(*filer_pb.Entry)
-			promote(base)
-			sourceFh.setAuthoritativeBase(base)
-		}
+		})
+		sourceFh.setAuthoritativeBase(promoted)
 	}
 
 	// Propagate the new HardLinkCounter to sibling cache entries and
@@ -350,8 +354,9 @@ func (wfs *WFS) syncHardLinkSiblings(inode uint64, authoritativeEntry *filer_pb.
 // back update left it, before the conversion ends: the cache takes the
 // acknowledgement, and the source's open handle, which Link holds locked,
 // holds the source standalone again if it took the promoted entry
-// meanwhile (from the subscription), so neither a lookup nor a flush
-// takes it for a hard link (Mountable).
+// meanwhile (from the subscription), and the acknowledged entry as its
+// base, so neither a lookup nor a flush takes it for a hard link
+// (Mountable).
 func (wfs *WFS) settleLinkRollback(ctx context.Context, fh *FileHandle, dir string, entry *filer_pb.Entry, resp *filer_pb.UpdateEntryResponse, group []byte) {
 	event := resp.GetMetadataEvent()
 	if event == nil {
@@ -367,7 +372,21 @@ func (wfs *WFS) settleLinkRollback(ctx context.Context, fh *FileHandle, dir stri
 				open.HardLinkId, open.HardLinkCounter = entry.HardLinkId, entry.HardLinkCounter
 			}
 		})
+		fh.setAuthoritativeBase(wfs.updateAck(entry, resp))
 	}
+}
+
+// updateAck is the entry the filer acknowledged for an update of sent,
+// which has the filer's uid and gid: the stored entry its event carries,
+// else sent, as a handle holds it (Mountable).
+func (wfs *WFS) updateAck(sent *filer_pb.Entry, resp *filer_pb.UpdateEntryResponse) *filer_pb.Entry {
+	acked := proto.Clone(sent).(*filer_pb.Entry)
+	if stored := resp.GetMetadataEvent().GetEventNotification().GetNewEntry(); stored != nil {
+		acked = proto.Clone(stored).(*filer_pb.Entry)
+		filer_pb.AfterEntryDeserialization(acked.GetChunks())
+	}
+	wfs.mapPbIdFromFilerToLocal(acked)
+	return acked
 }
 
 // beforeLinkReload, when set (by tests), runs in Link once it holds the
