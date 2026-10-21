@@ -569,3 +569,27 @@ func TestRecoveryPromotesPastAPrimaryDetachedMeanwhile(t *testing.T) {
 		t.Fatalf("recovery answered %s, %v", p, st)
 	}
 }
+
+// A name of a hard-link group whose entry turns into a symlink of the same
+// stored inode and group, another name still bound: a lookup gives the
+// symlink an inode of its own, never the group's, and both stat.
+func TestGroupNameChangedTypeGetsItsOwnInode(t *testing.T) {
+	wfs, filer, group := linkedWFS(t)
+	symlink := linkEntry("one", 4242, "link", "")
+	symlink.Attributes.FileMode, symlink.Attributes.SymlinkTarget = uint32(os.ModeSymlink|0o777), "t"
+	filer.set("/d/one", symlink)
+	dirInode, _ := wfs.inodeToPath.GetInode("/d")
+	var out fuse.EntryOut
+	if st := wfs.Lookup(nil, &fuse.InHeader{NodeId: dirInode}, "one", &out); st != fuse.OK {
+		t.Fatalf("lookup: %v", st)
+	}
+	if out.NodeId == group {
+		t.Fatalf("the symlink joined the group's inode %d", group)
+	}
+	for _, inode := range []uint64{out.NodeId, group} {
+		var attr fuse.AttrOut
+		if st := wfs.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{NodeId: inode}}, &attr); st != fuse.OK {
+			t.Fatalf("GetAttr %d: %v", inode, st)
+		}
+	}
+}

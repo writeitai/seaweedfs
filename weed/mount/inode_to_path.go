@@ -263,7 +263,7 @@ func (i *InodeToPath) LookupLinked(path util.FullPath, unixTime int64, kind os.F
 		}
 		joined := false
 		if isHardlink && possibleInode != 0 {
-			inode, joined = i.linkGroupLocked(possibleInode, linkID)
+			inode, joined = i.linkGroupLocked(possibleInode, kind, linkID)
 		}
 		if !joined {
 			for _, found := i.inode2path[inode]; found; inode++ {
@@ -336,24 +336,12 @@ func (i *InodeToPath) IncrementNlookup(inode uint64) bool {
 // InodeForListing returns the inode number a readdir should report for path
 // without entering it in the table. Nothing is reserved, so the collision probe
 // Lookup does is skipped: the worst case is a repeated st_ino in one listing.
-//
-// Mountable (writeitai/seaweedfs, branch mountable): the path's inode only
-// if it holds the listed object by the identity rule (Holds), or a bound
-// hard link's group; otherwise the stored inode. Two objects that share a
-// stored inode and are not looked up can show one d_ino in a plain
-// listing: after D43 only legacy objects can share one, and handles,
-// plus listings and stat keep the whole identity rule. See deviation 4 of
-// macos-mount in writeitai/mountable#11.
-func (i *InodeToPath) InodeForListing(path util.FullPath, unixTime int64, kind os.FileMode, linkID string, possibleInode uint64) uint64 {
+func (i *InodeToPath) InodeForListing(path util.FullPath, unixTime int64, possibleInode uint64) uint64 {
 	i.RLock()
-	defer i.RUnlock()
-	if inode, found := i.path2inode[path]; found && !i.replacedLocked(inode, kind, linkID, possibleInode) {
+	inode, found := i.path2inode[path]
+	i.RUnlock()
+	if found {
 		return inode
-	}
-	if linkID != "" && possibleInode != 0 {
-		if inode, joined := i.linkGroupLocked(possibleInode, linkID); joined {
-			return inode
-		}
 	}
 	if possibleInode != 0 {
 		return possibleInode
@@ -851,13 +839,13 @@ func (i *InodeToPath) Unwatch(path util.FullPath, inode, generation uint64, deta
 // identity joins only when it is the only one), and that still has a path.
 // joined is false when there is none, and the link takes an inode of its
 // own: a link that cannot tell its group apart joins nothing.
-func (i *InodeToPath) linkGroupLocked(persisted uint64, linkID string) (inode uint64, joined bool) {
+func (i *InodeToPath) linkGroupLocked(persisted uint64, kind os.FileMode, linkID string) (inode uint64, joined bool) {
 	var candidates []uint64
-	if ie, ok := i.inode2path[persisted]; ok && i.persistedLocked(persisted) == persisted && ie.path != "" {
+	if ie, ok := i.inode2path[persisted]; ok && i.persistedLocked(persisted) == persisted && ie.path != "" && i.kindLocked(persisted) == kind {
 		candidates = append(candidates, persisted)
 	}
 	for _, c := range i.probed[persisted] {
-		if ie, ok := i.inode2path[c]; ok && ie.path != "" {
+		if ie, ok := i.inode2path[c]; ok && ie.path != "" && i.kindLocked(c) == kind {
 			candidates = append(candidates, c)
 		}
 	}

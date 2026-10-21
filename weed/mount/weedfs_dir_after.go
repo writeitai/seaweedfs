@@ -157,7 +157,15 @@ func (wfs *WFS) listEntryAfter(dirPath util.FullPath, entry *filer.Entry, plus b
 	}
 	listed := &ListedEntry{Name: name, StoredInode: entry.Inode}
 	if !plus {
-		listed.Inode = wfs.inodeToPath.InodeForListing(childPath, entry.Crtime.Unix(), EntryKind(entry.IsDirectory(), entry.Mode), string(entry.HardLinkId), entry.Inode)
+		// The stored inode, never a number of this mount's table, which a
+		// lookup may have probed past another object's: names of one hard
+		// link share it, and objects created since D43 differ in it
+		// (Mountable: see deviation 4 of macos-mount in
+		// writeitai/mountable#11).
+		listed.Inode = entry.Inode
+		if listed.Inode == 0 {
+			listed.Inode = childPath.AsInode(entry.Crtime.Unix())
+		}
 		return add(listed)
 	}
 	// The reference is taken now and given back if add refuses the entry,

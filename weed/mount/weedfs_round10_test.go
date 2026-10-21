@@ -628,6 +628,59 @@ func TestReplacedGroupNameIsToldApart(t *testing.T) {
 	}
 }
 
+// A regular file and a symlink stored as 500, both looked up, so the
+// symlink is probed to 501, and a file stored as 501 never looked up,
+// listed plainly a page at a time, cached and read-through: each listing
+// number is the stored inode, so the symlink and that file differ.
+func TestPlainListingReportsStoredInodes(t *testing.T) {
+	for _, direct := range []bool{false, true} {
+		dir := util.FullPath("/d")
+		wfs := newPagingWFS(t, dir, nil, 0)
+		store := &swapListFiler{entries: map[string]*filer_pb.Entry{
+			"f": {Name: "f", Attributes: &filer_pb.FuseAttributes{FileMode: 0o644, Inode: 500, Crtime: 1, Mtime: 1}},
+			"s": {Name: "s", Attributes: &filer_pb.FuseAttributes{FileMode: uint32(os.ModeSymlink | 0o777), Inode: 500, Crtime: 1, Mtime: 1, SymlinkTarget: "t"}},
+			"g": {Name: "g", Attributes: &filer_pb.FuseAttributes{FileMode: 0o644, Inode: 501, Crtime: 1, Mtime: 1}},
+		}}
+		startFakeFiler(t, wfs, store)
+		if direct {
+			wfs.inodeToPath.MarkDirectoryReadThrough(dir, time.Now())
+		} else {
+			for _, e := range store.entries {
+				if err := wfs.metaCache.InsertEntry(context.Background(), filer.FromPbEntry(string(dir), e), 0); err != nil {
+					t.Fatalf("insert: %v", err)
+				}
+			}
+		}
+		dirInode, _ := wfs.inodeToPath.GetInode(dir)
+		looked := map[string]uint64{}
+		for _, name := range []string{"f", "s"} {
+			var out fuse.EntryOut
+			if st := wfs.Lookup(nil, &fuse.InHeader{NodeId: dirInode}, name, &out); st != fuse.OK {
+				t.Fatalf("direct %v: lookup %s: %v", direct, name, st)
+			}
+			looked[name] = out.NodeId
+		}
+		if looked["s"] != 501 {
+			t.Fatalf("direct %v: the symlink was bound to %d, not probed to 501", direct, looked["s"])
+		}
+		listed := map[string]uint64{}
+		after := ""
+		for range 3 {
+			taken := 0
+			if _, st := wfs.ReadDirectoryAfter(dirInode, after, false, func(string) bool { return taken < 1 }, func(e *ListedEntry) bool {
+				taken++
+				listed[e.Name], after = e.Inode, e.Name
+				return true
+			}); st != fuse.OK {
+				t.Fatalf("direct %v: list %v", direct, st)
+			}
+		}
+		if listed["f"] != 500 || listed["s"] != 500 || listed["g"] != 501 {
+			t.Fatalf("direct %v: listed %v", direct, listed)
+		}
+	}
+}
+
 // swapListFiler lists and looks up its entries by name, which a test may
 // replace.
 type swapListFiler struct {
@@ -759,6 +812,32 @@ func TestLinkOfADeferredCreate(t *testing.T) {
 		t.Fatalf("fsync of the deleted file: %v", st)
 	}
 	if len(filer.created) != 2 || filer.created[0] != "/d/new" || filer.created[1] != "/d/alias" {
+		t.Fatalf("created %v", filer.created)
+	}
+}
+
+// A create still waiting for its flush, in a cached directory, marked
+// unlinked by an Unlink that has not removed it from the cache yet, then
+// linked: ENOENT at once, the file never written.
+func TestLinkOfAnUnlinkedDeferredCreate(t *testing.T) {
+	wfs, _, _ := linkedWFS(t)
+	filer := newRecordFiler()
+	filer.entries["/d"] = &filer_pb.Entry{Name: "d", IsDirectory: true, Attributes: &filer_pb.FuseAttributes{FileMode: uint32(os.ModeDir | 0o755)}}
+	startFakeFiler(t, wfs, filer)
+	wfs.inodeToPath.MarkChildrenCached("/d")
+	dirInode, _ := wfs.inodeToPath.GetInode("/d")
+	var out fuse.CreateOut
+	if st := wfs.Create(nil, &fuse.CreateIn{InHeader: fuse.InHeader{NodeId: dirInode}, Mode: 0o644}, "new", &out); st != fuse.OK {
+		t.Fatalf("create: %v", st)
+	}
+	fh := wfs.GetHandle(FileHandleId(out.Fh))
+	lock := wfs.fhLockTable.AcquireLock("test", fh.fh, util.ExclusiveLock)
+	fh.isDeleted = true
+	wfs.fhLockTable.ReleaseLock(fh.fh, lock)
+	if st := wfs.Link(nil, &fuse.LinkIn{InHeader: fuse.InHeader{NodeId: dirInode}, Oldnodeid: out.NodeId}, "alias", &fuse.EntryOut{}); st != fuse.ENOENT {
+		t.Fatalf("link: %v", st)
+	}
+	if len(filer.created) != 0 {
 		t.Fatalf("created %v", filer.created)
 	}
 }

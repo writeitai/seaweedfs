@@ -129,6 +129,11 @@ func (wfs *WFS) Link(cancel <-chan struct{}, in *fuse.LinkIn, name string, out *
 		for attempt := 0; ; attempt++ {
 			wfs.waitForPendingAsyncFlush(sourceInode)
 			fhActiveLock = wfs.fhLockTable.AcquireLock("Link", sourceFh.fh, util.ExclusiveLock)
+			if sourceFh.isDeleted {
+				// Unlinked, its create perhaps never sent: nothing to link.
+				wfs.fhLockTable.ReleaseLock(sourceFh.fh, fhActiveLock)
+				return fuse.ENOENT
+			}
 			pendingCreate := sourceFh.pendingCreate
 			if !pendingCreate && !wfs.asyncFlushPending(sourceInode) {
 				break

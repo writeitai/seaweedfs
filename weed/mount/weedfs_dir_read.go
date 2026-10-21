@@ -229,7 +229,7 @@ func (wfs *WFS) doReadDirectory(input *fuse.ReadIn, out DirEntrySink, isPlusMode
 		if takesLookupRef {
 			inode = wfs.inodeToPath.LookupLinked(childPath, entry.Crtime.Unix(), EntryKind(entry.IsDirectory(), entry.Mode), string(entry.HardLinkId), entry.Inode, false)
 		} else {
-			inode = wfs.inodeToPath.InodeForListing(childPath, entry.Crtime.Unix(), EntryKind(entry.IsDirectory(), entry.Mode), string(entry.HardLinkId), entry.Inode)
+			inode = wfs.inodeToPath.InodeForListing(childPath, entry.Crtime.Unix(), entry.Inode)
 		}
 		dirEntry.Ino = inode
 
