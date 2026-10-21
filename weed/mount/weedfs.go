@@ -212,12 +212,6 @@ type WFS struct {
 	pendingAsyncFlushMu sync.Mutex
 	pendingAsyncFlush   map[uint64]chan struct{}
 
-	// createLeases holds, by path, the distributed lock lease of a Create
-	// in flight here until it gives the lease to its handle or lets it go
-	// (Mountable: see holdCreateLease).
-	createLeasesMu sync.Mutex
-	createLeases   map[util.FullPath]chan struct{}
-
 	// streamMutate is the multiplexed streaming gRPC connection for all filer
 	// mutations (create, update, delete, rename). All mutations go through one
 	// ordered stream to prevent cross-operation reordering.

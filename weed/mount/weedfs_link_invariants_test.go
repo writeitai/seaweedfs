@@ -92,6 +92,39 @@ func TestLinkDestinationCreatedFirst(t *testing.T) {
 	}
 }
 
+// A Link that loses its alias create to an existing name, and whose
+// rollback then fails, the source changed elsewhere meanwhile: EEXIST, and
+// the destination directory's cache no longer hides the name.
+func TestLinkDestinationCreatedFirstRollbackFails(t *testing.T) {
+	f := newStoreFiler()
+	wfs := newLinkTestWFS(t, f)
+	f.put(plainEntry("a", 8001, "source"))
+	f.put(plainEntry("b", 9000, "theirs"))
+	src := seen(t, wfs, f, "a")
+	wfs.inodeToPath.MarkChildrenCached("/") // without b
+	updates := 0
+	f.beforeUpdate = func(r *filer_pb.UpdateEntryRequest) {
+		if r.Entry.Name != "a" {
+			return
+		}
+		if updates++; updates == 2 { // the rollback: the source changes first
+			e := plainEntry("a", 8001, "changed")
+			e.HardLinkId, e.HardLinkCounter = r.Entry.HardLinkId, 2
+			f.put(e)
+		}
+	}
+	if st := tryLink(wfs, src, "b"); st != fuse.Status(syscall.EEXIST) {
+		t.Fatalf("Link: %v", st)
+	}
+	if updates != 2 {
+		t.Fatalf("%d updates of the source", updates)
+	}
+	var found fuse.EntryOut
+	if st := wfs.Lookup(nil, &fuse.InHeader{NodeId: 1}, "b", &found); st != fuse.OK {
+		t.Fatalf("lookup of the name the link lost to: %v", st)
+	}
+}
+
 // The cache's entry for the source behind the filer's (another mount made
 // it a hard link): Link locks the group the filer has, reads the source
 // again under it, and links.
@@ -591,9 +624,8 @@ func TestDelayedCreateKeepsNewerHandleState(t *testing.T) {
 }
 
 // A write open of the new file, registered while the eager create's reply
-// is on its way: it waits for the create to give its handle, which it
-// shares, the path's lease, never for the lease itself, which that handle
-// keeps until both close. Then the lease is let go.
+// is on its way: the open and the create share one handle and take one
+// lease between them, which goes once both close.
 func TestDelayedCreateWithAWriteOpen(t *testing.T) {
 	f := newStoreFiler()
 	wfs := newLinkTestWFS(t, f)
@@ -641,6 +673,12 @@ func TestDelayedCreateWithAWriteOpen(t *testing.T) {
 	if openOut.Fh != out.Fh {
 		t.Fatalf("the open has handle %d, the create %d", openOut.Fh, out.Fh)
 	}
+	f.mu.Lock()
+	taken := slices.Clone(f.locked)
+	f.mu.Unlock()
+	if !slices.Equal(taken, []string{"/new"}) {
+		t.Fatalf("leases taken: %v", taken)
+	}
 	for range 2 {
 		wfs.Release(nil, &fuse.ReleaseIn{InHeader: fuse.InHeader{NodeId: out.NodeId}, Fh: out.Fh})
 	}
@@ -648,6 +686,63 @@ func TestDelayedCreateWithAWriteOpen(t *testing.T) {
 	defer f.mu.Unlock()
 	if _, held := f.locks["/new"]; held {
 		t.Fatal("the lease outlived both closes")
+	}
+}
+
+// A delayed eager Create of a file another mount deletes, its deletion
+// applied here before the reply, nothing here having looked it up: the
+// create succeeds as if the file were created and then unlinked, open. The
+// name is not bound, the handle is marked deleted, and what it writes does
+// not bring the file back.
+func TestDelayedCreateOfAFileDeletedElsewhere(t *testing.T) {
+	f := newStoreFiler()
+	wfs := newLinkTestWFS(t, f)
+	wfs.option.EagerFilerCreate = true
+	wfs.inodeToPath.MarkChildrenCached("/") // deletions here are recorded
+	var once sync.Once
+	f.afterCreate = func(r *filer_pb.CreateEntryRequest) (*filer_pb.CreateEntryResponse, error) {
+		f.mu.Lock()
+		stored := f.find(util.FullPath(r.Directory).Child(r.Entry.Name))
+		resp := &filer_pb.CreateEntryResponse{MetadataEvent: f.event(r.Directory, stored), LogTsNs: f.logTsNs}
+		f.mu.Unlock()
+		if r.Entry.Name == "new" {
+			once.Do(func() {
+				f.mu.Lock()
+				delete(f.entries, "/new")
+				f.logTsNs++
+				deletion := &filer_pb.SubscribeMetadataResponse{Directory: "/", TsNs: f.logTsNs, EventNotification: &filer_pb.EventNotification{
+					OldEntry: &filer_pb.Entry{Name: "new"},
+				}}
+				f.mu.Unlock()
+				if err := wfs.metaCache.ApplyMetadataResponse(context.Background(), deletion, meta_cache.SubscriberMetadataResponseApplyOptions); err != nil {
+					t.Errorf("apply the deletion: %v", err)
+				}
+			})
+		}
+		return resp, nil
+	}
+	h := fuse.InHeader{NodeId: 1, Caller: fuse.Caller{Owner: fuse.Owner{Uid: 99, Gid: 100}}}
+	var out fuse.CreateOut
+	if st := wfs.Create(nil, &fuse.CreateIn{InHeader: h, Flags: syscall.O_WRONLY | syscall.O_CREAT, Mode: 0o644}, "new", &out); st != fuse.OK {
+		t.Fatalf("Create: %v", st)
+	}
+	if inode, found := wfs.inodeToPath.GetInode("/new"); found {
+		t.Fatalf("the deleted name is bound to %d", inode)
+	}
+	fh := wfs.GetHandle(FileHandleId(out.Fh))
+	if !fh.isDeleted {
+		t.Fatal("the handle is not marked deleted")
+	}
+	fh.dirtyMetadata = true
+	if st := wfs.Fsync(nil, &fuse.FsyncIn{InHeader: fuse.InHeader{NodeId: out.NodeId}, Fh: out.Fh}); st != fuse.OK {
+		t.Fatalf("fsync: %v", st)
+	}
+	if e := f.lookup("/new"); e != nil {
+		t.Fatal("the file is back")
+	}
+	var looked fuse.EntryOut
+	if st := wfs.Lookup(nil, &h, "new", &looked); st != fuse.ENOENT {
+		t.Fatalf("lookup of the deleted name: %v", st)
 	}
 }
 
@@ -796,6 +891,14 @@ func TestDelayedCreateOfAFileLinkedAndUnlinked(t *testing.T) {
 	}
 	if cached, _, _ := wfs.metaCache.FindEntry(context.Background(), "/new"); cached != nil {
 		t.Fatal("the cache has the unlinked name back")
+	}
+	// The write lease is on the name that is left.
+	f.mu.Lock()
+	_, onAlias := f.locks["/alias"]
+	_, onNew := f.locks["/new"]
+	f.mu.Unlock()
+	if !onAlias || onNew {
+		t.Fatalf("lease on /alias %v, on /new %v", onAlias, onNew)
 	}
 	fh := wfs.GetHandle(FileHandleId(out.Fh))
 	fh.dirtyMetadata = true

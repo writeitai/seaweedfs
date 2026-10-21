@@ -12,7 +12,6 @@ import (
 	"github.com/seaweedfs/go-fuse/v2/fuse"
 	"google.golang.org/protobuf/proto"
 
-	"github.com/seaweedfs/seaweedfs/weed/cluster"
 	"github.com/seaweedfs/seaweedfs/weed/cluster/lock_manager"
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
@@ -76,32 +75,19 @@ func (wfs *WFS) Create(cancel <-chan struct{}, in *fuse.CreateIn, name string, o
 		return code
 	}
 
-	// Acquire the DLM lock before the filer create: a lock failure after an
-	// eager create would return EAGAIN while the file stays persisted.
-	var dlmLock *cluster.LiveLock
-	endLease := func() {}
-	defer func() { endLease() }()
-	if wfs.lockClient != nil {
-		owner := fmt.Sprintf("mount-%d", wfs.signature)
-		dlmLock = wfs.lockClient.NewBlockingLongLivedLock(
-			string(entryFullPath), owner, lock_manager.LiveLockTTL,
-		)
-		if dlmLock == nil {
-			return fuse.Status(syscall.EAGAIN)
-		}
-		endLease = wfs.holdCreateLease(entryFullPath)
-	}
+	// The write lease is taken once the file is settled, on the path and
+	// handle it settled on, as an open's is (Mountable): an exclusive
+	// create is the only creator without it.
+	unlockInode := func() {}
+	defer func() { unlockInode() }()
 
 	var version entryVersion
 	var cache func()
+	deleted := false // the new file deleted elsewhere since (Mountable)
 	inode, newEntry, version, cache, code = wfs.createRegularFileAt(dirFullPath, name, in.Mode, in.Uid, in.Gid, 0, !wfs.option.EagerFilerCreate, true)
 	if code == fuse.Status(syscall.EEXIST) && in.Flags&syscall.O_EXCL == 0 {
 		// Race: another process created the file between our check and create.
 		// Reopen the winner's entry; AcquireHandle takes its own lock.
-		if dlmLock != nil {
-			dlmLock.Stop()
-		}
-		endLease()
 		// The winner is not in this mount's cache yet: look it up afresh.
 		wfs.inodeToPath.InvalidateChildrenCache(dirFullPath)
 		newEntry, _, code = wfs.maybeLoadEntry(entryFullPath)
@@ -128,9 +114,6 @@ func (wfs *WFS) Create(cancel <-chan struct{}, in *fuse.CreateIn, name string, o
 		out.OpenFlags = 0
 		return fuse.OK
 	} else if code != fuse.OK {
-		if dlmLock != nil {
-			dlmLock.Stop()
-		}
 		return code
 	} else {
 		// The binding and the handle are made under the inode's lock, as an
@@ -139,7 +122,11 @@ func (wfs *WFS) Create(cancel <-chan struct{}, in *fuse.CreateIn, name string, o
 		// after both. When it came before, the file is that hard link
 		// (Mountable: see Link).
 		inodeLock := wfs.inodeLocks().AcquireLock("create", inode, util.SharedLock)
-		defer wfs.inodeLocks().ReleaseLock(inode, inodeLock)
+		var unlockOnce sync.Once
+		lockedInode := inode
+		unlockInode = func() {
+			unlockOnce.Do(func() { wfs.inodeLocks().ReleaseLock(lockedInode, inodeLock) })
+		}
 		// Another process may have looked the new file up while this reply
 		// was on its way, and linked it, renamed it, unlinked a name: then
 		// the inode is in the table, and the file is what the namespace has
@@ -149,12 +136,7 @@ func (wfs *WFS) Create(cancel <-chan struct{}, in *fuse.CreateIn, name string, o
 			// Whatever happened to it meanwhile decides: no name left, an
 			// error reading it, or another object on that inode, and the
 			// create fails, never rebinding the path to a second inode.
-			fail := func(code fuse.Status) fuse.Status {
-				if dlmLock != nil {
-					dlmLock.Stop()
-				}
-				return code
-			}
+			fail := func(code fuse.Status) fuse.Status { return code }
 			p, st := wfs.inodeToPath.GetPath(inode)
 			if st != fuse.OK {
 				return fail(fuse.ENOENT) // unlinked again before this reply
@@ -168,6 +150,15 @@ func (wfs *WFS) Create(cancel <-chan struct{}, in *fuse.CreateIn, name string, o
 			}
 			newEntry, version, entryFullPath, known = latest, latestVersion, path, true
 			wfs.inodeToPath.IncrementNlookup(inode) // the reply's reference
+		}
+		if !known && wfs.metaCache.DeletedAfter(context.Background(), entryFullPath, version.tsNs) {
+			// Deleted elsewhere before anything here looked it up: created,
+			// then unlinked, as if open first. The kernel's reference is to
+			// an inode with no name, and the handle is marked deleted, so
+			// nothing it writes brings the name back.
+			inode = wfs.inodeToPath.LookupLinked(entryFullPath, newEntry.Attributes.Crtime, PbEntryKind(newEntry), string(newEntry.HardLinkId), inode, true)
+			wfs.inodeToPath.RemovePath(entryFullPath, nil)
+			deleted, known = true, true
 		}
 		if !known {
 			// Nothing happened to the new file meanwhile: the cache takes
@@ -210,21 +201,21 @@ func (wfs *WFS) Create(cancel <-chan struct{}, in *fuse.CreateIn, name string, o
 		// persisted the entry, so its handle starts clean.
 		fileHandle.dirtyMetadata = !wfs.option.EagerFilerCreate
 		fileHandle.pendingCreate = !wfs.option.EagerFilerCreate
+		fileHandle.isDeleted = deleted
 		wfs.fhLockTable.ReleaseLock(fileHandle.fh, fhActiveLock)
 	}
 	fileHandle.RememberPath(entryFullPath)
 	// The file as its handle has it, which may be newer than this reply.
 	wfs.outputPbEntry(&out.EntryOut, inode, fileHandle.GetEntry().GetEntry())
 
-	// Create bypasses AcquireHandle, so attach the lock acquired above.
-	// A surviving handle may already hold one; ours is redundant then.
-	if dlmLock != nil {
-		if fileHandle.dlmLock == nil {
-			fileHandle.dlmLock = dlmLock
-			glog.V(1).Infof("DLM lock acquired for new file %s", entryFullPath)
-		} else {
-			dlmLock.Stop()
-		}
+	// Create bypasses AcquireHandle, so it takes the write lease as
+	// AcquireHandle does, once the handle is registered; the inode's lock
+	// is not held while it waits.
+	unlockInode()
+	if code := wfs.acquireWriteLease(fileHandle, entryFullPath); code != fuse.OK {
+		wfs.ReleaseHandle(fileHandle.fh)
+		wfs.Forget(inode, 1)
+		return code
 	}
 
 	out.Fh = uint64(fileHandle.fh)
@@ -233,42 +224,28 @@ func (wfs *WFS) Create(cancel <-chan struct{}, in *fuse.CreateIn, name string, o
 	return fuse.OK
 }
 
-// holdCreateLease records that a Create here holds the lease on path, and
-// returns the function that ends that, once the lease is with the create's
-// handle or let go. A write open of the new file, which another process can
-// make once the filer has it, waits for that instead of for the lease,
-// which the create's handle, its handle too, would hold until it closes
-// (Mountable).
-func (wfs *WFS) holdCreateLease(path util.FullPath) func() {
-	done := make(chan struct{})
-	wfs.createLeasesMu.Lock()
-	if wfs.createLeases == nil {
-		wfs.createLeases = map[util.FullPath]chan struct{}{}
+// acquireWriteLease gives fh the distributed lock's lease on path for
+// writing, unless it has one: under the handle's lock, so the openers and
+// the creator sharing a handle take one lease between them, the first one
+// waiting for it and the others for that one (Mountable).
+func (wfs *WFS) acquireWriteLease(fh *FileHandle, path util.FullPath) fuse.Status {
+	if wfs.lockClient == nil {
+		return fuse.OK
 	}
-	wfs.createLeases[path] = done
-	wfs.createLeasesMu.Unlock()
-	var once sync.Once
-	return func() {
-		once.Do(func() {
-			wfs.createLeasesMu.Lock()
-			if wfs.createLeases[path] == done {
-				delete(wfs.createLeases, path)
-			}
-			wfs.createLeasesMu.Unlock()
-			close(done)
-		})
+	fhActiveLock := wfs.fhLockTable.AcquireLock("lease", fh.fh, util.ExclusiveLock)
+	defer wfs.fhLockTable.ReleaseLock(fh.fh, fhActiveLock)
+	if fh.dlmLock != nil {
+		return fuse.OK
 	}
-}
-
-// waitForCreateLease waits until no Create here holds the lease on path
-// (Mountable: see holdCreateLease).
-func (wfs *WFS) waitForCreateLease(path util.FullPath) {
-	wfs.createLeasesMu.Lock()
-	done := wfs.createLeases[path]
-	wfs.createLeasesMu.Unlock()
-	if done != nil {
-		<-done
+	owner := fmt.Sprintf("mount-%d", wfs.signature)
+	fh.dlmLock = wfs.lockClient.NewBlockingLongLivedLock(string(path), owner, lock_manager.LiveLockTTL)
+	if fh.dlmLock == nil {
+		// No lock server is reachable: proceeding would silently drop
+		// cross-mount write serialization, so fail instead.
+		return fuse.Status(syscall.EAGAIN)
 	}
+	glog.V(1).Infof("DLM lock acquired for %s", path)
+	return fuse.OK
 }
 
 /** Create a file node

@@ -1,11 +1,7 @@
 package mount
 
 import (
-	"fmt"
-	"syscall"
-
 	"github.com/seaweedfs/go-fuse/v2/fuse"
-	"github.com/seaweedfs/seaweedfs/weed/cluster/lock_manager"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/util"
@@ -102,22 +98,11 @@ func (wfs *WFS) AcquireHandle(inode uint64, flags, uid, gid uint32) (fileHandle 
 	// auto-renewal until the file handle is released (close).
 	// Use the filer path as the lock key since inode numbers are
 	// assigned per-mount and differ across mount instances.
-	if wfs.lockClient != nil && flags&fuse.O_ANYWRITE != 0 {
-		// A Create here may hold the lease for this handle (Mountable).
-		wfs.waitForCreateLease(path)
-	}
-	if wfs.lockClient != nil && flags&fuse.O_ANYWRITE != 0 && fileHandle.dlmLock == nil {
-		owner := fmt.Sprintf("mount-%d", wfs.signature)
-		fileHandle.dlmLock = wfs.lockClient.NewBlockingLongLivedLock(
-			string(path), owner, lock_manager.LiveLockTTL,
-		)
-		if fileHandle.dlmLock == nil {
-			// No lock server is reachable: proceeding would silently drop
-			// cross-mount write serialization, so fail the open instead.
-			wfs.fhMap.ReleaseByHandle(fileHandle.fh)
-			return nil, fuse.Status(syscall.EAGAIN)
+	if flags&fuse.O_ANYWRITE != 0 {
+		if code := wfs.acquireWriteLease(fileHandle, path); code != fuse.OK {
+			wfs.ReleaseHandle(fileHandle.fh)
+			return nil, code
 		}
-		glog.V(1).Infof("DLM lock acquired for %s", path)
 	}
 	return fileHandle, fuse.OK
 }

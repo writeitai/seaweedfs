@@ -410,6 +410,21 @@ func (mc *MetaCache) FindEntry(ctx context.Context, fp util.FullPath) (entry *fi
 	return entry, mc.entryVersionFloorLocked(fp, recordTsNs), nil
 }
 
+// DeletedAfter reports whether the cache holds a deletion of fp at a log
+// position after tsNs, and no entry there since: a create acknowledged at
+// tsNs whose file was deleted before anything here looked it up.
+//
+// Mountable (writeitai/seaweedfs, branch d43): see Create.
+func (mc *MetaCache) DeletedAfter(ctx context.Context, fp util.FullPath, tsNs int64) bool {
+	if tsNs == 0 {
+		return false
+	}
+	mc.RLock()
+	defer mc.RUnlock()
+	recordTsNs, tombstone, _ := mc.entryVersionRecordLocked(ctx, fp)
+	return tombstone && recordTsNs > tsNs && !mc.entryExistsLocked(ctx, fp)
+}
+
 // entryVersionKeyPrefix namespaces per-entry version records apart from entry
 // keys. Keys encode parent-NUL-name, so a directory's direct children form one
 // contiguous range: pruning scans exactly them, never a subtree.

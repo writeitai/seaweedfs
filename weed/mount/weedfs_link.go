@@ -215,6 +215,9 @@ func (wfs *WFS) linkLocked(in *fuse.LinkIn, sourceInode uint64, oldEntryPath, ne
 	newEntryPath := newParentPath.Child(name)
 	switch {
 	case err == nil && createResp.GetErrorCode() == filer_pb.FilerError_ENTRY_ALREADY_EXISTS:
+		// The name another creator has is not in this mount's cache yet:
+		// the next lookup asks the filer, as after Create (Mountable).
+		wfs.inodeToPath.InvalidateChildrenCache(newParentPath)
 		// A typed refusal before any change: the extra reference goes back,
 		// on the condition that the source is still as promoted.
 		rollback := proto.Clone(acked).(*filer_pb.Entry)
@@ -245,9 +248,6 @@ func (wfs *WFS) linkLocked(in *fuse.LinkIn, sourceInode uint64, oldEntryPath, ne
 			glog.Warningf("link rollback %s: best-effort metadata apply failed: %v", oldEntryPath, applyErr)
 			wfs.inodeToPath.InvalidateChildrenCache(util.FullPath(oldParentPath))
 		}
-		// The name another creator has is not in this mount's cache yet:
-		// the next lookup asks the filer, as after Create (Mountable).
-		wfs.inodeToPath.InvalidateChildrenCache(newParentPath)
 		return fuse.Status(syscall.EEXIST), nil
 	case err != nil || createResp.GetError() != "":
 		// Ambiguous: the name may exist although the reply says otherwise.
