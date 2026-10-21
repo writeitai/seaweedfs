@@ -118,6 +118,9 @@ func (wfs *WFS) NFSCreate(step NFSStep, dir uint64, name string, mode NFSCreateM
 		setVerifier(entry.Attributes, verifier)
 	} else {
 		applyNFSAttrs(entry.Attributes, attrs, now)
+		if attrs.Size != nil {
+			entry.Attributes.FileSize = *attrs.Size // a hole
+		}
 	}
 	entry.Attributes.FileMode &= 0o7777 // a regular file
 	inode, code := wfs.nfsCreateEntry(step, dirPath, entry, false)
@@ -141,6 +144,9 @@ func (wfs *WFS) NFSCreate(step NFSStep, dir uint64, name string, mode NFSCreateM
 	if mode == NFSUnchecked && attrs.Size != nil {
 		if existing, code = wfs.nfsUpdate(step, dirPath, existing, func(a *filer_pb.FuseAttributes, e *filer_pb.Entry) { truncateEntry(e, *attrs.Size, now) }); code != fuse.OK {
 			return 0, code
+		}
+		if inode, found := wfs.inodeToPath.GetInode(path); found {
+			wfs.invalidateOpenMtimeCache(inode)
 		}
 	}
 	return wfs.inodeToPath.LookupLinked(path, existing.Attributes.Crtime, PbEntryKind(existing), string(existing.HardLinkId), existing.Attributes.Inode, true), fuse.OK
@@ -219,7 +225,7 @@ func (wfs *WFS) nfsCreateEntry(step NFSStep, dirPath util.FullPath, entry *filer
 	}
 	var inode uint64
 	if err == nil {
-		inode, err = wfs.adoptStoredInode(path, entry, resp)
+		inode, err = wfs.adoptStoredInode(step.Mutate, path, entry, resp)
 	}
 	if err != nil {
 		glog.V(0).Infof("nfs create %s: %v", path, err)
@@ -368,12 +374,18 @@ func (wfs *WFS) NFSRename(step NFSStep, fromDir uint64, fromName string, toDir u
 	if oldPath == newPath {
 		return fuse.OK
 	}
-	target, err := wfs.lookupOnce(step.Prepare, newPath)
+	if strings.HasPrefix(string(newPath), string(oldPath)+"/") {
+		return fuse.EINVAL // into itself
+	}
+	target, releaseGroup, code := wfs.nfsLockTarget(step.Prepare, newPath)
+	if code != fuse.OK {
+		return code
+	}
+	defer releaseGroup()
 	switch {
-	case errors.Is(err, filer_pb.ErrNotFound):
-		target = nil
-	case err != nil:
-		return nfsReadStatus(err)
+	case target == nil:
+	case sameObject(source, target):
+		return fuse.OK // two names of one file: nothing to do (RFC 1813 §3.3.14)
 	case source.IsDirectory && !target.IsDirectory:
 		return fuse.ENOTDIR
 	case !source.IsDirectory && target.IsDirectory:
@@ -389,7 +401,8 @@ func (wfs *WFS) NFSRename(step NFSStep, fromDir uint64, fromName string, toDir u
 	// the name back, as for a FUSE rename.
 	var targetInode, epoch uint64
 	if target != nil {
-		if inode, found := wfs.inodeToPath.GetInode(newPath); found {
+		sourceInode, _ := wfs.inodeToPath.GetInode(oldPath)
+		if inode, found := wfs.inodeToPath.GetInode(newPath); found && inode != sourceInode {
 			targetInode, epoch = inode, wfs.markHandleDeleted(inode)
 		}
 	}
@@ -532,6 +545,18 @@ func (wfs *WFS) NFSSetAttr(step NFSStep, inode uint64, attrs NFSAttrs, guard *ti
 		return fuse.EIO // kept changing
 	case code != fuse.OK:
 		return code
+	}
+	if inode == 1 {
+		// WFS reports the root from these, as after a FUSE SetAttr.
+		if attrs.Mode != nil {
+			wfs.option.MountMode = os.FileMode(chmod(uint32(wfs.option.MountMode), *attrs.Mode))
+		}
+		if attrs.Uid != nil {
+			wfs.option.MountUid = *attrs.Uid
+		}
+		if attrs.Gid != nil {
+			wfs.option.MountGid = *attrs.Gid
+		}
 	}
 	if attrs.Atime != nil || clearVerifier {
 		// WFS keeps access times in memory; GetAttr reports this one.
@@ -707,6 +732,37 @@ func (wfs *WFS) nfsLockEntry(ctx context.Context, path util.FullPath) (func(), *
 	return nil, nil, NFSRetryLater
 }
 
+// nfsLockTarget reads what a rename replaces at path, nil for nothing,
+// with its hard-link group's lock held when it is a hard link: replacing
+// it lowers the group's counter, which a concurrent link must not race. A
+// group that changed while its lock was taken is let go and the new one
+// taken.
+func (wfs *WFS) nfsLockTarget(ctx context.Context, path util.FullPath) (*filer_pb.Entry, func(), fuse.Status) {
+	none := func() {}
+	target, err := wfs.lookupOnce(ctx, path)
+	for range 3 {
+		switch {
+		case errors.Is(err, filer_pb.ErrNotFound):
+			return nil, none, fuse.OK
+		case err != nil:
+			return nil, nil, nfsReadStatus(err)
+		case len(target.HardLinkId) == 0:
+			return target, none, fuse.OK
+		}
+		release, code := wfs.nfsLocks(ctx, HardLinkLockKey(target.HardLinkId))
+		if code != fuse.OK {
+			return nil, nil, code
+		}
+		fresh, freshErr := wfs.lookupOnce(ctx, path)
+		if freshErr == nil && bytes.Equal(fresh.HardLinkId, target.HardLinkId) {
+			return fresh, release, fuse.OK
+		}
+		release()
+		target, err = fresh, freshErr
+	}
+	return nil, nil, NFSRetryLater
+}
+
 // nfsTouchDir sets a directory's modification and change times, as a FUSE
 // create or remove does, with one call whose failure is only logged.
 func (wfs *WFS) nfsTouchDir(step NFSStep, dirPath util.FullPath) {
@@ -714,8 +770,15 @@ func (wfs *WFS) nfsTouchDir(step NFSStep, dirPath util.FullPath) {
 		wfs.touchDirMtimeCtimeLocal(dirPath)
 		return
 	}
-	dirEntry, _, code := wfs.maybeLoadEntry(dirPath)
-	if code != fuse.OK || dirEntry == nil || dirEntry.Attributes == nil || string(dirPath) == wfs.option.FilerMountRootPath {
+	if string(dirPath) == wfs.option.FilerMountRootPath {
+		return
+	}
+	// From the cache when it has the directory, else from the filer within
+	// the step.
+	var dirEntry *filer_pb.Entry
+	if cached, _, err := wfs.metaCache.FindEntry(context.Background(), dirPath); err == nil && cached != nil {
+		dirEntry = cached.ToProtoEntry()
+	} else if dirEntry, err = wfs.lookupOnce(step.Mutate, dirPath); err != nil {
 		return
 	}
 	now := time.Now()
@@ -773,27 +836,46 @@ func (wfs *WFS) deleteEntryOnce(ctx context.Context, req *filer_pb.DeleteEntryRe
 	return resp, err
 }
 
-// renameOnce sends one StreamRenameEntry, applying its events as a FUSE
-// rename does.
+// renameOnce sends one StreamRenameEntry and, once the filer reports it
+// committed (the stream's end), applies its events as a FUSE rename does:
+// the filer sends them as it moves, before its transaction commits, which
+// may still fail.
 func (wfs *WFS) renameOnce(ctx context.Context, req *filer_pb.StreamRenameEntryRequest, newPath util.FullPath) error {
-	return wfs.withFilerOnce(ctx, func(client filer_pb.SeaweedFilerClient) error {
+	var events []*filer_pb.StreamRenameEntryResponse
+	err := wfs.withFilerOnce(ctx, func(client filer_pb.SeaweedFilerClient) error {
 		stream, err := client.StreamRenameEntry(ctx, req)
 		if err != nil {
 			return err
 		}
 		for {
 			resp, err := stream.Recv()
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
 			if err != nil {
-				if errors.Is(err, io.EOF) {
-					return nil
-				}
 				return err
 			}
-			if err := wfs.handleRenameResponse(ctx, resp, newPath, nil); err != nil {
-				return err
-			}
+			events = append(events, resp)
 		}
 	})
+	if err != nil {
+		return err
+	}
+	for _, resp := range events {
+		if err := wfs.handleRenameResponse(context.Background(), resp, newPath, nil); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// sameObject reports whether two entries are names of one file: one hard
+// link group, or one stored inode.
+func sameObject(a, b *filer_pb.Entry) bool {
+	if len(a.HardLinkId) > 0 || len(b.HardLinkId) > 0 {
+		return bytes.Equal(a.HardLinkId, b.HardLinkId)
+	}
+	return a.Attributes.Inode != 0 && a.Attributes.Inode == b.Attributes.Inode
 }
 
 // nfsReadStatus is a preparation read's error as a status: nothing
@@ -835,6 +917,8 @@ func nfsCallStatus(err error, first bool) fuse.Status {
 		return fuse.Status(syscall.ENOTEMPTY)
 	case strings.Contains(msg, "not directory"):
 		return fuse.ENOTDIR
+	case strings.Contains(msg, "subdirectory of itself"):
+		return fuse.EINVAL
 	}
 	return fuse.EIO
 }

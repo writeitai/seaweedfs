@@ -99,6 +99,9 @@ func (lock *LiveLock) attempt(ctx context.Context, lockDuration time.Duration) (
 	if err != nil || resp == nil {
 		return "", err
 	}
+	if resp.LockHostMovedTo != "" {
+		lock.hostFiler = pb.ServerAddress(resp.LockHostMovedTo)
+	}
 	if resp.Error != "" {
 		return resp.Error, nil
 	}
@@ -106,9 +109,6 @@ func (lock *LiveLock) attempt(ctx context.Context, lockDuration time.Duration) (
 	lock.owner = resp.LockOwner
 	if resp.Generation > 0 {
 		atomic.StoreInt64(&lock.generation, resp.Generation)
-	}
-	if resp.LockHostMovedTo != "" {
-		lock.hostFiler = pb.ServerAddress(resp.LockHostMovedTo)
 	}
 	atomic.StoreInt32(&lock.isLocked, 1)
 	return "", nil
@@ -132,7 +132,10 @@ func (lock *LiveLock) StopWithin(d time.Duration) {
 		select {
 		case <-lock.renewalDone:
 		case <-timer.C:
-			return // a renewal in flight may still rotate the token
+			// A renewal in flight may still rotate the token: it is
+			// abandoned, and the lease lapses on its own.
+			lock.abortRenewal()
+			return
 		}
 	}
 	lock.unlockWithin(d)
@@ -154,9 +157,15 @@ func (lock *LiveLock) unlockWithin(d time.Duration) {
 
 // startRenewal renews the lock every half lease until Stop, as
 // NewBlockingLongLivedLock's renewal does.
+// A renewal in flight is let finish on a stop, so the unlock has the
+// latest renew token, and abandoned once StopWithin's bound is over: none is
+// left running.
 func (lock *LiveLock) startRenewal() {
 	lock.renewalDone = make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	lock.abortRenewal = cancel
 	go func() {
+		defer cancel()
 		defer close(lock.renewalDone)
 		ticker := time.NewTicker(lock.lockTTL / 2)
 		defer ticker.Stop()
@@ -165,8 +174,8 @@ func (lock *LiveLock) startRenewal() {
 			case <-lock.cancelCh:
 				return
 			case <-ticker.C:
-				if err := lock.AttemptToLock(lock.lockTTL); err != nil {
-					glog.V(0).Infof("lock renewal failed for %s: %v", lock.key, err)
+				if message, err := lock.attempt(ctx, lock.lockTTL); err != nil || message != "" {
+					glog.V(0).Infof("lock renewal failed for %s: %v %s", lock.key, err, message)
 					atomic.StoreInt32(&lock.isLocked, 0)
 				}
 			}

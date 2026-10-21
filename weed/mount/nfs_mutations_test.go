@@ -3,6 +3,7 @@ package mount
 import (
 	"context"
 	"os"
+	"slices"
 	"sync"
 	"syscall"
 	"testing"
@@ -393,4 +394,152 @@ func TestNFSOpenForWriteLeaseWithinItsContext(t *testing.T) {
 	}
 	wfs.ReleaseHandle(fh)
 	waitUnlocked(t, f)
+}
+
+// Two names of one file: RENAME does nothing (RFC 1813 §3.3.14). A
+// directory never moves into itself.
+func TestNFSRenameSameFileAndIntoItself(t *testing.T) {
+	f := newStoreFiler()
+	wfs := newLinkTestWFS(t, f)
+	f.put(plainEntry("a", 8001, "a"))
+	inode := seen(t, wfs, f, "a")
+	if st := wfs.NFSLink(step(t), inode, 1, "b", 99, 100); st != fuse.OK {
+		t.Fatalf("link: %v", st)
+	}
+	if st := wfs.NFSRename(step(t), 1, "a", 1, "b"); st != fuse.OK {
+		t.Fatalf("rename onto the other name: %v", st)
+	}
+	if f.lookup("/a") == nil || f.lookup("/b") == nil || f.lookup("/a").HardLinkCounter != 2 {
+		t.Fatalf("after the rename: /a %v, /b %v", f.lookup("/a"), f.lookup("/b"))
+	}
+	if _, st := wfs.NFSMkdir(step(t), 1, "d", NFSAttrs{}, 99, 100); st != fuse.OK {
+		t.Fatalf("mkdir: %v", st)
+	}
+	dir, _ := wfs.inodeToPath.GetInode("/d")
+	if _, st := wfs.NFSMkdir(step(t), dir, "sub", NFSAttrs{}, 99, 100); st != fuse.OK {
+		t.Fatalf("mkdir sub: %v", st)
+	}
+	sub, _ := wfs.inodeToPath.GetInode("/d/sub")
+	if st := wfs.NFSRename(step(t), 1, "d", sub, "d"); st != fuse.EINVAL {
+		t.Fatalf("into itself: %v", st)
+	}
+}
+
+// quotaFiler refuses the creates of a name for the entry quota, as the
+// gateway does before changing anything.
+type quotaFiler struct {
+	*storeFiler
+	refuse string
+}
+
+func (q quotaFiler) CreateEntry(ctx context.Context, r *filer_pb.CreateEntryRequest) (*filer_pb.CreateEntryResponse, error) {
+	if r.Entry.Name == q.refuse {
+		return nil, status.Error(codes.ResourceExhausted, "entry quota exceeded")
+	}
+	return q.storeFiler.CreateEntry(ctx, r)
+}
+
+// LINK whose source read runs out of preparation time answers "retry
+// later"; one whose new name the gateway refuses for the entry quota, after
+// the source was promoted, answers the quota, not an unknown outcome.
+func TestNFSLinkStatuses(t *testing.T) {
+	f := newStoreFiler()
+	wfs := newLinkTestWFS(t, f)
+	f.put(plainEntry("a", 8001, "a"))
+	inode := seen(t, wfs, f, "a")
+	lookups := 0
+	f.beforeLookup = func(ctx context.Context, p util.FullPath) {
+		if p == "/a" {
+			if lookups++; lookups == 2 { // the read under the group's lock
+				<-ctx.Done()
+			}
+		}
+	}
+	s, _ := nfsStep(t, 300*time.Millisecond, 5*time.Second)
+	if st := wfs.NFSLink(s, inode, 1, "l", 99, 100); st != NFSRetryLater {
+		t.Fatalf("out of preparation time: %v", st)
+	}
+	f.beforeLookup = nil
+	waitUnlocked(t, f)
+	startFakeFiler(t, wfs, quotaFiler{f, "l"})
+	if st := wfs.NFSLink(step(t), inode, 1, "l", 99, 100); st != fuse.Status(syscall.EDQUOT) {
+		t.Fatalf("refused for the quota: %v", st)
+	}
+}
+
+// A SETATTR through one name of a hard link reaches the cached entries of
+// its other names: the cache's store keeps a group in one record, as the
+// filer's does.
+func TestNFSSetAttrReachesTheOtherNames(t *testing.T) {
+	f := newStoreFiler()
+	wfs := newLinkTestWFS(t, f)
+	wfs.inodeToPath.MarkChildrenCached("/")
+	f.put(plainEntry("a", 8001, "a"))
+	inode := seen(t, wfs, f, "a")
+	if st := wfs.NFSLink(step(t), inode, 1, "b", 99, 100); st != fuse.OK {
+		t.Fatalf("link: %v", st)
+	}
+	mode := uint32(0o600)
+	if st := wfs.NFSSetAttr(step(t), inode, NFSAttrs{Mode: &mode}, nil, false); st != fuse.OK {
+		t.Fatalf("setattr: %v", st)
+	}
+	for _, p := range []util.FullPath{"/a", "/b"} {
+		cached, _, err := wfs.metaCache.FindEntry(context.Background(), p)
+		if err != nil || cached.Attr.Mode.Perm() != 0o600 {
+			t.Fatalf("%s cached as %v (%v)", p, cached, err)
+		}
+	}
+}
+
+// brokenRenameFiler reports a rename's move and then fails it, as a filer
+// whose transaction does not commit.
+type brokenRenameFiler struct{ *storeFiler }
+
+func (b brokenRenameFiler) StreamRenameEntry(r *filer_pb.StreamRenameEntryRequest, stream grpc.ServerStreamingServer[filer_pb.StreamRenameEntryResponse]) error {
+	stream.Send(&filer_pb.StreamRenameEntryResponse{Directory: r.OldDirectory, EventNotification: &filer_pb.EventNotification{
+		OldEntry: &filer_pb.Entry{Name: r.OldName}, NewEntry: plainEntry(r.NewName, 8001, "a"), NewParentPath: r.NewDirectory,
+	}})
+	return status.Error(codes.Internal, "move commit error")
+}
+
+// A rename the filer reports moving and then fails leaves the mount as it
+// was: its events count only once the rename is committed.
+func TestNFSRenameAppliesOnlyACommittedMove(t *testing.T) {
+	f := newStoreFiler()
+	wfs := newLinkTestWFS(t, f)
+	f.put(plainEntry("a", 8001, "a"))
+	inode := seen(t, wfs, f, "a")
+	startFakeFiler(t, wfs, brokenRenameFiler{f})
+	if st := wfs.NFSRename(step(t), 1, "a", 1, "b"); st != fuse.EIO {
+		t.Fatalf("rename: %v", st)
+	}
+	if p, _ := wfs.inodeToPath.GetPath(inode); p != "/a" {
+		t.Fatalf("the file is at %s here", p)
+	}
+}
+
+// A rename over a hard link holds the link's group, whose counter the
+// replacement lowers.
+func TestNFSRenameOverAHardLinkLocksItsGroup(t *testing.T) {
+	f := newStoreFiler()
+	wfs := newLinkTestWFS(t, f)
+	f.put(plainEntry("a", 8001, "a"))
+	f.put(plainEntry("t", 8002, "t"))
+	seen(t, wfs, f, "a")
+	target := seen(t, wfs, f, "t")
+	if st := wfs.NFSLink(step(t), target, 1, "t2", 99, 100); st != fuse.OK {
+		t.Fatalf("link: %v", st)
+	}
+	group := HardLinkLockKey(f.lookup("/t").HardLinkId)
+	f.mu.Lock()
+	f.locked = nil
+	f.mu.Unlock()
+	if st := wfs.NFSRename(step(t), 1, "a", 1, "t"); st != fuse.OK {
+		t.Fatalf("rename: %v", st)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !slices.Contains(f.locked, group) {
+		t.Fatalf("locked %v, not %s", f.locked, group)
+	}
 }

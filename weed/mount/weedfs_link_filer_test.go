@@ -43,6 +43,8 @@ type storeFiler struct {
 	locks       map[string]string // lock name -> token
 	locked      []string          // every lock name taken, in order
 	failLookup  map[util.FullPath]bool
+	// beforeLookup, when set, runs unlocked before a lookup is answered.
+	beforeLookup func(ctx context.Context, p util.FullPath)
 }
 
 func newStoreFiler() *storeFiler {
@@ -102,7 +104,10 @@ func entriesEqual(a, b *filer_pb.Entry) bool {
 	return proto.Equal(filer.FromPbEntry("", a).ToProtoEntry(), filer.FromPbEntry("", b).ToProtoEntry())
 }
 
-func (f *storeFiler) LookupDirectoryEntry(_ context.Context, r *filer_pb.LookupDirectoryEntryRequest) (*filer_pb.LookupDirectoryEntryResponse, error) {
+func (f *storeFiler) LookupDirectoryEntry(ctx context.Context, r *filer_pb.LookupDirectoryEntryRequest) (*filer_pb.LookupDirectoryEntryResponse, error) {
+	if hook := f.beforeLookup; hook != nil {
+		hook(ctx, util.FullPath(r.Directory).Child(r.Name))
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.failLookup[util.FullPath(r.Directory).Child(r.Name)] {

@@ -149,6 +149,9 @@ func (wfs *WFS) linkHeld(in *fuse.LinkIn, sourceInode uint64, oldEntryPath, newP
 		if errors.Is(err, filer_pb.ErrNotFound) {
 			return fuse.ENOENT, nil
 		}
+		if step != nil {
+			return nfsReadStatus(err), nil // nothing changed yet
+		}
 		return fuse.EIO, nil
 	}
 	if read == nil || !wfs.inodeToPath.HoldsEntry(sourceInode, read) {
@@ -276,6 +279,10 @@ func (wfs *WFS) linkHeld(in *fuse.LinkIn, sourceInode uint64, oldEntryPath, newP
 		glog.V(0).Infof("Link %v -> %s: %v %s", oldEntryPath, newEntryPath, err, createResp.GetError())
 		if step != nil {
 			wfs.inodeToPath.InvalidateChildrenCache(newParentPath)
+			if err == nil {
+				err = errors.New(createResp.GetError())
+			}
+			return nfsCallStatus(err, false), nil
 		}
 		return fuse.EIO, nil
 	}

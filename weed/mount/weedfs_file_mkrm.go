@@ -605,7 +605,7 @@ func (wfs *WFS) createRegularFileAt(dirFullPath util.FullPath, name string, mode
 	if err == nil {
 		// The inode the filer stored, before anything caches the entry
 		// (Mountable).
-		inode, err = wfs.adoptStoredInode(entryFullPath, newEntry, resp)
+		inode, err = wfs.adoptStoredInode(context.Background(), entryFullPath, newEntry, resp)
 	}
 	if err != nil {
 		glog.V(0).Infof("createFile %s: %v", entryFullPath, err)

@@ -160,6 +160,9 @@ type LiveLock struct {
 	owner               string
 	lockTTL             time.Duration
 	consecutiveFailures int // Track connection failures to trigger fallback
+	// abortRenewal ends a renewal RPC in flight; StopWithin calls it once
+	// its bound is over (Mountable: see AcquireLock).
+	abortRenewal context.CancelFunc
 }
 
 // NewShortLivedLock creates a lock with a 5-second duration.
