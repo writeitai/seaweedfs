@@ -32,6 +32,17 @@ func (wfs *WFS) AcquireHandle(inode uint64, flags, uid, gid uint32) (fileHandle 
 	var entry *filer_pb.Entry
 	var entryVersionTsNs entryVersion
 	freshLookup := false
+	// From loading the entry to registering the handle, the inode's lock
+	// is shared: a Link of the inode, which holds it exclusively, cannot
+	// fall between the two and leave the handle with the entry from before
+	// it (Mountable: see inodeLocks).
+	inodeLock := wfs.inodeLocks().AcquireLock("open", inode, util.SharedLock)
+	inodeLocked := true
+	defer func() {
+		if inodeLocked {
+			wfs.inodeLocks().ReleaseLock(inode, inodeLock)
+		}
+	}()
 	existingFh, found := wfs.fhMap.FindFileHandle(inode)
 	if found && !wfs.handleHolds(existingFh) {
 		// The handle holds another object than the inode's (Mountable: see
@@ -74,6 +85,9 @@ func (wfs *WFS) AcquireHandle(inode uint64, flags, uid, gid uint32) (fileHandle 
 	}
 	// need to AcquireFileHandle again to ensure correct handle counter
 	var existed bool
+	if afterOpenLoaded != nil {
+		afterOpenLoaded(inode)
+	}
 	fileHandle, existed = wfs.fhMap.AcquireFileHandle(wfs, inode, entry, entryVersionTsNs.tsNs, entryVersionTsNs.signature)
 	fileHandle.RememberPath(path)
 	if existed && freshLookup {
@@ -81,6 +95,8 @@ func (wfs *WFS) AcquireHandle(inode uint64, flags, uid, gid uint32) (fileHandle 
 		// install only state that provably improves on what it holds.
 		fileHandle.installAckedEntry(entry, entryVersionTsNs.tsNs, entryVersionTsNs.signature)
 	}
+	wfs.inodeLocks().ReleaseLock(inode, inodeLock)
+	inodeLocked = false
 
 	// Acquire distributed lock for write opens. The lock is held with
 	// auto-renewal until the file handle is released (close).

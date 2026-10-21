@@ -96,6 +96,12 @@ func (wfs *WFS) Link(cancel <-chan struct{}, in *fuse.LinkIn, name string, out *
 		oldEntry = fresh
 	}
 
+	// The source inode's lock, which an open shares from loading the entry
+	// to registering its handle, is held to the end: no handle is left with
+	// the entry from before the link (Mountable: see inodeLocks).
+	inodeLock := wfs.inodeLocks().AcquireLock("link", sourceInode, util.ExclusiveLock)
+	defer wfs.inodeLocks().ReleaseLock(sourceInode, inodeLock)
+
 	// update old file to hardlink mode
 	origHardLinkId := oldEntry.HardLinkId
 	origHardLinkCounter := oldEntry.HardLinkCounter

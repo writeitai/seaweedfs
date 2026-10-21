@@ -155,29 +155,33 @@ type WFS struct {
 	IsOverQuota           bool
 	fhLockTable           *util.LockTable[FileHandleId]
 	hardLinkLockTable     *util.LockTable[string]
-	posixLocks            *PosixLockTable
-	posixSid              uint64             // this mount's session id, for routed-lock owner identity
-	posixHint             *posixLockHint     // local fcntl-lock hint for routed mode
-	posixOwn              *posixlock.Manager // mirror of locks this mount holds, re-asserted via keepalive
-	peerRegistrar         *PeerRegistrar
-	peerDirectory         *PeerDirectory
-	peerGrpcServer        *PeerGrpcServer
-	peerAnnouncer         *PeerAnnouncer
-	peerConnPool          *PeerConnPool
-	peerDirectoryStop     chan struct{} // closed on unmount to stop the sweeper goroutine
-	FilerConf             *filer.FilerConf
-	filerClient           *wdclient.FilerClient // Cached volume location client
-	refreshMu             sync.Mutex
-	refreshingDirs        map[util.FullPath]struct{}
-	atimeMu               sync.Mutex
-	atimeMap              map[uint64]time.Time // inode -> atime, in-memory only, bounded
-	dirMtimeMu            sync.Mutex
-	dirMtimeMap           map[uint64]time.Time // inode -> mtime/ctime, in-memory overlay for dirs
-	removedDirMu          sync.Mutex
-	removedDirs           map[uint64]*filer_pb.Entry // inode -> last-known entry of a directory removed while still referenced
-	entryValidSec         uint64                     // kernel FUSE entry cache TTL in seconds
-	attrValidSec          uint64                     // kernel FUSE attr cache TTL in seconds
-	dirIdleEvict          time.Duration
+	// inodeLockTable serialises Link against opens of its source inode
+	// (Mountable: see inodeLocks).
+	inodeLockOnce     sync.Once
+	inodeLockTable    *util.LockTable[uint64]
+	posixLocks        *PosixLockTable
+	posixSid          uint64             // this mount's session id, for routed-lock owner identity
+	posixHint         *posixLockHint     // local fcntl-lock hint for routed mode
+	posixOwn          *posixlock.Manager // mirror of locks this mount holds, re-asserted via keepalive
+	peerRegistrar     *PeerRegistrar
+	peerDirectory     *PeerDirectory
+	peerGrpcServer    *PeerGrpcServer
+	peerAnnouncer     *PeerAnnouncer
+	peerConnPool      *PeerConnPool
+	peerDirectoryStop chan struct{} // closed on unmount to stop the sweeper goroutine
+	FilerConf         *filer.FilerConf
+	filerClient       *wdclient.FilerClient // Cached volume location client
+	refreshMu         sync.Mutex
+	refreshingDirs    map[util.FullPath]struct{}
+	atimeMu           sync.Mutex
+	atimeMap          map[uint64]time.Time // inode -> atime, in-memory only, bounded
+	dirMtimeMu        sync.Mutex
+	dirMtimeMap       map[uint64]time.Time // inode -> mtime/ctime, in-memory overlay for dirs
+	removedDirMu      sync.Mutex
+	removedDirs       map[uint64]*filer_pb.Entry // inode -> last-known entry of a directory removed while still referenced
+	entryValidSec     uint64                     // kernel FUSE entry cache TTL in seconds
+	attrValidSec      uint64                     // kernel FUSE attr cache TTL in seconds
+	dirIdleEvict      time.Duration
 
 	// openMtimeCache maps inode -> [mtime_sec, mtime_ns] from the last Open.
 	// Used to decide whether to set FOPEN_KEEP_CACHE on subsequent opens.
@@ -620,13 +624,13 @@ func (wfs *WFS) loadInodeEntry(inode uint64, path util.FullPath) (util.FullPath,
 // localEntry is an open handle's entry, cloned, when it may stand in for an
 // entry the filer does not have yet: unflushed, neither unlinked nor
 // refused, and its inode's object (Mountable). Read under the handle's
-// locks: async upload workers append chunks under entryLock.
+// locks: async upload workers append chunks under the entry's own.
 func (wfs *WFS) localEntry(fh *FileHandle) *filer_pb.Entry {
 	fhActiveLock := wfs.fhLockTable.AcquireLock("localEntry", fh.fh, util.SharedLock)
 	defer wfs.fhLockTable.ReleaseLock(fh.fh, fhActiveLock)
-	fh.entryLock.RLock()
-	defer fh.entryLock.RUnlock()
-	entry := fh.GetEntry().GetEntry()
+	fh.entry.RLock()
+	defer fh.entry.RUnlock()
+	entry := fh.entry.Entry
 	if !fh.dirtyMetadata || fh.isDeleted || fh.persistErr != 0 || entry == nil || !wfs.inodeToPath.HoldsEntry(fh.inode, entry) {
 		return nil
 	}

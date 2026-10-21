@@ -5,7 +5,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/seaweedfs/seaweedfs/weed/pb"
+	"google.golang.org/grpc"
 	"io"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -138,6 +141,22 @@ func (wfs *WFS) doFlush(ctx context.Context, fh *FileHandle, uid, gid uint32, al
 	// send the data to the OS
 	glog.V(4).Infof("doFlush %s fh %d", fileFullPath, fh.fh)
 
+	// Nothing is uploaded for a dirty handle whose flush would not be
+	// written (Mountable: see persistDestination).
+	fhActiveLock := wfs.fhLockTable.AcquireLock("doFlush", fh.fh, util.ExclusiveLock)
+	write, refusal := true, error(nil)
+	if fh.dirtyMetadata {
+		_, write, refusal = wfs.persistDestination(fh, "")
+	}
+	wfs.fhLockTable.ReleaseLock(fh.fh, fhActiveLock)
+	if !write {
+		var refused syscall.Errno
+		if errors.As(refusal, &refused) {
+			return fuse.Status(refused)
+		}
+		return fuse.OK
+	}
+
 	// When writebackCache is enabled and this is a close()-triggered Flush (not fsync),
 	// defer the expensive data upload + metadata flush to a background goroutine.
 	// This allows the calling process (e.g., rsync) to proceed to the next file immediately.
@@ -155,22 +174,6 @@ func (wfs *WFS) doFlush(ctx context.Context, fh *FileHandle, uid, gid uint32, al
 
 	// Synchronous flush path (normal mode, fsync, or no dirty data)
 	fh.asyncFlushPending = false
-
-	// Nothing is uploaded for a dirty handle whose flush would not be
-	// written (Mountable: see persistDestination).
-	fhActiveLock := wfs.fhLockTable.AcquireLock("doFlush", fh.fh, util.ExclusiveLock)
-	write, refusal := true, error(nil)
-	if fh.dirtyMetadata {
-		_, write, refusal = wfs.persistDestination(fh, "")
-	}
-	wfs.fhLockTable.ReleaseLock(fh.fh, fhActiveLock)
-	if !write {
-		var refused syscall.Errno
-		if errors.As(refusal, &refused) {
-			return fuse.Status(refused)
-		}
-		return fuse.OK
-	}
 
 	// Check quota including uncommitted writes for real-time enforcement
 	isOverQuota := wfs.IsOverQuotaWithUncommitted()
@@ -305,9 +308,13 @@ func (wfs *WFS) flushMetadataToFiler(ctx context.Context, fh *FileHandle, dir, n
 	baseSnapshot := proto.Clone(requestEntry).(*filer_pb.Entry)
 	wfs.mapPbIdFromLocalToFiler(request.Entry)
 
-	resp, err := wfs.streamCreateEntry(ctx, request)
+	resp, err := wfs.persistEntry(ctx, fh, fileFullPath, request)
 	if err != nil {
 		glog.Errorf("fh flush create %s: %v", fileFullPath, err)
+		var refused syscall.Errno
+		if errors.As(err, &refused) {
+			return refused
+		}
 		return fmt.Errorf("fh flush create %s: %v", fileFullPath, err)
 	}
 
@@ -430,10 +437,80 @@ func (wfs *WFS) persistDestination(fh *FileHandle, path util.FullPath) (util.Ful
 		glog.Warningf("flush %s fh %d: the path no longer leads to the open file, not writing it", path, fh.fh)
 		fh.persistErr = syscall.ESTALE
 	}
+	// Nor is an entry that is not the inode's object any more, as an open
+	// that loaded it before a Link changed the object's identity holds.
+	if entry := fh.GetEntry().GetEntry(); fh.persistErr == 0 && entry != nil && !wfs.inodeToPath.HoldsEntry(fh.inode, entry) {
+		glog.Warningf("flush %s fh %d: the handle holds another object than its inode's, not writing it", path, fh.fh)
+		fh.persistErr = syscall.ESTALE
+	}
 	if fh.persistErr != 0 {
 		return path, false, fh.persistErr
 	}
 	return path, true, nil
+}
+
+// persistEntry writes a handle's entry with request, on the condition
+// that the filer still has the entry the handle last saw there (its base),
+// or none for a create the filer has not had yet: a check of the binding
+// beforehand alone could be overtaken by a replacement. When the filer has
+// another entry, it is read: still the handle's object, it becomes the
+// base and the write is tried again, last writer winning on content as
+// before; another object, or none, and the handle refuses for good
+// (ESTALE), keeping its writes. Called under the handle lock (Mountable).
+func (wfs *WFS) persistEntry(ctx context.Context, fh *FileHandle, path util.FullPath, request *filer_pb.CreateEntryRequest) (*filer_pb.CreateEntryResponse, error) {
+	for range 3 {
+		var expected *filer_pb.Entry
+		if base := fh.baseEntry.Load(); base != nil && fh.entryVersionTsNs.Load() != 0 {
+			expected = proto.Clone(base).(*filer_pb.Entry)
+			wfs.mapPbIdFromLocalToFiler(expected)
+		}
+		request.Condition = entryCondition(expected)
+		resp, err := wfs.createEntryOnce(ctx, request)
+		if err != nil {
+			return nil, err
+		}
+		if resp.GetErrorCode() != filer_pb.FilerError_PRECONDITION_FAILED {
+			if resp.GetError() != "" {
+				return nil, fmt.Errorf("create %s: %s", path, resp.GetError())
+			}
+			return resp, nil
+		}
+		current, version, _, err := filer_pb.GetEntry(ctx, wfs, path)
+		if errors.Is(err, filer_pb.ErrNotFound) || err == nil && (current == nil || !wfs.inodeToPath.HoldsEntry(fh.inode, current)) {
+			glog.Warningf("flush %s fh %d: the filer has another object there, not writing it", path, fh.fh)
+			fh.persistErr = syscall.ESTALE
+			return nil, fh.persistErr
+		}
+		if err != nil {
+			return nil, err
+		}
+		wfs.mapPbIdFromFilerToLocal(current)
+		fh.setAuthoritativeBase(current)
+		fh.advanceEntryVersion(max(version, 1), 0)
+	}
+	return nil, fmt.Errorf("create %s: the entry kept changing", path)
+}
+
+// entryCondition is the condition that the stored entry is expected, or
+// that there is none for a nil expected.
+func entryCondition(expected *filer_pb.Entry) *filer_pb.WriteCondition {
+	return &filer_pb.WriteCondition{Clauses: []*filer_pb.WriteCondition_Clause{{
+		Kind:          filer_pb.WriteCondition_IF_ENTRY_EQUAL,
+		ExpectedEntry: expected,
+	}}}
+}
+
+// createEntryOnce sends one CreateEntry to the current filer: unary, with
+// neither the stream's fallback nor WithFilerClient's retries, and its
+// refusal typed in the response (Mountable).
+func (wfs *WFS) createEntryOnce(ctx context.Context, req *filer_pb.CreateEntryRequest) (resp *filer_pb.CreateEntryResponse, err error) {
+	address := wfs.option.FilerAddresses[atomic.LoadInt32(&wfs.option.filerIndex)].ToGrpcAddress()
+	err = pb.WithGrpcClient(ctx, false, wfs.signature, func(conn *grpc.ClientConn) error {
+		var callErr error
+		resp, callErr = filer_pb.NewSeaweedFilerClient(conn).CreateEntry(ctx, req)
+		return callErr
+	}, address, false, wfs.option.GrpcDialOption)
+	return resp, err
 }
 
 // afterFlushData, when set (by tests), runs in doFlush once the data is
