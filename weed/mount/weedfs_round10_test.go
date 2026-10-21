@@ -107,7 +107,7 @@ func TestFlushWritesWhereThePathIsNow(t *testing.T) {
 
 // A failed LINK of an open, dirty standalone source leaves it as it was:
 // the cache takes the rollback, so a lookup finds the same inode, and the
-// handle's writes still flush, expecting the rolled back entry.
+// handle's writes still flush, expecting the entry the link left.
 func TestFailedLinkLeavesAnOpenSourceItself(t *testing.T) {
 	wfs, _ := newCreateTestWFS(t)
 	filer := newRecordFiler()
@@ -129,9 +129,11 @@ func TestFailedLinkLeavesAnOpenSourceItself(t *testing.T) {
 	if st := wfs.Lookup(nil, &fuse.InHeader{NodeId: 1}, "first.txt", &out); st != fuse.OK || out.NodeId != source {
 		t.Fatalf("lookup after the failed link %v: inode %d, want %d", st, out.NodeId, source)
 	}
-	// One write, expecting the entry as the rollback left it.
-	if st := wfs.Fsync(nil, &fuse.FsyncIn{InHeader: fuse.InHeader{NodeId: source}, Fh: uint64(fh.fh)}); st != fuse.OK || filer.creates != 1 {
-		t.Fatalf("fsync after the failed link: %v, %d creates", st, filer.creates)
+	// At most one write (Link flushed the handle already), expecting the
+	// entry as the failed link left it.
+	before := filer.creates
+	if st := wfs.Fsync(nil, &fuse.FsyncIn{InHeader: fuse.InHeader{NodeId: source}, Fh: uint64(fh.fh)}); st != fuse.OK || filer.creates-before > 1 {
+		t.Fatalf("fsync after the failed link: %v, %d creates", st, filer.creates-before)
 	}
 }
 
