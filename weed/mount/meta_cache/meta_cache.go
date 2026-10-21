@@ -183,7 +183,45 @@ func (mc *MetaCache) doInsertEntry(ctx context.Context, entry *filer.Entry, vers
 // This is more efficient than inserting entries one by one.
 
 func (mc *MetaCache) doBatchInsertEntries(ctx context.Context, entries []*filer.Entry) error {
-	return mc.leveldbStore.BatchInsertEntries(ctx, entries)
+	if err := mc.leveldbStore.BatchInsertEntries(ctx, entries); err != nil {
+		return err
+	}
+	// A listed hard link is its group as the filer has it now: the shared
+	// record every name reads takes it (Mountable: see
+	// setHardLinkRecordLocked).
+	for _, entry := range entries {
+		if len(entry.HardLinkId) > 0 {
+			mc.setHardLinkRecordLocked(ctx, entry, true)
+		}
+	}
+	return nil
+}
+
+// setHardLinkRecordLocked writes entry's hard-link group record, which the
+// store's reads of every name of the group take their attributes and
+// chunks from, as the filer store keeps them. Bypassing it, a write to one
+// name, or a listing written in a batch, would leave the others read from
+// an older record. Unless always, only a record already kept is written:
+// one for a group none of whose names is cached would only accumulate.
+//
+// Mountable (writeitai/seaweedfs, branch nfs-writes): a hard link's change
+// through a name whose directory is not cached reaches its other names.
+func (mc *MetaCache) setHardLinkRecordLocked(ctx context.Context, entry *filer.Entry, always bool) {
+	if !always {
+		if _, err := mc.localStore.KvGet(ctx, entry.HardLinkId); err != nil {
+			return
+		}
+	}
+	pb := proto.Clone(entry.ToProtoEntry()).(*filer_pb.Entry)
+	filer_pb.BeforeEntrySerialization(pb.Chunks)
+	dir, _ := entry.DirAndName()
+	blob, err := filer.FromPbEntry(dir, pb).EncodeAttributesAndChunks()
+	if err == nil {
+		err = mc.localStore.KvPut(ctx, entry.HardLinkId, blob)
+	}
+	if err != nil {
+		glog.V(1).Infof("hard link record %x: %v", entry.HardLinkId, err)
+	}
 }
 
 func (mc *MetaCache) AtomicUpdateEntryFromFiler(ctx context.Context, oldPath util.FullPath, newEntry *filer.Entry) error {
@@ -228,6 +266,9 @@ func (mc *MetaCache) atomicUpdateEntryFromFilerLocked(ctx context.Context, oldPa
 				return err
 			}
 			mc.setEntryVersionLocked(ctx, newEntry.FullPath, versionTsNs)
+		} else if len(newEntry.HardLinkId) > 0 {
+			// Not cached here, but other names of the group may be.
+			mc.setHardLinkRecordLocked(ctx, newEntry, false)
 		}
 	}
 	return nil

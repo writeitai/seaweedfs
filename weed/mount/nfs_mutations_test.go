@@ -87,33 +87,33 @@ func waitUnlocked(t *testing.T, f *storeFiler) {
 func TestNFSCreateModes(t *testing.T) {
 	f := newStoreFiler()
 	wfs := newLinkTestWFS(t, f)
-	inode, st := wfs.NFSCreate(step(t), 1, "g", NFSGuarded, NFSAttrs{}, [8]byte{}, 99, 100)
+	inode, st := wfs.NFSCreate(step(t), 1, "g", NFSGuarded, NFSAttrs{}, [8]byte{}, 99, 100, nil)
 	if st != fuse.OK || f.lookup("/g") == nil || f.lookup("/g").Attributes.Inode != inode {
 		t.Fatalf("GUARDED: %v, inode %d, stored %v", st, inode, f.lookup("/g"))
 	}
-	if _, st := wfs.NFSCreate(step(t), 1, "g", NFSGuarded, NFSAttrs{}, [8]byte{}, 99, 100); st != fuse.Status(syscall.EEXIST) {
+	if _, st := wfs.NFSCreate(step(t), 1, "g", NFSGuarded, NFSAttrs{}, [8]byte{}, 99, 100, nil); st != fuse.Status(syscall.EEXIST) {
 		t.Fatalf("GUARDED again: %v", st)
 	}
 	verifier := [8]byte{0, 0, 0, 7, 0xff, 0xff, 0xff, 0xff}
-	made, st := wfs.NFSCreate(step(t), 1, "x", NFSExclusive, NFSAttrs{}, verifier, 99, 100)
+	made, st := wfs.NFSCreate(step(t), 1, "x", NFSExclusive, NFSAttrs{}, verifier, 99, 100, nil)
 	if st != fuse.OK {
 		t.Fatalf("EXCLUSIVE: %v", st)
 	}
 	if a := f.lookup("/x").Attributes; a.Atime != 7 || a.Mtime != 0xffffffff || a.AtimeNs != exclusiveMarker {
 		t.Fatalf("stored times %d.%d and %d", a.Atime, a.AtimeNs, a.Mtime)
 	}
-	if again, st := wfs.NFSCreate(step(t), 1, "x", NFSExclusive, NFSAttrs{}, verifier, 99, 100); st != fuse.OK || again != made {
+	if again, st := wfs.NFSCreate(step(t), 1, "x", NFSExclusive, NFSAttrs{}, verifier, 99, 100, nil); st != fuse.OK || again != made {
 		t.Fatalf("EXCLUSIVE retried: %v, inode %d, made %d", st, again, made)
 	}
-	if _, st := wfs.NFSCreate(step(t), 1, "x", NFSExclusive, NFSAttrs{}, [8]byte{1}, 99, 100); st != fuse.Status(syscall.EEXIST) {
+	if _, st := wfs.NFSCreate(step(t), 1, "x", NFSExclusive, NFSAttrs{}, [8]byte{1}, 99, 100, nil); st != fuse.Status(syscall.EEXIST) {
 		t.Fatalf("EXCLUSIVE with another verifier: %v", st)
 	}
 	f.put(plainEntry("u", 8001, "content"))
-	if _, st := wfs.NFSCreate(step(t), 1, "u", NFSUnchecked, NFSAttrs{}, [8]byte{}, 99, 100); st != fuse.OK || string(f.lookup("/u").Content) != "content" {
+	if _, st := wfs.NFSCreate(step(t), 1, "u", NFSUnchecked, NFSAttrs{}, [8]byte{}, 99, 100, nil); st != fuse.OK || string(f.lookup("/u").Content) != "content" {
 		t.Fatalf("UNCHECKED: %v, %q", st, f.lookup("/u").Content)
 	}
 	zero := uint64(0)
-	if _, st := wfs.NFSCreate(step(t), 1, "u", NFSUnchecked, NFSAttrs{Size: &zero}, [8]byte{}, 99, 100); st != fuse.OK || len(f.lookup("/u").Content) != 0 || f.lookup("/u").Attributes.FileSize != 0 {
+	if _, st := wfs.NFSCreate(step(t), 1, "u", NFSUnchecked, NFSAttrs{Size: &zero}, [8]byte{}, 99, 100, nil); st != fuse.OK || len(f.lookup("/u").Content) != 0 || f.lookup("/u").Attributes.FileSize != 0 {
 		t.Fatalf("UNCHECKED with size 0: %v, %v", st, f.lookup("/u"))
 	}
 	if f.creates["/g"] != 2 || f.creates["/x"] != 3 {
@@ -129,7 +129,7 @@ func TestNFSCreateLostReplyIsSentOnce(t *testing.T) {
 	f.afterCreate = func(*filer_pb.CreateEntryRequest) (*filer_pb.CreateEntryResponse, error) {
 		return nil, status.Error(codes.Unavailable, "connection reset")
 	}
-	if _, st := wfs.NFSCreate(step(t), 1, "n", NFSGuarded, NFSAttrs{}, [8]byte{}, 99, 100); st != fuse.EIO {
+	if _, st := wfs.NFSCreate(step(t), 1, "n", NFSGuarded, NFSAttrs{}, [8]byte{}, 99, 100, nil); st != fuse.EIO {
 		t.Fatalf("create: %v", st)
 	}
 	if f.creates["/n"] != 1 || f.lookup("/n") == nil {
@@ -147,7 +147,7 @@ func TestNFSMutationStallEndsWithItsStep(t *testing.T) {
 	f.beforeCreate = func(*filer_pb.CreateEntryRequest) { <-release }
 	s, _ := nfsStep(t, 5*time.Second, 200*time.Millisecond)
 	start := time.Now()
-	if _, st := wfs.NFSCreate(s, 1, "n", NFSGuarded, NFSAttrs{}, [8]byte{}, 99, 100); st != fuse.EIO {
+	if _, st := wfs.NFSCreate(s, 1, "n", NFSGuarded, NFSAttrs{}, [8]byte{}, 99, 100, nil); st != fuse.EIO {
 		t.Fatalf("create: %v", st)
 	}
 	if took := time.Since(start); took > 2*time.Second {
@@ -169,7 +169,7 @@ func TestNFSRateRefusalIsRetryLater(t *testing.T) {
 	f := newStoreFiler()
 	wfs := newLinkTestWFS(t, f)
 	startFakeFiler(t, wfs, rateFiler{f})
-	if _, st := wfs.NFSCreate(step(t), 1, "n", NFSGuarded, NFSAttrs{}, [8]byte{}, 99, 100); st != NFSRetryLater {
+	if _, st := wfs.NFSCreate(step(t), 1, "n", NFSGuarded, NFSAttrs{}, [8]byte{}, 99, 100, nil); st != NFSRetryLater {
 		t.Fatalf("create: %v", st)
 	}
 }
@@ -186,7 +186,7 @@ func TestNFSMutationsWaitForAnotherMountsLock(t *testing.T) {
 		done func(f *storeFiler) bool
 	}{
 		{"create", func(*storeFiler) string { return "/n" }, func(wfs *WFS, s NFSStep) fuse.Status {
-			_, st := wfs.NFSCreate(s, 1, "n", NFSGuarded, NFSAttrs{}, [8]byte{}, 99, 100)
+			_, st := wfs.NFSCreate(s, 1, "n", NFSGuarded, NFSAttrs{}, [8]byte{}, 99, 100, nil)
 			return st
 		}, func(f *storeFiler) bool { return f.lookup("/n") != nil }},
 		{"remove", func(*storeFiler) string { return "/a" }, func(wfs *WFS, s NFSStep) fuse.Status {
@@ -541,5 +541,120 @@ func TestNFSRenameOverAHardLinkLocksItsGroup(t *testing.T) {
 	defer f.mu.Unlock()
 	if !slices.Contains(f.locked, group) {
 		t.Fatalf("locked %v, not %s", f.locked, group)
+	}
+}
+
+// UNCHECKED CREATE of an existing name decides on the entry it read under
+// the lease: a refusal stands and leaves it untouched; a directory is
+// ISDIR.
+func TestNFSCreateReuseDecidesUnderTheLease(t *testing.T) {
+	f := newStoreFiler()
+	wfs := newLinkTestWFS(t, f)
+	theirs := plainEntry("t", 8001, "keep")
+	theirs.Attributes.Uid, theirs.Attributes.FileMode = 502, 0o444
+	f.put(theirs)
+	zero := uint64(0)
+	var asked *filer_pb.Entry
+	refuse := func(e *filer_pb.Entry) fuse.Status {
+		asked = e
+		return fuse.EACCES
+	}
+	if _, st := wfs.NFSCreate(step(t), 1, "t", NFSUnchecked, NFSAttrs{Size: &zero}, [8]byte{}, 99, 100, refuse); st != fuse.EACCES {
+		t.Fatalf("refused: %v", st)
+	}
+	if asked == nil || asked.Attributes.Uid != 502 || string(f.lookup("/t").Content) != "keep" {
+		t.Fatalf("asked about %v; the file is %q", asked, f.lookup("/t").Content)
+	}
+	if _, st := wfs.NFSMkdir(step(t), 1, "d", NFSAttrs{}, 99, 100); st != fuse.OK {
+		t.Fatalf("mkdir: %v", st)
+	}
+	if _, st := wfs.NFSCreate(step(t), 1, "d", NFSUnchecked, NFSAttrs{}, [8]byte{}, 99, 100, nil); st != fuse.Status(syscall.EISDIR) {
+		t.Fatalf("a directory: %v", st)
+	}
+}
+
+// The times a create sets on its directory never undo a concurrent change
+// to it: the write expects what it read, and reads again on a conflict.
+func TestNFSDirectoryTimesKeepAConcurrentChange(t *testing.T) {
+	f := newStoreFiler()
+	wfs := newLinkTestWFS(t, f)
+	f.mu.Lock()
+	f.store("/d", &filer_pb.Entry{Name: "d", IsDirectory: true, Attributes: &filer_pb.FuseAttributes{FileMode: uint32(os.ModeDir | 0o755), Uid: 99, Gid: 100}})
+	f.mu.Unlock()
+	dir := wfs.inodeToPath.LookupLinked("/d", 1, os.ModeDir, "", 0, true)
+	var once sync.Once
+	f.beforeUpdate = func(r *filer_pb.UpdateEntryRequest) {
+		if r.Entry.Name == "d" {
+			once.Do(func() {
+				changed := f.lookup("/d")
+				changed.Attributes.FileMode = uint32(os.ModeDir | 0o700) // a chmod elsewhere
+				f.mu.Lock()
+				f.store("/d", changed)
+				f.mu.Unlock()
+			})
+		}
+	}
+	if _, st := wfs.NFSMkdir(step(t), dir, "sub", NFSAttrs{}, 99, 100); st != fuse.OK {
+		t.Fatalf("mkdir: %v", st)
+	}
+	if mode := os.FileMode(f.lookup("/d").Attributes.FileMode).Perm(); mode != 0o700 {
+		t.Fatalf("the directory's mode is %o", mode)
+	}
+}
+
+// The shared write handle's close lets its lease go at once, even while a
+// read holds the handle too, and flushes nothing; a read's close never
+// flushes the writes it shares.
+func TestNFSClosesNeverFlush(t *testing.T) {
+	f := newStoreFiler()
+	wfs := newLinkTestWFS(t, f)
+	f.put(plainEntry("a", 8001, "data"))
+	inode := seen(t, wfs, f, "a")
+	fh, st := wfs.NFSOpenForWrite(context.Background(), inode, 99, 100)
+	if st != fuse.OK {
+		t.Fatalf("open for write: %v", st)
+	}
+	if _, st := wfs.Write(nil, &fuse.WriteIn{InHeader: fuse.InHeader{NodeId: inode}, Fh: uint64(fh), Offset: 0, Size: 1}, []byte("x")); st != fuse.OK {
+		t.Fatalf("write: %v", st)
+	}
+	read, st := wfs.AcquireHandle(inode, syscall.O_RDONLY, 99, 100)
+	if st != fuse.OK {
+		t.Fatalf("open for read: %v", st)
+	}
+	creates := f.creates["/a"]
+	wfs.NFSCloseWrite(fh, true)
+	waitUnlocked(t, f)
+	if wfs.GetHandle(read.fh) == nil {
+		t.Fatal("the read's handle is gone")
+	}
+	wfs.NFSCloseRead(read.fh)
+	if f.creates["/a"] != creates {
+		t.Fatalf("%d flushes", f.creates["/a"]-creates)
+	}
+}
+
+// deniedFiler refuses the creates of a name with PermissionDenied.
+type deniedFiler struct {
+	*storeFiler
+	refuse string
+}
+
+func (q deniedFiler) CreateEntry(ctx context.Context, r *filer_pb.CreateEntryRequest) (*filer_pb.CreateEntryResponse, error) {
+	if r.Entry.Name == q.refuse {
+		return nil, status.Error(codes.PermissionDenied, "unsupported entry fields")
+	}
+	return q.storeFiler.CreateEntry(ctx, r)
+}
+
+// After LINK's promotion changed the source, a refusal of the new name
+// other than a quota or a cap leaves the outcome unknown: IO.
+func TestNFSLinkLaterRefusalIsIO(t *testing.T) {
+	f := newStoreFiler()
+	wfs := newLinkTestWFS(t, f)
+	f.put(plainEntry("a", 8001, "a"))
+	inode := seen(t, wfs, f, "a")
+	startFakeFiler(t, wfs, deniedFiler{f, "l"})
+	if st := wfs.NFSLink(step(t), inode, 1, "l", 99, 100); st != fuse.EIO {
+		t.Fatalf("link: %v", st)
 	}
 }

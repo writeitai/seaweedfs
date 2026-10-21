@@ -90,10 +90,11 @@ const (
 
 // NFSCreate creates a regular file name in the directory dir, exclusively
 // at the filer, with the path's write lease held. An existing file is the
-// result for UNCHECKED, with attrs' size applied; for EXCLUSIVE only when
-// its stored times hold verifier, the retry of a create whose reply was
-// lost; and EEXIST otherwise. The inode comes back with a lookup reference.
-func (wfs *WFS) NFSCreate(step NFSStep, dir uint64, name string, mode NFSCreateMode, attrs NFSAttrs, verifier [8]byte, uid, gid uint32) (uint64, fuse.Status) {
+// result for UNCHECKED, with attrs' size applied, once reuse allows the
+// entry as read under the lease; for EXCLUSIVE only when its stored times
+// hold verifier, the retry of a create whose reply was lost; and EEXIST
+// otherwise. The inode comes back with a lookup reference.
+func (wfs *WFS) NFSCreate(step NFSStep, dir uint64, name string, mode NFSCreateMode, attrs NFSAttrs, verifier [8]byte, uid, gid uint32, reuse func(*filer_pb.Entry) fuse.Status) (uint64, fuse.Status) {
 	dirPath, path, code := wfs.nfsChildPath(dir, name)
 	if code != fuse.OK {
 		return 0, code
@@ -136,10 +137,17 @@ func (wfs *WFS) NFSCreate(step NFSStep, dir uint64, name string, mode NFSCreateM
 	case err != nil:
 		wfs.inodeToPath.InvalidateChildrenCache(dirPath)
 		return 0, fuse.EIO
+	case existing.IsDirectory && mode == NFSUnchecked:
+		return 0, fuse.Status(syscall.EISDIR)
 	case existing.IsDirectory || os.FileMode(existing.GetAttributes().GetFileMode())&os.ModeType != 0:
 		return 0, fuse.Status(syscall.EEXIST)
 	case mode == NFSExclusive && !holdsVerifier(existing.Attributes, verifier):
 		return 0, fuse.Status(syscall.EEXIST)
+	}
+	if mode == NFSUnchecked && reuse != nil {
+		if code := reuse(existing); code != fuse.OK {
+			return 0, code
+		}
 	}
 	if mode == NFSUnchecked && attrs.Size != nil {
 		if existing, code = wfs.nfsUpdate(step, dirPath, existing, func(a *filer_pb.FuseAttributes, e *filer_pb.Entry) { truncateEntry(e, *attrs.Size, now) }); code != fuse.OK {
@@ -344,7 +352,9 @@ func (wfs *WFS) NFSRmdir(step NFSStep, dir uint64, name string) fuse.Status {
 		glog.Warningf("nfs rmdir %s: best-effort metadata apply failed: %v", path, applyErr)
 		wfs.inodeToPath.InvalidateChildrenCache(dirPath)
 	}
-	wfs.inodeToPath.RemovePath(path, func(inode uint64) { wfs.rememberRemovedDir(inode, entry) })
+	// Not remembered as a removed directory: no FUSE handle outlives it, and
+	// the NFS server never forgets an inode it issued.
+	wfs.inodeToPath.RemovePath(path, nil)
 	wfs.inodeToPath.TouchDirectory(dirPath)
 	wfs.nfsTouchDir(step, dirPath)
 	wfs.inodeToPath.AdjustSubdirCount(dirPath, -1)
@@ -503,7 +513,9 @@ func (wfs *WFS) NFSSetAttr(step NFSStep, inode uint64, attrs NFSAttrs, guard *ti
 	if !wfs.inodeToPath.HoldsEntry(inode, entry) {
 		return fuse.ENOENT
 	}
-	if guard != nil && (entry.Attributes.Ctime != guard.Unix() || entry.Attributes.CtimeNs != int32(guard.Nanosecond())) {
+	// The root's times are WFS's own, the time of each call (setRootAttr),
+	// so no guard can name them: the root's is not checked.
+	if guard != nil && inode != 1 && (entry.Attributes.Ctime != guard.Unix() || entry.Attributes.CtimeNs != int32(guard.Nanosecond())) {
 		return NFSNotSync
 	}
 	if attrs.Size != nil && *attrs.Size > filer.FileSize(entry) && wfs.IsOverQuotaWithUncommitted() {
@@ -547,16 +559,10 @@ func (wfs *WFS) NFSSetAttr(step NFSStep, inode uint64, attrs NFSAttrs, guard *ti
 		return code
 	}
 	if inode == 1 {
-		// WFS reports the root from these, as after a FUSE SetAttr.
-		if attrs.Mode != nil {
-			wfs.option.MountMode = os.FileMode(chmod(uint32(wfs.option.MountMode), *attrs.Mode))
-		}
-		if attrs.Uid != nil {
-			wfs.option.MountUid = *attrs.Uid
-		}
-		if attrs.Gid != nil {
-			wfs.option.MountGid = *attrs.Gid
-		}
+		// WFS reports the root from these, as after a FUSE SetAttr, as the
+		// filer acknowledged them.
+		wfs.option.MountMode = os.FileMode(chmod(uint32(wfs.option.MountMode), updated.Attributes.FileMode))
+		wfs.option.MountUid, wfs.option.MountGid = updated.Attributes.Uid, updated.Attributes.Gid
 	}
 	if attrs.Atime != nil || clearVerifier {
 		// WFS keeps access times in memory; GetAttr reports this one.
@@ -628,6 +634,30 @@ func (wfs *WFS) NFSOpenForWrite(ctx context.Context, inode uint64, uid, gid uint
 		return 0, code
 	}
 	return fh.fh, fuse.OK
+}
+
+// NFSCloseRead lets go of a handle an NFS read opened. It never flushes:
+// what the handle holds dirty is the NFS server's shared write handle's,
+// which flushes it under its own rules.
+func (wfs *WFS) NFSCloseRead(fh FileHandleId) { wfs.ReleaseHandle(fh) }
+
+// NFSCloseWrite lets go of the shared write handle NFSOpenForWrite opened:
+// its lease at once, within nfsUnlockTimeout, whoever else holds the
+// handle, and without a flush; discard also drops what it holds dirty,
+// after a flush that failed.
+func (wfs *WFS) NFSCloseWrite(id FileHandleId, discard bool) {
+	if fh := wfs.GetHandle(id); fh != nil {
+		lock := wfs.fhLockTable.AcquireLock("nfsCloseWrite", fh.fh, util.ExclusiveLock)
+		if fh.dlmLock != nil {
+			fh.dlmLock.StopWithin(nfsUnlockTimeout)
+			fh.dlmLock = nil
+		}
+		if discard {
+			fh.ResetDirtyPages()
+		}
+		wfs.fhLockTable.ReleaseLock(fh.fh, lock)
+	}
+	wfs.ReleaseHandle(id)
 }
 
 // acquireWriteLeaseContext is acquireWriteLease bounded by ctx.
@@ -764,7 +794,10 @@ func (wfs *WFS) nfsLockTarget(ctx context.Context, path util.FullPath) (*filer_p
 }
 
 // nfsTouchDir sets a directory's modification and change times, as a FUSE
-// create or remove does, with one call whose failure is only logged.
+// create or remove does. The write expects the entry it read from the
+// filer, so a concurrent change to the directory is kept; one conflict is
+// read again, and a second, or any failure, only logged: the times are a
+// courtesy, never the mutation's outcome.
 func (wfs *WFS) nfsTouchDir(step NFSStep, dirPath util.FullPath) {
 	if wfs.option.WritebackCache {
 		wfs.touchDirMtimeCtimeLocal(dirPath)
@@ -773,31 +806,20 @@ func (wfs *WFS) nfsTouchDir(step NFSStep, dirPath util.FullPath) {
 	if string(dirPath) == wfs.option.FilerMountRootPath {
 		return
 	}
-	// From the cache when it has the directory, else from the filer within
-	// the step.
-	var dirEntry *filer_pb.Entry
-	if cached, _, err := wfs.metaCache.FindEntry(context.Background(), dirPath); err == nil && cached != nil {
-		dirEntry = cached.ToProtoEntry()
-	} else if dirEntry, err = wfs.lookupOnce(step.Mutate, dirPath); err != nil {
-		return
-	}
-	now := time.Now()
-	dirEntry.Attributes.Mtime, dirEntry.Attributes.MtimeNs = now.Unix(), int32(now.Nanosecond())
-	dirEntry.Attributes.Ctime, dirEntry.Attributes.CtimeNs = now.Unix(), int32(now.Nanosecond())
-	parent, _ := dirPath.DirAndName()
-	wfs.mapPbIdFromLocalToFiler(dirEntry)
-	resp, err := wfs.updateEntryOnce(step.Mutate, &filer_pb.UpdateEntryRequest{Directory: parent, Entry: dirEntry, Signatures: []int32{wfs.signature}})
-	if err != nil {
-		glog.V(1).Infof("nfs: the times of %s: %v", dirPath, err)
-		return
-	}
-	event := resp.GetMetadataEvent()
-	if event == nil {
-		event = metadataUpdateEvent(parent, dirEntry)
-		event.TsNs = ackVersionTsNs(resp)
-	}
-	if applyErr := wfs.applyLocalMetadataEvent(context.Background(), event); applyErr != nil {
-		wfs.inodeToPath.InvalidateChildrenCache(util.FullPath(parent))
+	dir, _ := dirPath.DirAndName()
+	for range 2 {
+		read, err := wfs.lookupOnce(step.Mutate, dirPath)
+		if err != nil {
+			glog.V(1).Infof("nfs: the times of %s: %v", dirPath, err)
+			return
+		}
+		_, code := wfs.nfsUpdate(step, util.FullPath(dir), read, func(a *filer_pb.FuseAttributes, _ *filer_pb.Entry) {
+			now := time.Now()
+			a.Mtime, a.MtimeNs = now.Unix(), int32(now.Nanosecond())
+		})
+		if code != fuse.Status(syscall.ESTALE) {
+			return
+		}
 	}
 }
 
@@ -890,11 +912,12 @@ func nfsReadStatus(err error) fuse.Status {
 	return nfsCallStatus(err, false)
 }
 
-// nfsCallStatus is a mutation call's error as a status. Refusals the
-// gateway names are mapped to their meaning; when the call was the first
-// that could change anything (first), a refusal for the metadata rate or an
-// unavailable ledger changed nothing and can be retried later. Anything
-// else, a reply that never came included, is EIO: the outcome is unknown.
+// nfsCallStatus is a mutation call's error as a status. When the call was
+// the first that could change anything (first), refusals the gateway names
+// are mapped to their meaning, and one for the metadata rate changed
+// nothing and can be retried later. A later call's quota and size-cap
+// refusals are named too. Anything else, a reply that never came included,
+// is EIO: the outcome is unknown.
 func nfsCallStatus(err error, first bool) fuse.Status {
 	msg := err.Error()
 	switch code := status.Code(err); {
@@ -907,6 +930,10 @@ func nfsCallStatus(err error, first bool) fuse.Status {
 		return fuse.Status(syscall.EFBIG)
 	case code == codes.ResourceExhausted:
 		return fuse.Status(syscall.EDQUOT) // a quota or spending cap
+	case !first:
+		// After an earlier call changed things, only a quota or a cap is
+		// named; anything else leaves the outcome unknown.
+		return fuse.EIO
 	case code == codes.PermissionDenied && strings.Contains(msg, "read-only"):
 		return fuse.EROFS
 	case code == codes.PermissionDenied:
