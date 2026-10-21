@@ -139,7 +139,9 @@ func (wfs *WFS) linkHeld(in *fuse.LinkIn, sourceInode uint64, oldEntryPath, newP
 	var read *filer_pb.Entry
 	var err error
 	if step != nil {
-		read, err = wfs.lookupOnce(step.Prepare, oldEntryPath)
+		if read, err = wfs.lookupOnce(step.Prepare, oldEntryPath); err == nil {
+			wfs.mapPbIdFromLocalToFiler(read) // as GetEntry returns it
+		}
 	} else {
 		read, _, _, err = filer_pb.GetEntry(context.Background(), wfs, oldEntryPath)
 	}
