@@ -157,7 +157,7 @@ func (wfs *WFS) listEntryAfter(dirPath util.FullPath, entry *filer.Entry, plus b
 	}
 	listed := &ListedEntry{Name: name, StoredInode: entry.Inode}
 	if !plus {
-		listed.Inode = wfs.inodeToPath.InodeForListing(childPath, entry.Crtime.Unix(), entry.Inode)
+		listed.Inode = wfs.inodeToPath.InodeForListing(childPath, entry.Crtime.Unix(), EntryKind(entry.IsDirectory(), entry.Mode), string(entry.HardLinkId), entry.Inode)
 		return add(listed)
 	}
 	// The reference is taken now and given back if add refuses the entry,

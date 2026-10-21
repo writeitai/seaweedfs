@@ -135,7 +135,6 @@ func (wfs *WFS) doFlush(ctx context.Context, fh *FileHandle, uid, gid uint32, al
 	// flush works at fh level
 	fileFullPath := fh.FullPath()
 	fh.RememberPath(fileFullPath)
-	dir, name := fileFullPath.DirAndName()
 	// send the data to the OS
 	glog.V(4).Infof("doFlush %s fh %d", fileFullPath, fh.fh)
 
@@ -166,6 +165,10 @@ func (wfs *WFS) doFlush(ctx context.Context, fh *FileHandle, uid, gid uint32, al
 		}
 	}
 
+	if afterFlushData != nil {
+		afterFlushData(fh)
+	}
+
 	if !fh.dirtyMetadata {
 		return fuse.OK
 	}
@@ -182,7 +185,9 @@ func (wfs *WFS) doFlush(ctx context.Context, fh *FileHandle, uid, gid uint32, al
 	}
 
 	if err := retryMetadataFlushIf(ctx, func() error {
-		return wfs.flushMetadataToFiler(ctx, fh, dir, name, uid, gid)
+		// The destination is resolved under the handle lock (Mountable):
+		// a rename during the upload above moves it.
+		return wfs.flushMetadataToFiler(ctx, fh, "", "", uid, gid)
 	}, func(err error) bool {
 		var refused syscall.Errno
 		return !errors.As(err, &refused) // a refusal stands (Mountable)
@@ -211,12 +216,19 @@ func (wfs *WFS) doFlush(ctx context.Context, fh *FileHandle, uid, gid uint32, al
 // When -dlm is enabled, the distributed lock is already held by the FileHandle
 // from open-for-write through close, so no additional distributed lock is
 // needed here. The local fhLockTable lock below serializes within this mount.
+//
+// Mountable: with dir and name empty, the destination is the handle's path
+// as it is under the handle lock. Either way, that destination is the one
+// checked, and written to.
 func (wfs *WFS) flushMetadataToFiler(ctx context.Context, fh *FileHandle, dir, name string, uid, gid uint32) error {
-	fileFullPath := fh.FullPath()
-	glog.V(4).Infof("flushMetadataToFiler %s/%s inode %d fh %d", dir, name, fh.inode, fh.fh)
-
 	fhActiveLock := fh.wfs.fhLockTable.AcquireLock("doFlush", fh.fh, util.ExclusiveLock)
 	defer fh.wfs.fhLockTable.ReleaseLock(fh.fh, fhActiveLock)
+
+	if dir == "" && name == "" {
+		dir, name = fh.FullPath().DirAndName()
+	}
+	fileFullPath := util.FullPath(dir).Child(name)
+	glog.V(4).Infof("flushMetadataToFiler %s inode %d fh %d", fileFullPath, fh.inode, fh.fh)
 
 	// Re-check under the lock: Unlink sets the flag under it, so a flush that
 	// was already past the earlier check cannot write the entry back after
@@ -393,3 +405,7 @@ func (wfs *WFS) maybeMergeChunks(fileFullPath util.FullPath, compactedChunks []*
 
 	return newChunks, nil
 }
+
+// afterFlushData, when set (by tests), runs in doFlush once the data is
+// uploaded, before the metadata is.
+var afterFlushData func(fh *FileHandle)

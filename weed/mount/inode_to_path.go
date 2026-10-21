@@ -336,17 +336,27 @@ func (i *InodeToPath) IncrementNlookup(inode uint64) bool {
 // InodeForListing returns the inode number a readdir should report for path
 // without entering it in the table. Nothing is reserved, so the collision probe
 // Lookup does is skipped: the worst case is a repeated st_ino in one listing.
-func (i *InodeToPath) InodeForListing(path util.FullPath, unixTime int64, possibleInode uint64) uint64 {
+//
+// Mountable (writeitai/seaweedfs, branch mountable): by the identity rule
+// (Holds), as a lookup would choose. The path's inode is reported only if
+// it holds the listed object, and a number another object holds is
+// probed past, so two objects never share one in a listing.
+func (i *InodeToPath) InodeForListing(path util.FullPath, unixTime int64, kind os.FileMode, linkID string, possibleInode uint64) uint64 {
 	i.RLock()
-	inode, found := i.path2inode[path]
-	i.RUnlock()
-	if found {
+	defer i.RUnlock()
+	if inode, found := i.path2inode[path]; found && !i.replacedLocked(inode, kind, linkID, possibleInode) {
 		return inode
 	}
-	if possibleInode != 0 {
-		return possibleInode
+	inode := possibleInode
+	if inode == 0 {
+		inode = path.AsInode(unixTime)
 	}
-	return path.AsInode(unixTime)
+	for {
+		if _, taken := i.inode2path[inode]; inode > 1 && (!taken || !i.replacedLocked(inode, kind, linkID, possibleInode)) {
+			return inode
+		}
+		inode++
+	}
 }
 
 func (i *InodeToPath) AllocateInode(path util.FullPath, unixTime int64) uint64 {

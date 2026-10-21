@@ -176,10 +176,11 @@ func (wfs *WFS) Link(cancel <-chan struct{}, in *fuse.LinkIn, name string, out *
 				Entry:      oldEntry,
 				Signatures: []int32{wfs.signature},
 			}
-			if _, rollbackErr := wfs.streamUpdateEntry(ctx, rollbackReq); rollbackErr != nil {
+			if rollbackResp, rollbackErr := wfs.streamUpdateEntry(ctx, rollbackReq); rollbackErr != nil {
 				glog.Warningf("link rollback %s: %v", oldEntryPath, rollbackErr)
 			} else {
 				linked = false
+				wfs.settleLinkRollback(ctx, sourceInode, oldParentPath, rollbackReq.Entry, rollbackResp, group)
 			}
 		} else {
 			createEvent := createResp.GetMetadataEvent()
@@ -278,4 +279,29 @@ func (wfs *WFS) syncHardLinkSiblings(inode uint64, authoritativeEntry *filer_pb.
 	// writes onto the same /dev/fuse fd that the kernel is still waiting to
 	// read the Link reply from — causing a self-notify deadlock. The kernel
 	// will re-stat siblings once its attr-cache TTL expires.
+}
+
+// settleLinkRollback brings this mount back to the source as the rolled
+// back update left it, before the conversion ends: the cache takes the
+// acknowledgement, and an open handle that took the promoted entry
+// meanwhile (from the subscription) holds the source standalone again, so
+// neither a lookup nor a flush takes it for a hard link (Mountable).
+func (wfs *WFS) settleLinkRollback(ctx context.Context, inode uint64, dir string, entry *filer_pb.Entry, resp *filer_pb.UpdateEntryResponse, group []byte) {
+	event := resp.GetMetadataEvent()
+	if event == nil {
+		event = metadataUpdateEvent(dir, entry)
+	}
+	if applyErr := wfs.applyLocalMetadataEvent(ctx, event); applyErr != nil {
+		glog.Warningf("link rollback %s: best-effort metadata apply failed: %v", util.FullPath(dir).Child(entry.Name), applyErr)
+		wfs.inodeToPath.InvalidateChildrenCache(util.FullPath(dir))
+	}
+	if fh, found := wfs.fhMap.FindFileHandle(inode); found {
+		fhActiveLock := wfs.fhLockTable.AcquireLock("Link", fh.fh, util.ExclusiveLock)
+		fh.UpdateEntry(func(open *filer_pb.Entry) {
+			if open != nil && bytes.Equal(open.HardLinkId, group) {
+				open.HardLinkId, open.HardLinkCounter = entry.HardLinkId, entry.HardLinkCounter
+			}
+		})
+		wfs.fhLockTable.ReleaseLock(fh.fh, fhActiveLock)
+	}
 }
