@@ -2,6 +2,7 @@ package mount
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"syscall"
 	"time"
@@ -238,22 +239,30 @@ func (wfs *WFS) Unlink(cancel <-chan struct{}, header *fuse.InHeader, name strin
 	// siblings to counter-1, leaving the cache one higher than the blob.
 	// Re-load the entry under the lock so we see any sibling update a
 	// prior holder just applied.
+	//
+	// Mountable: the group's -dlm lock serialises this with other mounts'
+	// changes to the group too, and the entry is read again from the filer
+	// under it, the shared record included (architecture §4 obligation 13
+	// in writeitai/fsit).
 	if entry != nil && len(entry.HardLinkId) > 0 {
-		hlKey := string(entry.HardLinkId)
-		lock := wfs.hardLinkLockTable.AcquireLock("unlink", hlKey, util.ExclusiveLock)
-		defer wfs.hardLinkLockTable.ReleaseLock(hlKey, lock)
+		release, lockCode := wfs.lockHardLinkGroup(entry.HardLinkId)
+		if lockCode != fuse.OK {
+			return lockCode
+		}
+		defer release()
 		// If another thread unlinked the entry while we waited for the
 		// lock, the file is already gone — return OK like the initial
 		// maybeLoadEntry path above. Do not fall back to the stale
 		// pre-lock snapshot: proceeding with its HardLinkCounter would
 		// reintroduce the stale-base update the lock is meant to prevent.
-		fresh, _, freshCode := wfs.maybeLoadEntry(entryFullPath)
-		if freshCode == fuse.ENOENT {
+		fresh, _, _, freshErr := filer_pb.GetEntry(context.Background(), wfs, entryFullPath)
+		if errors.Is(freshErr, filer_pb.ErrNotFound) {
 			return fuse.OK
 		}
-		if freshCode != fuse.OK {
-			return freshCode
+		if freshErr != nil || fresh == nil {
+			return fuse.EIO
 		}
+		wfs.mapPbIdFromFilerToLocal(fresh)
 		entry = fresh
 	}
 

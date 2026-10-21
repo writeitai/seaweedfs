@@ -17,7 +17,8 @@ func linkTestSource(t *testing.T, wfs *WFS, name string, persistedInode uint64) 
 	t.Helper()
 
 	entry := &filer_pb.Entry{
-		Name: name,
+		Name:    name,
+		Content: []byte("hello world!"),
 		Attributes: &filer_pb.FuseAttributes{
 			FileMode: 0o644,
 			FileSize: 12,
@@ -30,6 +31,11 @@ func linkTestSource(t *testing.T, wfs *WFS, name string, persistedInode uint64) 
 	}
 	if err := wfs.metaCache.InsertEntry(context.Background(), filer.FromPbEntry("/", entry), 0); err != nil {
 		t.Fatalf("InsertEntry: %v", err)
+	}
+	if err := wfs.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+		return filer_pb.CreateEntry(context.Background(), client, &filer_pb.CreateEntryRequest{Directory: "/", Entry: entry})
+	}); err != nil {
+		t.Fatalf("CreateEntry: %v", err)
 	}
 
 	fullPath := util.FullPath("/").Child(name)
@@ -64,7 +70,7 @@ func doLink(t *testing.T, wfs *WFS, oldNodeId uint64, name string) *fuse.EntryOu
 // https://github.com/seaweedfs/seaweedfs/issues/8404 reports. The reply has to
 // name the node id the kernel already holds for the source.
 func TestLinkReportsKernelNodeIdWhenEntryHasNoPersistedInode(t *testing.T) {
-	wfs, _ := newCreateTestWFS(t)
+	wfs := newLinkTestWFS(t, newStoreFiler())
 
 	sourcePath, sourceInode := linkTestSource(t, wfs, "s3-uploaded.txt", 0)
 
@@ -122,7 +128,7 @@ func TestLinkReportsKernelNodeIdWhenEntryHasNoPersistedInode(t *testing.T) {
 // must keep naming the node id the kernel holds, which for this case is the
 // same number.
 func TestLinkReportsKernelNodeIdWhenEntryHasPersistedInode(t *testing.T) {
-	wfs, _ := newCreateTestWFS(t)
+	wfs := newLinkTestWFS(t, newStoreFiler())
 
 	_, sourceInode := linkTestSource(t, wfs, "mount-created.txt", 8404)
 	if sourceInode != 8404 {
@@ -169,7 +175,7 @@ func cachedLink(t *testing.T, wfs *WFS, path util.FullPath) *filer.Entry {
 // which is what the second half of this test pins down: the sync has to be
 // keyed by the kernel node id, the number inodeToPath is indexed by.
 func TestLinkSyncsHardLinkSiblingsOnThirdLink(t *testing.T) {
-	wfs, _ := newCreateTestWFS(t)
+	wfs := newLinkTestWFS(t, newStoreFiler())
 
 	sourcePath, sourceInode := linkTestSource(t, wfs, "s3-uploaded.txt", 0)
 
@@ -259,11 +265,11 @@ func TestLinkSyncsHardLinkSiblingsOnThirdLink(t *testing.T) {
 // throughout, and an open handle of it holds it as the link afterwards, so
 // it still reads.
 func TestLinkKeepsAnOpenSourceItsOwn(t *testing.T) {
-	wfs, _ := newCreateTestWFS(t)
+	wfs := newLinkTestWFS(t, newStoreFiler())
 	_, sourceInode := linkTestSource(t, wfs, "open.txt", 0)
 	fh, _ := wfs.fhMap.AcquireFileHandle(wfs, sourceInode, &filer_pb.Entry{
-		Name: "open.txt", Content: []byte("hello"),
-		Attributes: &filer_pb.FuseAttributes{FileMode: 0o644, FileSize: 5, Crtime: 1, Mtime: 1},
+		Name: "open.txt", Content: []byte("hello world!"),
+		Attributes: &filer_pb.FuseAttributes{FileMode: 0o644, FileSize: 12, Crtime: 1, Mtime: 1, Uid: 99, Gid: 100},
 	}, 0, 0)
 	doLink(t, wfs, sourceInode, "second.txt")
 	if !wfs.handleHolds(fh) {
@@ -274,7 +280,7 @@ func TestLinkKeepsAnOpenSourceItsOwn(t *testing.T) {
 	if st != fuse.OK {
 		t.Fatalf("ReadAs after the link: %v", st)
 	}
-	if data, _ := r.Bytes(buf); string(data) != "hello" {
+	if data, _ := r.Bytes(buf); string(data) != "hello world!" {
 		t.Fatalf("read %q", data)
 	}
 }
