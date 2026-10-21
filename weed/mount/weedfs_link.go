@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"strings"
 	"syscall"
 	"time"
 
@@ -80,13 +81,18 @@ func (wfs *WFS) Link(cancel <-chan struct{}, in *fuse.LinkIn, name string, out *
 	// Open takes from loading the entry to registering its handle, and the
 	// open handle's own lock, both held to the end, so no handle is left
 	// with the entry from before the promotion.
-	if len(oldEntry.HardLinkId) > 0 {
-		release, code := wfs.lockHardLinkGroup(oldEntry.HardLinkId)
-		if code != fuse.OK {
-			return code
-		}
-		defer release()
+	// A standalone source's group is allocated here, and locked before the
+	// promotion makes it visible: another mount linking into it waits until
+	// the new name exists, or the counter is back.
+	group := oldEntry.HardLinkId
+	if len(group) == 0 {
+		group = filer.NewHardLinkId()
 	}
+	release, code := wfs.lockHardLinkGroup(group)
+	if code != fuse.OK {
+		return code
+	}
+	defer release()
 	inodeLock := wfs.inodeLocks().AcquireLock("link", sourceInode, util.ExclusiveLock)
 	defer wfs.inodeLocks().ReleaseLock(sourceInode, inodeLock)
 	fh, fhLock, code := wfs.lockFlushedHandle(sourceInode, in.Uid, in.Gid)
@@ -118,6 +124,9 @@ func (wfs *WFS) Link(cancel <-chan struct{}, in *fuse.LinkIn, name string, out *
 	if read == nil || !wfs.inodeToPath.HoldsEntry(sourceInode, read) {
 		return fuse.ENOENT
 	}
+	if len(read.HardLinkId) > 0 && !bytes.Equal(read.HardLinkId, group) {
+		return fuse.ENOENT // made a hard link of another group meanwhile
+	}
 
 	// Promote the source: hard-link mode, its counter raised, before the new
 	// name exists, so its chunks belong to the shared record from here and a
@@ -126,14 +135,13 @@ func (wfs *WFS) Link(cancel <-chan struct{}, in *fuse.LinkIn, name string, out *
 	promoted := proto.Clone(read).(*filer_pb.Entry)
 	converting := len(promoted.HardLinkId) == 0
 	if converting {
-		promoted.HardLinkId = filer.NewHardLinkId()
+		promoted.HardLinkId = group
 		promoted.HardLinkCounter = 1
 	}
 	promoted.HardLinkCounter++
 	linkNow := time.Now()
 	promoted.Attributes.Ctime = linkNow.Unix()
 	promoted.Attributes.CtimeNs = int32(linkNow.Nanosecond())
-	group := promoted.HardLinkId
 	glog.V(4).Infof("Link: %s -> %s/%s HardLinkId %x counter=%d", oldEntryPath, newParentPath, name, group, promoted.HardLinkCounter)
 	if converting {
 		wfs.inodeToPath.BeginLink(sourceInode, group)
@@ -153,7 +161,7 @@ func (wfs *WFS) Link(cancel <-chan struct{}, in *fuse.LinkIn, name string, out *
 	})
 	if err != nil {
 		glog.V(0).Infof("Link %v: promoting the source: %v", oldEntryPath, err)
-		if code := status.Code(err); code == codes.FailedPrecondition || code == codes.NotFound {
+		if code := status.Code(err); code == codes.FailedPrecondition || isNotFound(err) {
 			return fuse.ENOENT
 		}
 		return fuse.EIO
@@ -321,3 +329,10 @@ func (wfs *WFS) holdAcked(fh *FileHandle, acked *filer_pb.Entry, resp *filer_pb.
 // beforeLinkReload, when set (by tests), runs in Link once it holds the
 // source handle's lock, before it reads the source again.
 var beforeLinkReload func()
+
+// isNotFound reports whether a filer call failed for a missing entry: a
+// NotFound status, or the filer's own wording, which its UpdateEntry
+// returns untyped (Mountable).
+func isNotFound(err error) bool {
+	return status.Code(err) == codes.NotFound || strings.Contains(err.Error(), filer_pb.ErrNotFound.Error())
+}

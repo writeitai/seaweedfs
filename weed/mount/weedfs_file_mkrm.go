@@ -123,7 +123,20 @@ func (wfs *WFS) Create(cancel <-chan struct{}, in *fuse.CreateIn, name string, o
 		}
 		return code
 	} else {
-		inode = wfs.inodeToPath.Lookup(entryFullPath, newEntry.Attributes.Crtime, false, false, inode, true)
+		// The binding and the handle are made under the inode's lock, as an
+		// open's are: a Link of the new file, by another process that looked
+		// it up while this create's reply was on its way, comes before or
+		// after both. When it came before, the file is that hard link
+		// (Mountable: see Link).
+		inodeLock := wfs.inodeLocks().AcquireLock("create", inode, util.SharedLock)
+		defer wfs.inodeLocks().ReleaseLock(inode, inodeLock)
+		if wfs.option.EagerFilerCreate {
+			if latest, _, st := wfs.maybeLoadEntry(entryFullPath); st == fuse.OK && len(latest.HardLinkId) > 0 &&
+				latest.GetAttributes().GetInode() == newEntry.Attributes.Inode {
+				newEntry = latest
+			}
+		}
+		inode = wfs.inodeToPath.LookupLinked(entryFullPath, newEntry.Attributes.Crtime, PbEntryKind(newEntry), string(newEntry.HardLinkId), inode, true)
 	}
 
 	wfs.outputPbEntry(&out.EntryOut, inode, newEntry)
@@ -451,12 +464,14 @@ func (wfs *WFS) createRegularFile(dirFullPath util.FullPath, name string, mode u
 
 	glog.V(1).Infof("createFile: %v", request)
 	resp, err := wfs.streamCreateEntry(context.Background(), request)
+	if err == nil {
+		// The inode the filer stored, before anything caches the entry
+		// (Mountable).
+		inode, err = wfs.adoptStoredInode(entryFullPath, newEntry, resp)
+	}
 	if err != nil {
 		glog.V(0).Infof("createFile %s: %v", entryFullPath, err)
 	} else {
-		// The inode the filer stored, before anything caches the entry
-		// (Mountable).
-		inode = wfs.adoptStoredInode(entryFullPath, newEntry, resp)
 		event := resp.GetMetadataEvent()
 		if event == nil {
 			event = metadataCreateEvent(string(dirFullPath), newEntry)

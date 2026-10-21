@@ -14,6 +14,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/util"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 )
 
 // The invariants of Link in architecture §4 obligation 13 (writeitai/fsit,
@@ -77,6 +78,108 @@ func TestLinkDestinationCreatedFirst(t *testing.T) {
 	}
 	if !wfs.inodeToPath.Holds(src, 0, "", 8001) {
 		t.Fatal("the source is no longer itself")
+	}
+}
+
+// After a rolled-back Link, the mount has the source as the filer does:
+// the namespace, a lookup and an open handle all find it, standalone.
+func TestLinkRollbackReachesTheMount(t *testing.T) {
+	f := newStoreFiler()
+	wfs := newLinkTestWFS(t, f)
+	f.put(plainEntry("a", 8001, "source"))
+	f.put(plainEntry("b", 9000, "theirs"))
+	src := seen(t, wfs, f, "a")
+	fh, _ := wfs.fhMap.AcquireFileHandle(wfs, src, f.lookup("/a"), 0, 0)
+	fh.RememberPath("/a")
+	if st := tryLink(wfs, src, "b"); st != fuse.Status(syscall.EEXIST) {
+		t.Fatalf("Link: %v", st)
+	}
+	if e, st := wfs.NamespaceEntry(src); st != fuse.OK || len(e.HardLinkId) != 0 {
+		t.Fatalf("NamespaceEntry: %v", st)
+	}
+	var out fuse.EntryOut
+	if st := wfs.Lookup(nil, &fuse.InHeader{NodeId: 1}, "a", &out); st != fuse.OK || out.NodeId != src {
+		t.Fatalf("lookup %v: inode %d, want %d", st, out.NodeId, src)
+	}
+	if !wfs.handleHolds(fh) || len(fh.GetEntry().GetEntry().HardLinkId) != 0 {
+		t.Fatal("the open handle does not hold the source standalone")
+	}
+	fh.dirtyMetadata = true
+	if st := wfs.doFlush(context.Background(), fh, 99, 100, false); st != fuse.OK {
+		t.Fatalf("flush: %v", st)
+	}
+	if a := f.lookup("/a"); len(a.HardLinkId) != 0 {
+		t.Fatal("the flush made the source a hard link again")
+	}
+}
+
+// A first Link of a standalone file locks the group it allocates before
+// the promotion shows it: another mount linking into the group meanwhile
+// waits for the new name, so the counter is right.
+func TestLinkLocksANewGroupBeforeShowingIt(t *testing.T) {
+	f := newStoreFiler()
+	one, two := newLinkTestWFS(t, f), newLinkTestWFS(t, f)
+	f.put(plainEntry("a", 8001, "source"))
+	src := seen(t, one, f, "a")
+	var once sync.Once
+	other := make(chan fuse.Status, 1)
+	f.beforeCreate = func(r *filer_pb.CreateEntryRequest) {
+		if r.Entry.Name != "b" {
+			return
+		}
+		once.Do(func() {
+			// The other mount sees the promoted source and links it.
+			promoted := seen(t, two, f, "a")
+			go func() { other <- tryLink(two, promoted, "c") }()
+			time.Sleep(300 * time.Millisecond)
+		})
+	}
+	if st := tryLink(one, src, "b"); st != fuse.OK {
+		t.Fatalf("Link: %v", st)
+	}
+	if st := <-other; st != fuse.OK {
+		t.Fatalf("the other mount's Link: %v", st)
+	}
+	if a := f.lookup("/a"); a.HardLinkCounter != 3 {
+		t.Fatalf("counter %d, want 3 (a, b, c)", a.HardLinkCounter)
+	}
+}
+
+// A Link of a file whose eager create's reply is still on its way: the
+// create then reports the file as that hard link, on the same inode, and
+// its handle holds it so.
+func TestCreateAfterALinkOfTheNewFile(t *testing.T) {
+	f := newStoreFiler()
+	wfs := newLinkTestWFS(t, f)
+	wfs.option.EagerFilerCreate = true
+	var linkedInode uint64
+	var once sync.Once
+	f.afterCreate = func(r *filer_pb.CreateEntryRequest) (*filer_pb.CreateEntryResponse, error) {
+		f.mu.Lock()
+		stored := f.find(util.FullPath(r.Directory).Child(r.Entry.Name))
+		resp := &filer_pb.CreateEntryResponse{MetadataEvent: f.event(r.Directory, stored), LogTsNs: f.logTsNs}
+		f.mu.Unlock()
+		if r.Entry.Name == "new" {
+			once.Do(func() {
+				// Another process looks the new file up and links it.
+				linkedInode = seen(t, wfs, f, "new")
+				if st := tryLink(wfs, linkedInode, "alias"); st != fuse.OK {
+					t.Errorf("Link: %v", st)
+				}
+			})
+		}
+		return resp, nil
+	}
+	h := fuse.InHeader{NodeId: 1, Caller: fuse.Caller{Owner: fuse.Owner{Uid: 99, Gid: 100}}}
+	var out fuse.CreateOut
+	if st := wfs.Create(nil, &fuse.CreateIn{InHeader: h, Flags: syscall.O_WRONLY | syscall.O_CREAT, Mode: 0o644}, "new", &out); st != fuse.OK {
+		t.Fatalf("Create: %v", st)
+	}
+	if out.NodeId != linkedInode {
+		t.Fatalf("Create reported inode %d, the link %d", out.NodeId, linkedInode)
+	}
+	if fh := wfs.GetHandle(FileHandleId(out.Fh)); len(fh.GetEntry().GetEntry().HardLinkId) == 0 {
+		t.Fatal("the created file's handle holds it standalone")
 	}
 }
 
@@ -253,8 +356,10 @@ func TestLinkWaitsForAnOpenInFlight(t *testing.T) {
 	}
 }
 
-// A metadata event from before the promotion, delivered late, does not
-// replace the handle's promoted entry, under a cached parent or not.
+// A metadata event from before the promotion, delivered late through the
+// production invalidation path, does not replace the handle's promoted
+// entry, under a cached parent or not: the binding stays, and the handle
+// still flushes, as the hard link.
 func TestLinkFencesALatePrePromotionEvent(t *testing.T) {
 	for _, cached := range []bool{true, false} {
 		f := newStoreFiler()
@@ -262,7 +367,8 @@ func TestLinkFencesALatePrePromotionEvent(t *testing.T) {
 		f.put(plainEntry("a", 8001, "source"))
 		src := seen(t, wfs, f, "a")
 		before := f.lookup("/a")
-		fh, _ := wfs.fhMap.AcquireFileHandle(wfs, src, before, 0, 0)
+		fh, _ := wfs.fhMap.AcquireFileHandle(wfs, src, proto.Clone(before).(*filer_pb.Entry), 0, 0)
+		fh.RememberPath("/a")
 		if st := tryLink(wfs, src, "b"); st != fuse.OK {
 			t.Fatalf("Link: %v", st)
 		}
@@ -270,7 +376,7 @@ func TestLinkFencesALatePrePromotionEvent(t *testing.T) {
 			wfs.inodeToPath.InvalidateChildrenCache("/")
 		}
 		late := &filer_pb.SubscribeMetadataResponse{Directory: "/", TsNs: 1, EventNotification: &filer_pb.EventNotification{
-			OldEntry: &filer_pb.Entry{Name: "a"}, NewEntry: before, NewParentPath: "/",
+			OldEntry: &filer_pb.Entry{Name: "a"}, NewEntry: proto.Clone(before).(*filer_pb.Entry), NewParentPath: "/",
 		}}
 		if err := wfs.metaCache.ApplyMetadataResponse(context.Background(), late, meta_cache.SubscriberMetadataResponseApplyOptions); err != nil {
 			t.Fatalf("apply: %v", err)
@@ -278,6 +384,16 @@ func TestLinkFencesALatePrePromotionEvent(t *testing.T) {
 		wfs.metaCache.WaitForEntryInvalidations()
 		if len(fh.GetEntry().GetEntry().HardLinkId) == 0 || fh.isDeleted {
 			t.Fatalf("cached %v: the late event replaced the handle's entry", cached)
+		}
+		if p, st := wfs.inodeToPath.GetPath(src); st != fuse.OK || p != "/a" {
+			t.Fatalf("cached %v: the binding was dropped: %s %v", cached, p, st)
+		}
+		fh.dirtyMetadata = true
+		if st := wfs.doFlush(context.Background(), fh, 99, 100, false); st != fuse.OK {
+			t.Fatalf("cached %v: flush: %v", cached, st)
+		}
+		if a := f.lookup("/a"); len(a.HardLinkId) == 0 || a.HardLinkCounter != 2 {
+			t.Fatalf("cached %v: after the flush the source is %x/%d", cached, a.HardLinkId, a.HardLinkCounter)
 		}
 	}
 }

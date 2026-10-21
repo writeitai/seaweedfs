@@ -23,6 +23,7 @@ type upsertFiler struct {
 	entries   map[util.FullPath]*filer_pb.Entry
 	winners   map[util.FullPath]uint64
 	eventless bool
+	blind     bool // lookups fail
 }
 
 func (f *upsertFiler) CreateEntry(_ context.Context, r *filer_pb.CreateEntryRequest) (*filer_pb.CreateEntryResponse, error) {
@@ -54,6 +55,9 @@ func (f *upsertFiler) UpdateEntry(context.Context, *filer_pb.UpdateEntryRequest)
 func (f *upsertFiler) LookupDirectoryEntry(_ context.Context, r *filer_pb.LookupDirectoryEntryRequest) (*filer_pb.LookupDirectoryEntryResponse, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.blind {
+		return nil, status.Error(codes.Internal, "disk on fire")
+	}
 	if e := f.entries[util.FullPath(r.Directory).Child(r.Name)]; e != nil {
 		return &filer_pb.LookupDirectoryEntryResponse{Entry: e}, nil
 	}
@@ -97,5 +101,21 @@ func TestCreatesAdoptTheStoredInode(t *testing.T) {
 		if st := wfs.Symlink(nil, &h, "target", "link", &out); st != fuse.OK || out.Ino != 7003 {
 			t.Fatalf("eventless %v: Symlink %v, ino %d", eventless, st, out.Ino)
 		}
+	}
+}
+
+// When neither the acknowledgement nor a lookup tells the stored inode, the
+// create fails rather than report a number the filer may not store.
+func TestCreateFailsWithoutTheStoredInode(t *testing.T) {
+	wfs, _ := newCreateTestWFS(t)
+	filer := &upsertFiler{entries: map[util.FullPath]*filer_pb.Entry{}, winners: map[util.FullPath]uint64{}, eventless: true, blind: true}
+	startFakeFiler(t, wfs, filer)
+	h := fuse.InHeader{NodeId: 1, Caller: fuse.Caller{Owner: fuse.Owner{Uid: 99, Gid: 100}}}
+	var out fuse.EntryOut
+	if st := wfs.Mknod(nil, &fuse.MknodIn{InHeader: h, Mode: syscall.S_IFREG | 0o644}, "node", &out); st != fuse.EIO {
+		t.Fatalf("Mknod: %v, inode %d", st, out.Ino)
+	}
+	if _, found := wfs.inodeToPath.GetInode("/node"); found {
+		t.Fatal("the object was bound all the same")
 	}
 }

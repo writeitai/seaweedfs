@@ -61,7 +61,9 @@ func (wfs *WFS) Symlink(cancel <-chan struct{}, header *fuse.InHeader, target st
 	if err == nil {
 		// The inode the filer stored, before anything caches the entry
 		// (Mountable).
-		inode = wfs.adoptStoredInode(entryFullPath, request.Entry, resp)
+		inode, err = wfs.adoptStoredInode(entryFullPath, request.Entry, resp)
+	}
+	if err == nil {
 		event := resp.GetMetadataEvent()
 		if event == nil {
 			event = metadataCreateEvent(string(dirPath), request.Entry)

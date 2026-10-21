@@ -2,12 +2,15 @@ package mount
 
 import (
 	"context"
+	"fmt"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/cluster"
 	"github.com/seaweedfs/seaweedfs/weed/filer"
+	"github.com/seaweedfs/seaweedfs/weed/mount/meta_cache"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/util"
 	"google.golang.org/grpc/codes"
@@ -31,6 +34,7 @@ type storeFiler struct {
 	// update's evaluation and after a create's commit; afterCreate may
 	// replace the reply.
 	beforeUpdate func(*filer_pb.UpdateEntryRequest)
+	beforeCreate func(*filer_pb.CreateEntryRequest)
 	afterCreate  func(*filer_pb.CreateEntryRequest) (*filer_pb.CreateEntryResponse, error)
 	locks        map[string]string // lock name -> token
 }
@@ -94,6 +98,9 @@ func (f *storeFiler) LookupDirectoryEntry(_ context.Context, r *filer_pb.LookupD
 }
 
 func (f *storeFiler) CreateEntry(_ context.Context, r *filer_pb.CreateEntryRequest) (*filer_pb.CreateEntryResponse, error) {
+	if hook := f.beforeCreate; hook != nil {
+		hook(r)
+	}
 	p := util.FullPath(r.Directory).Child(r.Entry.Name)
 	f.mu.Lock()
 	f.creates[p]++
@@ -119,8 +126,13 @@ func (f *storeFiler) UpdateEntry(_ context.Context, r *filer_pb.UpdateEntryReque
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	current := f.find(p)
+	if current == nil && r.Entry.IsDirectory {
+		f.store(p, r.Entry) // a directory's times, the root's among them
+		return &filer_pb.UpdateEntryResponse{LogTsNs: f.logTsNs}, nil
+	}
 	if current == nil {
-		return nil, status.Errorf(codes.NotFound, "not found %s", p)
+		// As the filer answers: untyped (gRPC Unknown), in its own words.
+		return nil, fmt.Errorf("not found %s: %w", p, filer_pb.ErrNotFound)
 	}
 	for _, c := range r.GetCondition().GetClauses() {
 		if c.Kind == filer_pb.WriteCondition_IF_ENTRY_EQUAL && !entriesEqual(current, c.ExpectedEntry) {
@@ -190,5 +202,12 @@ func newLinkTestWFS(t *testing.T, filer *storeFiler) *WFS {
 	startFakeFiler(t, wfs, filer)
 	wfs.lockClient = cluster.NewLockClient(wfs.option.GrpcDialOption, wfs.option.FilerAddresses[0])
 	wfs.openMtimeCache = map[uint64][2]int64{}
+	// Events reach open handles as in production.
+	wfs.metaCache.Shutdown()
+	wfs.metaCache = meta_cache.NewMetaCache(filepath.Join(t.TempDir(), "meta"), wfs.option.UidGidMapper, "/", false,
+		func(path util.FullPath) { wfs.inodeToPath.MarkChildrenCached(path) },
+		func(path util.FullPath) bool { return wfs.inodeToPath.IsChildrenCached(path) },
+		wfs.onEntryInvalidation, nil)
+	t.Cleanup(wfs.metaCache.Shutdown)
 	return wfs
 }
