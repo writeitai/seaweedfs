@@ -467,12 +467,10 @@ func (wfs *WFS) persistEntry(ctx context.Context, fh *FileHandle, path util.Full
 			expected = storedForm(base)
 			expected.Name = request.Entry.Name // a rename moved the base too
 			wfs.mapPbIdFromLocalToFiler(expected)
-			// A hard link's counter is its group's, which other names
-			// change: the write keeps the one the filer had, never the
-			// handle's own copy, perhaps older.
-			if len(request.Entry.HardLinkId) > 0 {
-				request.Entry.HardLinkCounter = expected.HardLinkCounter
-			}
+			// The hard-link group and its counter belong to the group,
+			// which other names change: the write keeps them as the filer
+			// had them, never the handle's own copy, perhaps older.
+			request.Entry.HardLinkId, request.Entry.HardLinkCounter = expected.HardLinkId, expected.HardLinkCounter
 		}
 		request.Condition = entryCondition(expected)
 		resp, err := wfs.createEntryOnce(ctx, request)

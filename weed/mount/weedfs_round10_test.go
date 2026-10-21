@@ -482,9 +482,16 @@ func TestUnchangedFlushIsOneCreate(t *testing.T) {
 	}
 }
 
-// A dirty handle of a hard link whose group another name changed meanwhile
-// writes the group's counter as the filer has it, never its own older copy.
+// A dirty handle of a hard link whose group another name changed meanwhile,
+// a third link made or a sibling unlinked, writes the group's counter as
+// the filer has it, never its own older copy.
 func TestFlushKeepsTheGroupsCounter(t *testing.T) {
+	for _, counter := range []int32{3, 1} {
+		testFlushKeepsTheGroupsCounter(t, counter)
+	}
+}
+
+func testFlushKeepsTheGroupsCounter(t *testing.T, counter int32) {
 	wfs, _, _ := linkedWFS(t)
 	filer := newRecordFiler()
 	startFakeFiler(t, wfs, filer)
@@ -493,14 +500,14 @@ func TestFlushKeepsTheGroupsCounter(t *testing.T) {
 	fh, _ := wfs.fhMap.AcquireFileHandle(wfs, inode, proto.Clone(e).(*filer_pb.Entry), 10, 0)
 	fh.RememberPath("/d/a")
 	fh.dirtyMetadata = true
-	third := storedForm(e)
-	third.HardLinkCounter = 3 // a third name, made elsewhere
-	filer.entries["/d/a"] = third
+	changed := storedForm(e)
+	changed.HardLinkCounter = counter // a third name made, or a sibling unlinked, elsewhere
+	filer.entries["/d/a"] = changed
 	if st := wfs.Fsync(nil, &fuse.FsyncIn{InHeader: fuse.InHeader{NodeId: inode}, Fh: uint64(fh.fh)}); st != fuse.OK {
 		t.Fatalf("fsync: %v", st)
 	}
-	if c := filer.entries["/d/a"].GetHardLinkCounter(); c != 3 {
-		t.Fatalf("the flush wrote counter %d over 3", c)
+	if c := filer.entries["/d/a"].GetHardLinkCounter(); c != counter {
+		t.Fatalf("the flush wrote counter %d over %d", c, counter)
 	}
 }
 

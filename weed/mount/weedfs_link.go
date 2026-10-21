@@ -12,6 +12,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/util"
+	"google.golang.org/protobuf/proto"
 )
 
 /*
@@ -238,6 +239,12 @@ func (wfs *WFS) Link(cancel <-chan struct{}, in *fuse.LinkIn, name string, out *
 					entry.HardLinkId, entry.HardLinkCounter = group, oldEntry.HardLinkCounter
 				}
 			})
+			// Its base too, which a flush takes the group from.
+			if base := sourceFh.baseEntry.Load(); base != nil {
+				base = proto.Clone(base).(*filer_pb.Entry)
+				base.HardLinkId, base.HardLinkCounter = group, oldEntry.HardLinkCounter
+				sourceFh.setAuthoritativeBase(base)
+			}
 		}
 	}
 
