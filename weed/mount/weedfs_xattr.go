@@ -147,7 +147,7 @@ func (wfs *WFS) SetXAttr(cancel <-chan struct{}, input *fuse.SetXAttrIn, attr st
 		return fuse.OK
 	}
 
-	return wfs.saveEntry(path, entry)
+	return wfs.saveAttributes(path, entry)
 
 }
 
@@ -230,5 +230,5 @@ func (wfs *WFS) RemoveXAttr(cancel <-chan struct{}, header *fuse.InHeader, attr 
 		return fuse.OK
 	}
 
-	return wfs.saveEntry(path, entry)
+	return wfs.saveAttributes(path, entry)
 }
