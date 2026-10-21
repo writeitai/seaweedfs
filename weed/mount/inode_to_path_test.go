@@ -231,13 +231,20 @@ func TestHardLinkAliasesArePromoted(t *testing.T) {
 	if !m.PromotePath(inode, "/a", "/b") || !m.PromotePath(inode, "/a", "/b") {
 		t.Fatal("the alias was not promoted, or not idempotently")
 	}
-	// A caller that saw /a gone and picked /c finds the primary moved to
-	// /b: refused, so it looks again instead of dropping /b.
-	if m.PromotePath(inode, "/a", "/c") {
-		t.Fatal("promoted over a primary that had moved")
+	// A caller that saw /a gone and picked /c, verified, finds /a no longer
+	// the inode's, the primary moved on: /c is promoted, and /b, whatever
+	// it holds, stays an alias for the next recovery to judge (Mountable).
+	if !m.PromotePath(inode, "/a", "/c") {
+		t.Fatal("refused a verified alias once the gone path was no longer the inode's")
 	}
-	if paths := m.GetAllPaths(inode); !slices.Equal(paths, []util.FullPath{"/b", "/c"}) || m.HasPath("/a") {
+	if paths := m.GetAllPaths(inode); !slices.Equal(paths, []util.FullPath{"/c", "/b"}) || m.HasPath("/a") {
 		t.Fatalf("paths %v", paths)
+	}
+	// While the gone path is still the inode's but not its primary, the
+	// primary moved under the caller: refused, so it looks again.
+	m.AddPath(inode, "/d")
+	if m.PromotePath(inode, "/d", "/b") {
+		t.Fatal("promoted over a primary that had moved")
 	}
 	// Not a hard link: a second path never shares the inode.
 	if x, y := m.Lookup("/x", 1, false, false, 90, true), m.Lookup("/y", 1, false, false, 90, true); x == y {
@@ -469,5 +476,27 @@ func TestFirstListingTellsObjectsApart(t *testing.T) {
 	// Another link of the bound group is listed as the group.
 	if got := m.InodeForListing("/l2", 1, 0, "group", 500); got != l {
 		t.Fatalf("another link of the group listed as %d, the group is %d", got, l)
+	}
+}
+
+// Unreferenced names of one hard-link group are listed under one fileid,
+// the one their lookups then bind; a file whose stored inode another file
+// already holds in the table is listed past it, as its lookup probes.
+func TestListingAgreesWithLookups(t *testing.T) {
+	m := NewInodeToPath(util.FullPath("/"), 0)
+	l1, l2 := m.InodeForListing("/l1", 1, 0, "group", 500), m.InodeForListing("/l2", 1, 0, "group", 500)
+	if l1 != l2 {
+		t.Fatalf("one group listed as %d and %d", l1, l2)
+	}
+	if a, b := m.LookupLinked("/l1", 1, 0, "group", 500, true), m.LookupLinked("/l2", 1, 0, "group", 500, true); a != l1 || b != l1 {
+		t.Fatalf("lookups bound %d and %d, the listing gave %d", a, b, l1)
+	}
+	taken := m.LookupLinked("/a", 1, 0, "", 700, true)
+	listed := m.InodeForListing("/b", 1, 0, "", 700)
+	if listed == taken {
+		t.Fatalf("/b listed on /a's inode %d", taken)
+	}
+	if got := m.LookupLinked("/b", 1, 0, "", 700, true); got != listed {
+		t.Fatalf("/b's lookup bound %d, the listing gave %d", got, listed)
 	}
 }

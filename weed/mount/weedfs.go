@@ -579,7 +579,7 @@ func (wfs *WFS) loadInodeEntry(inode uint64, path util.FullPath) (util.FullPath,
 	// rebound reports whether a lookup bound p again since it was watched:
 	// what was found there then no longer stands (Mountable).
 	rebound := func(p util.FullPath) bool {
-		return wfs.inodeToPath.Generation(p) != watched[p]
+		return wfs.inodeToPath.Generation(p) != watched[p] && wfs.inodeToPath.Bound(p, inode)
 	}
 	entry, version, status := load(path)
 	for range 4 {

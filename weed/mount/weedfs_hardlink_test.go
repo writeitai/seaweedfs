@@ -517,3 +517,55 @@ func TestRecoveryKeepsAPrimaryBoundAgain(t *testing.T) {
 		t.Fatalf("primary %s", p)
 	}
 }
+
+// Recovery finds the primary overwritten by another file and the first
+// alias gone and, while it verifies the second alias, a lookup binds the
+// primary to that other file: the survivor is still promoted, as the
+// primary is no longer this inode's.
+func TestRecoveryPromotesPastAPrimaryTakenByAnother(t *testing.T) {
+	wfs, filer, inode := linkedWFS(t)
+	filer.set("/d/one", linkEntry("one", 9999, "", "another"))
+	filer.set("/d/two", nil)
+	var once sync.Once
+	filer.mu.Lock()
+	filer.delay = func(p util.FullPath) {
+		if p != "/d/three" {
+			return
+		}
+		once.Do(func() {
+			filer.mu.Unlock()
+			wfs.inodeToPath.LookupLinked("/d/one", 1, 0, "", 9999, true) // the other file
+			filer.mu.Lock()
+		})
+	}
+	filer.mu.Unlock()
+	if p, _, _, st := wfs.loadInodeEntry(inode, "/d/one"); st != fuse.OK || p != "/d/three" {
+		t.Fatalf("recovery answered %s, %v", p, st)
+	}
+}
+
+// Recovery finds the primary and the first alias gone and, while it
+// verifies the second alias, the primary is detached elsewhere, which
+// leaves the first alias as the primary: the verified alias is promoted
+// all the same.
+func TestRecoveryPromotesPastAPrimaryDetachedMeanwhile(t *testing.T) {
+	wfs, filer, inode := linkedWFS(t)
+	filer.set("/d/one", nil)
+	filer.set("/d/two", nil)
+	var once sync.Once
+	filer.mu.Lock()
+	filer.delay = func(p util.FullPath) {
+		if p != "/d/three" {
+			return
+		}
+		once.Do(func() {
+			filer.mu.Unlock()
+			wfs.inodeToPath.DetachPath(inode, "/d/one") // a lookup's miss elsewhere
+			filer.mu.Lock()
+		})
+	}
+	filer.mu.Unlock()
+	if p, _, _, st := wfs.loadInodeEntry(inode, "/d/one"); st != fuse.OK || p != "/d/three" {
+		t.Fatalf("recovery answered %s, %v", p, st)
+	}
+}
