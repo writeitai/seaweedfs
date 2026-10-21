@@ -4,6 +4,7 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
+	"syscall"
 
 	"google.golang.org/protobuf/proto"
 
@@ -45,6 +46,11 @@ type FileHandle struct {
 	// nothing to delete after all can tell its own mark from a later one.
 	deleteEpoch uint64
 	isRenamed   bool // set by Rename before waiting for async flush; skips old-path metadata flush
+	// persistErr, once set, is what every later flush returns: its path no
+	// longer leads to the handle's object, so nothing it holds is written
+	// back, and the loss is reported rather than silent (Mountable). Set
+	// under the handle lock.
+	persistErr syscall.Errno
 
 	// entryVersionTsNs is the filer log position the handle's entry reflects.
 	// State at or below it must not replace the entry — that rolls it back.

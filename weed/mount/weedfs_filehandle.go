@@ -175,5 +175,8 @@ func (wfs *WFS) reclaimHandle(fh *FileHandle, entry *filer_pb.Entry, version ent
 	fh.dirtyPages = newPageWriter(fh, wfs.option.ChunkSizeLimit)
 	fh.SetEntry(entry)
 	fh.baseEntry.Store(proto.Clone(entry).(*filer_pb.Entry))
-	fh.advanceEntryVersion(version.tsNs, version.signature)
+	// Nothing of the previous occupant's state carries over.
+	fh.isDeleted, fh.isRenamed, fh.persistErr = false, false, 0
+	fh.entryVersionTsNs.Store(version.tsNs)
+	fh.entryVersionSignature.Store(version.signature)
 }

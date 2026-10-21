@@ -3,6 +3,7 @@ package mount
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"syscall"
@@ -180,13 +181,20 @@ func (wfs *WFS) doFlush(ctx context.Context, fh *FileHandle, uid, gid uint32, al
 		return fuse.Status(syscall.ENOSPC)
 	}
 
-	if err := retryMetadataFlush(ctx, func() error {
+	if err := retryMetadataFlushIf(ctx, func() error {
 		return wfs.flushMetadataToFiler(ctx, fh, dir, name, uid, gid)
+	}, func(err error) bool {
+		var refused syscall.Errno
+		return !errors.As(err, &refused) // a refusal stands (Mountable)
 	}, func(nextAttempt, totalAttempts int, backoff time.Duration, err error) {
 		glog.Warningf("%v fh %d flush: retrying metadata flush (attempt %d/%d) after %v: %v",
 			fileFullPath, fh.fh, nextAttempt, totalAttempts, backoff, err)
 	}); err != nil {
 		glog.Errorf("%v fh %d flush: %v", fileFullPath, fh.fh, err)
+		var refused syscall.Errno
+		if errors.As(err, &refused) {
+			return fuse.Status(refused)
+		}
 		return grpcErrorToFuseStatus(err)
 	}
 
@@ -216,6 +224,16 @@ func (wfs *WFS) flushMetadataToFiler(ctx context.Context, fh *FileHandle, dir, n
 	if fh.isDeleted {
 		glog.V(3).Infof("flushMetadataToFiler %s fh %d: file was unlinked, skipping", fileFullPath, fh.fh)
 		return nil
+	}
+	// The handle writes through its path only while the path leads to its
+	// object: one detached, or bound to another object since, would take
+	// this entry over whatever is there now (Mountable).
+	if fh.persistErr == 0 && !wfs.inodeToPath.Bound(fileFullPath, fh.inode) {
+		glog.Warningf("flushMetadataToFiler %s fh %d: the path no longer leads to the open file, not writing it", fileFullPath, fh.fh)
+		fh.persistErr = syscall.ESTALE
+	}
+	if fh.persistErr != 0 {
+		return fh.persistErr
 	}
 
 	entry := fh.GetEntry()

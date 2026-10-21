@@ -41,6 +41,11 @@ func (wfs *WFS) ReadAs(cancel <-chan struct{}, in *fuse.ReadIn, buff []byte, sto
 	if !holds || stored != 0 && stored != storedInode {
 		return nil, fuse.Status(syscall.ESTALE)
 	}
+	// A remote-only entry is downloaded on read and installed in the
+	// handle, unchecked: nothing would bind those bytes to the object.
+	if entry.IsInRemoteOnly() {
+		return nil, fuse.EIO
+	}
 
 	ctx, cancelFunc := context.WithCancel(context.Background())
 	defer cancelFunc()

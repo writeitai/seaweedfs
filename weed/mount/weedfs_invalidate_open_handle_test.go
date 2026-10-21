@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -2078,8 +2079,8 @@ func TestAckFromAnotherFilerIsNotDroppedBehindForeignFence(t *testing.T) {
 
 // An event putting another object at an open file's path (another stored
 // inode: an overwrite) leaves the handle its own entry, and the path no
-// longer leads to the inode; with no other path left, no flush may write
-// the old file over the newcomer.
+// longer leads to the inode: a flush of the old file's writes refuses to
+// write it over the newcomer, and says so, every time.
 func TestOverwriteEventLeavesTheHandleItsObject(t *testing.T) {
 	wfs := newInvalidateTestWFS(t)
 	inode := wfs.inodeToPath.Lookup(util.FullPath("/dir/file"), time.Now().Unix(), false, false, 500, false)
@@ -2109,7 +2110,50 @@ func TestOverwriteEventLeavesTheHandleItsObject(t *testing.T) {
 	if _, st := wfs.inodeToPath.GetPath(inode); st == fuse.OK {
 		t.Fatal("the path still leads to the overwritten file's inode")
 	}
-	if !fh.isDeleted {
-		t.Fatal("the overwritten file's handle may still flush over the newcomer")
+	fh.RememberPath("/dir/file")
+	fh.dirtyMetadata = true
+	for range 2 {
+		if st := wfs.doFlush(context.Background(), fh, 0, 0, false); st != fuse.Status(syscall.ESTALE) {
+			t.Fatalf("flush of the overwritten file: %v", st)
+		}
+	}
+	if fh.isDeleted || !fh.dirtyMetadata {
+		t.Fatal("the handle's writes were dropped as if the file was unlinked")
+	}
+}
+
+// Another mount making an open, dirty standalone file a hard link: the
+// handle's writes are neither persisted under a changed identity nor
+// silently dropped; fsync reports it.
+func TestForeignLinkOfADirtyHandleIsReported(t *testing.T) {
+	wfs := newInvalidateTestWFS(t)
+	inode := wfs.inodeToPath.Lookup(util.FullPath("/dir/file"), time.Now().Unix(), false, false, 500, false)
+	fh, _ := wfs.fhMap.AcquireFileHandle(wfs, inode, &filer_pb.Entry{
+		Name:       "file",
+		Attributes: &filer_pb.FuseAttributes{FileSize: 88, Inode: 500},
+	}, 0, 0)
+	fh.RememberPath("/dir/file")
+	fh.dirtyMetadata = true
+	linked := &filer_pb.SubscribeMetadataResponse{
+		Directory: "/dir",
+		TsNs:      1000,
+		EventNotification: &filer_pb.EventNotification{
+			OldEntry: &filer_pb.Entry{Name: "file"},
+			NewEntry: &filer_pb.Entry{
+				Name: "file", HardLinkId: []byte("foreign"), HardLinkCounter: 2,
+				Attributes: &filer_pb.FuseAttributes{FileSize: 88, Inode: 500},
+			},
+			NewParentPath: "/dir",
+		},
+	}
+	if err := wfs.metaCache.ApplyMetadataResponse(context.Background(), linked, meta_cache.SubscriberMetadataResponseApplyOptions); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	wfs.metaCache.WaitForEntryInvalidations()
+	if st := wfs.Fsync(nil, &fuse.FsyncIn{InHeader: fuse.InHeader{NodeId: inode}, Fh: uint64(fh.fh)}); st != fuse.Status(syscall.ESTALE) {
+		t.Fatalf("fsync: %v", st)
+	}
+	if fh.isDeleted || !fh.dirtyMetadata {
+		t.Fatal("the writes were dropped as if the file was unlinked")
 	}
 }

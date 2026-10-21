@@ -429,3 +429,62 @@ func TestHandleOfAnotherObjectAnswersForNothing(t *testing.T) {
 		t.Fatalf("read %q", data)
 	}
 }
+
+// A dirty open file replaced at its path, the newcomer looked up before the
+// invalidation arrives: fsync of the old file refuses to write it over the
+// newcomer, and says so.
+func TestDetachedDirtyHandleRefusesToPersist(t *testing.T) {
+	wfs, filer, _ := linkedWFS(t)
+	dir, _ := wfs.inodeToPath.GetInode("/d")
+	filer.set("/d/p", linkEntry("p", 500, "", "AAAA"))
+	var out fuse.EntryOut
+	if st := wfs.Lookup(nil, &fuse.InHeader{NodeId: dir}, "p", &out); st != fuse.OK {
+		t.Fatalf("lookup: %v", st)
+	}
+	old := out.NodeId
+	fh, _ := wfs.fhMap.AcquireFileHandle(wfs, old, linkEntry("p", 500, "", "AAAA"), 0, 0)
+	fh.RememberPath("/d/p")
+	fh.dirtyMetadata = true
+	filer.set("/d/p", linkEntry("p", 600, "", "BBBB"))
+	if st := wfs.Lookup(nil, &fuse.InHeader{NodeId: dir}, "p", &out); st != fuse.OK || out.NodeId == old {
+		t.Fatalf("lookup of the newcomer %v: inode %d", st, out.NodeId)
+	}
+	if st := wfs.Fsync(nil, &fuse.FsyncIn{InHeader: fuse.InHeader{NodeId: old}, Fh: uint64(fh.fh)}); st != fuse.Status(syscall.ESTALE) {
+		t.Fatalf("fsync of the replaced file: %v", st)
+	}
+}
+
+// remoteFiler materialises any remote entry as another object.
+type remoteFiler struct{ linkFiler }
+
+func (f *remoteFiler) CacheRemoteObjectToLocalCluster(context.Context, *filer_pb.CacheRemoteObjectToLocalClusterRequest) (*filer_pb.CacheRemoteObjectToLocalClusterResponse, error) {
+	return &filer_pb.CacheRemoteObjectToLocalClusterResponse{Entry: linkEntry("remote", 900, "", "BBBB")}, nil
+}
+
+// ReadAs refuses a remote-only entry, which a read would download and
+// install unchecked: here, another object's bytes.
+func TestReadAsRefusesARemoteOnlyEntry(t *testing.T) {
+	wfs, _, _ := linkedWFS(t)
+	startFakeFiler(t, wfs, &remoteFiler{linkFiler{entries: map[util.FullPath]*filer_pb.Entry{}, broken: map[util.FullPath]bool{}}})
+	inode := wfs.inodeToPath.Lookup("/d/remote", 1, false, false, 800, true)
+	remote := linkEntry("remote", 800, "", "")
+	remote.RemoteEntry = &filer_pb.RemoteEntry{RemoteSize: 4}
+	fh, _ := wfs.fhMap.AcquireFileHandle(wfs, inode, remote, 0, 0)
+	buf := make([]byte, 4)
+	if _, st := wfs.ReadAs(nil, &fuse.ReadIn{InHeader: fuse.InHeader{NodeId: inode}, Fh: uint64(fh.fh), Size: 4}, buf, 800); st != fuse.EIO {
+		t.Fatalf("ReadAs of a remote-only entry: %v", st)
+	}
+}
+
+// Putting the inode's own entry back on a handle leaves nothing of the
+// previous occupant's state.
+func TestReclaimedHandleStartsAfresh(t *testing.T) {
+	wfs, _, inode := linkedWFS(t)
+	fh, _ := wfs.fhMap.AcquireFileHandle(wfs, inode, linkEntry("one", 4242, "other", "intruder"), 0, 0)
+	fh.isDeleted, fh.isRenamed, fh.persistErr = true, true, syscall.ESTALE
+	fh.entryVersionTsNs.Store(1000)
+	wfs.reclaimHandle(fh, linkEntry("one", 4242, "link", "shared"), entryVersion{tsNs: 5})
+	if fh.isDeleted || fh.isRenamed || fh.persistErr != 0 || fh.entryVersionTsNs.Load() != 5 {
+		t.Fatalf("deleted %v, renamed %v, refusal %v, version %d", fh.isDeleted, fh.isRenamed, fh.persistErr, fh.entryVersionTsNs.Load())
+	}
+}

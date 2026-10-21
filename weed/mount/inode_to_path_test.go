@@ -410,8 +410,30 @@ func TestOwnLinkConvertsInPlace(t *testing.T) {
 	}
 	other := m.LookupLinked("/g", 1, 0, "", 901, true)
 	m.BeginLink(other, []byte("M"))
+	if m.LookupLinked("/g", 1, 0, "M", 901, true) != other { // a lookup in between
+		t.Fatal("the file being linked looked replaced")
+	}
 	m.EndLink(other, []byte("M"), false)
 	if !m.Holds(other, 0, "", 901) || m.Holds(other, 0, "M", 901) {
 		t.Fatal("after a failed link, the file is standalone only")
+	}
+}
+
+// A path Link or Rename bound back to the same inode moves the watch on, so
+// a slow miss that watched it detaches nothing.
+func TestBindingsMoveWatchesOn(t *testing.T) {
+	m := NewInodeToPath(util.FullPath("/"), 0)
+	inode := m.Lookup("/p", 1, false, false, 700, true)
+	_, _, generation := m.Watch("/p")
+	m.DetachPath(inode, "/p")
+	m.AddPath(inode, "/p")
+	if m.Unwatch("/p", inode, generation, true) || !m.Bound("/p", inode) {
+		t.Fatal("a slow miss undid a Link's binding")
+	}
+	_, _, generation = m.Watch("/p")
+	m.MovePath("/p", "/q")
+	m.MovePath("/q", "/p")
+	if m.Unwatch("/p", inode, generation, true) || !m.Bound("/p", inode) {
+		t.Fatal("a slow miss undid a Rename's binding")
 	}
 }

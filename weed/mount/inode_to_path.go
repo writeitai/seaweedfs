@@ -281,9 +281,7 @@ func (i *InodeToPath) LookupLinked(path util.FullPath, unixTime int64, kind os.F
 		}
 	}
 	i.path2inode[path] = inode
-	if w := i.watches[path]; w != nil {
-		w.generation++
-	}
+	i.boundLocked(path)
 
 	if isHardlink {
 		i.noteLinkLocked(inode, linkID)
@@ -629,6 +627,7 @@ func (i *InodeToPath) AddPath(inode uint64, path util.FullPath) {
 	// A second path makes a hard link (Mountable: see linkIDs).
 	i.noteLinkLocked(inode, unknownLink)
 	i.path2inode[path] = inode
+	i.boundLocked(path)
 
 	ie, found := i.inode2path[inode]
 	if found {
@@ -766,6 +765,21 @@ func (i *InodeToPath) Watch(path util.FullPath) (inode uint64, found bool, gener
 	return inode, found, w.generation
 }
 
+// boundLocked moves a watched path's generation on: something bound it.
+func (i *InodeToPath) boundLocked(path util.FullPath) {
+	if w := i.watches[path]; w != nil {
+		w.generation++
+	}
+}
+
+// Bound reports whether path still leads to inode: a handle persists
+// through its path only while it does (Mountable).
+func (i *InodeToPath) Bound(path util.FullPath, inode uint64) bool {
+	i.RLock()
+	defer i.RUnlock()
+	return i.path2inode[path] == inode
+}
+
 // Unwatch ends a Watch of path. With detach, it detaches path from inode
 // (as DetachPath), unless a lookup bound the path since the Watch.
 func (i *InodeToPath) Unwatch(path util.FullPath, inode, generation uint64, detach bool) bool {
@@ -852,6 +866,10 @@ func (i *InodeToPath) EndLink(inode uint64, linkID []byte, linked bool) {
 	delete(i.linking, inode)
 	if linked {
 		i.noteLinkLocked(inode, string(linkID))
+	} else {
+		// Standalone again, as before BeginLink, whatever a lookup in
+		// between recorded.
+		delete(i.linkIDs, inode)
 	}
 }
 
@@ -951,6 +969,11 @@ func (i *InodeToPath) MovePath(sourcePath, targetPath util.FullPath) (sourceInod
 	i.Lock()
 	defer i.Unlock()
 	sourceInode, sourceFound := i.path2inode[sourcePath]
+	if sourceFound {
+		// Both bindings change (Mountable: see Watch).
+		i.boundLocked(sourcePath)
+		i.boundLocked(targetPath)
+	}
 	if !sourceFound {
 		// Nothing of ours to move: the source was never visited here, or a
 		// redelivery already moved it. Whatever sits at the target is not ours

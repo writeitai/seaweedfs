@@ -1070,15 +1070,13 @@ func (wfs *WFS) invalidateOpenFileHandle(invalidation meta_cache.EntryInvalidati
 		return
 	}
 	if !wfs.inodeToPath.HoldsEntry(inode, candidate) {
-		// Another object took the path (Mountable: see InodeToPath.Holds).
-		// The handle keeps its own object, and the path no longer leads to
-		// the inode; with no other path left, the object is unlinked, and
-		// no flush may write it over the newcomer.
+		// Another object took the path, or this one changed identity, as
+		// when another mount made it a hard link (Mountable: see
+		// InodeToPath.Holds). The handle keeps its own object, and the
+		// path no longer leads to the inode, so the handle's next flush
+		// refuses to write over whatever is there and reports it; it is not
+		// taken for an unlink, whose flush silently succeeds.
 		wfs.inodeToPath.DetachPath(inode, filePath)
-		if _, st := wfs.inodeToPath.GetPath(inode); st != fuse.OK {
-			fh.isDeleted = true
-			fh.deleteEpoch++
-		}
 		fh.advanceEntryVersion(eventTsNs, 0)
 		return
 	}
