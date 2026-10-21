@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -163,4 +164,79 @@ func (s *fileidSink) AddEntry(e fuse.DirEntry) bool {
 		s.t.Errorf("readdir reported the symlink with the file's fileid %d", e.Ino)
 	}
 	return s.pagingSink.AddEntry(e)
+}
+
+// Every path that writes a handle's entry back, the periodic metadata
+// flusher and the async flush's included, refuses a detached handle with
+// ESTALE and writes nothing for an unlinked one.
+func TestEveryFlushPathKeepsThePersistenceRule(t *testing.T) {
+	wfs, _, _ := linkedWFS(t)
+	filer := newRecordFiler()
+	startFakeFiler(t, wfs, filer)
+	open := func(name string, inode uint64) *FileHandle {
+		bound := wfs.inodeToPath.Lookup(util.FullPath("/d").Child(name), 1, false, false, inode, true)
+		e := linkEntry(name, inode, "", "")
+		e.Chunks = []*filer_pb.FileChunk{{FileId: "1,ab", Size: 4}}
+		fh, _ := wfs.fhMap.AcquireFileHandle(wfs, bound, e, 0, 0)
+		fh.RememberPath(util.FullPath("/d").Child(name))
+		fh.dirtyMetadata = true
+		return fh
+	}
+	detached := open("detached", 500)
+	wfs.inodeToPath.DetachPath(detached.inode, "/d/detached")
+	unlinked := open("unlinked", 501)
+	unlinked.isDeleted = true
+	paths := map[string]func(*FileHandle) error{
+		"periodic": wfs.flushFileMetadata,
+		"async": func(fh *FileHandle) error {
+			dir, name := fh.FullPath().DirAndName()
+			return wfs.flushMetadataToFiler(context.Background(), fh, dir, name, 0, 0)
+		},
+	}
+	for name, flush := range paths {
+		if err := flush(detached); err != syscall.ESTALE {
+			t.Fatalf("%s flush of a detached handle: %v", name, err)
+		}
+		if err := flush(unlinked); err != nil {
+			t.Fatalf("%s flush of an unlinked handle: %v", name, err)
+		}
+	}
+	if st := wfs.doFlush(context.Background(), detached, 0, 0, false); st != fuse.Status(syscall.ESTALE) {
+		t.Fatalf("doFlush of a detached handle: %v", st)
+	}
+	if len(filer.created) != 0 {
+		t.Fatalf("written: %v", filer.created)
+	}
+}
+
+// The namespace never takes an open handle's entry for a file the filer
+// does not have; elsewhere, a deferred create's handle stands in for it
+// only while it holds its own object, unlinked neither nor refused.
+func TestOpenHandlesStandInOnlyForTheirOwnUnflushedObject(t *testing.T) {
+	wfs, _, _ := linkedWFS(t)
+	inode := wfs.inodeToPath.Lookup("/d/f", 1, false, false, 500, true)
+	fh, _ := wfs.fhMap.AcquireFileHandle(wfs, inode, linkEntry("f", 500, "", "unflushed"), 0, 0)
+	fh.RememberPath("/d/f")
+	fh.dirtyMetadata = true
+	if e, _, st := wfs.maybeLoadEntry("/d/f"); st != fuse.OK || e.GetAttributes().GetInode() != 500 {
+		t.Fatalf("the deferred create's handle: %v", st)
+	}
+	fh.isDeleted = true
+	if _, _, st := wfs.maybeLoadEntry("/d/f"); st != fuse.ENOENT {
+		t.Fatalf("an unlinked handle stood in: %v", st)
+	}
+	fh.isDeleted = false
+	fh.SetEntry(linkEntry("f", 9999, "", "another object"))
+	if _, _, st := wfs.maybeLoadEntry("/d/f"); st != fuse.ENOENT {
+		t.Fatalf("a handle of another object stood in: %v", st)
+	}
+	fh.SetEntry(linkEntry("f", 500, "", "unflushed"))
+	fh.persistErr = syscall.ESTALE
+	if _, _, st := wfs.maybeLoadEntry("/d/f"); st != fuse.ENOENT {
+		t.Fatalf("a refused handle stood in: %v", st)
+	}
+	fh.persistErr = 0
+	if _, st := wfs.NamespaceEntry(inode); st != fuse.ENOENT {
+		t.Fatalf("NamespaceEntry of a file only a handle has: %v", st)
+	}
 }

@@ -156,6 +156,22 @@ func (wfs *WFS) doFlush(ctx context.Context, fh *FileHandle, uid, gid uint32, al
 	// Synchronous flush path (normal mode, fsync, or no dirty data)
 	fh.asyncFlushPending = false
 
+	// Nothing is uploaded for a dirty handle whose flush would not be
+	// written (Mountable: see persistDestination).
+	fhActiveLock := wfs.fhLockTable.AcquireLock("doFlush", fh.fh, util.ExclusiveLock)
+	write, refusal := true, error(nil)
+	if fh.dirtyMetadata {
+		_, write, refusal = wfs.persistDestination(fh, "")
+	}
+	wfs.fhLockTable.ReleaseLock(fh.fh, fhActiveLock)
+	if !write {
+		var refused syscall.Errno
+		if errors.As(refusal, &refused) {
+			return fuse.Status(refused)
+		}
+		return fuse.OK
+	}
+
 	// Check quota including uncommitted writes for real-time enforcement
 	isOverQuota := wfs.IsOverQuotaWithUncommitted()
 	if !isOverQuota {
@@ -224,29 +240,16 @@ func (wfs *WFS) flushMetadataToFiler(ctx context.Context, fh *FileHandle, dir, n
 	fhActiveLock := fh.wfs.fhLockTable.AcquireLock("doFlush", fh.fh, util.ExclusiveLock)
 	defer fh.wfs.fhLockTable.ReleaseLock(fh.fh, fhActiveLock)
 
-	if dir == "" && name == "" {
-		dir, name = fh.FullPath().DirAndName()
+	fileFullPath := util.FullPath("")
+	if dir != "" || name != "" {
+		fileFullPath = util.FullPath(dir).Child(name)
 	}
-	fileFullPath := util.FullPath(dir).Child(name)
+	fileFullPath, write, err := wfs.persistDestination(fh, fileFullPath)
+	if !write {
+		return err
+	}
+	dir, name = fileFullPath.DirAndName()
 	glog.V(4).Infof("flushMetadataToFiler %s inode %d fh %d", fileFullPath, fh.inode, fh.fh)
-
-	// Re-check under the lock: Unlink sets the flag under it, so a flush that
-	// was already past the earlier check cannot write the entry back after
-	// the delete removed it.
-	if fh.isDeleted {
-		glog.V(3).Infof("flushMetadataToFiler %s fh %d: file was unlinked, skipping", fileFullPath, fh.fh)
-		return nil
-	}
-	// The handle writes through its path only while the path leads to its
-	// object: one detached, or bound to another object since, would take
-	// this entry over whatever is there now (Mountable).
-	if fh.persistErr == 0 && !wfs.inodeToPath.Bound(fileFullPath, fh.inode) {
-		glog.Warningf("flushMetadataToFiler %s fh %d: the path no longer leads to the open file, not writing it", fileFullPath, fh.fh)
-		fh.persistErr = syscall.ESTALE
-	}
-	if fh.persistErr != 0 {
-		return fh.persistErr
-	}
 
 	entry := fh.GetEntry()
 	entry.Name = name // this flush may be just after a rename operation
@@ -404,6 +407,33 @@ func (wfs *WFS) maybeMergeChunks(fileFullPath util.FullPath, compactedChunks []*
 	glog.V(0).Infof("merged %s: %d chunks -> %d chunks", fileFullPath, len(compactedChunks)+len(manifestChunks), len(newChunks))
 
 	return newChunks, nil
+}
+
+// persistDestination is where a flush of fh writes its metadata, path or,
+// when empty, the handle's own, and whether it may: called under the
+// handle lock by every path that writes a handle's entry back, so they
+// agree. An unlinked file is not written, and that is no error (Unlink
+// sets the flag under the lock, so a flush past an earlier check cannot
+// write the entry back after the delete). A path that no longer leads to
+// the handle's inode, detached or bound to another object since, is not
+// written either: that flush and every later one return ESTALE, rather
+// than take the entry over whatever is there now (Mountable).
+func (wfs *WFS) persistDestination(fh *FileHandle, path util.FullPath) (util.FullPath, bool, error) {
+	if path == "" {
+		path = fh.FullPath()
+	}
+	if fh.isDeleted {
+		glog.V(3).Infof("flush %s fh %d: file was unlinked, skipping", path, fh.fh)
+		return path, false, nil
+	}
+	if fh.persistErr == 0 && !wfs.inodeToPath.Bound(path, fh.inode) {
+		glog.Warningf("flush %s fh %d: the path no longer leads to the open file, not writing it", path, fh.fh)
+		fh.persistErr = syscall.ESTALE
+	}
+	if fh.persistErr != 0 {
+		return path, false, fh.persistErr
+	}
+	return path, true, nil
 }
 
 // afterFlushData, when set (by tests), runs in doFlush once the data is

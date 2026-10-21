@@ -569,7 +569,8 @@ func (wfs *WFS) loadInodeEntry(inode uint64, path util.FullPath) (util.FullPath,
 		if _, ok := watched[p]; !ok {
 			_, _, watched[p] = wfs.inodeToPath.Watch(p)
 		}
-		return wfs.maybeLoadEntry(p)
+		// The namespace's: never an open handle's entry.
+		return wfs.maybeLoadNamespaceEntry(p)
 	}
 	entry, version, status := load(path)
 	for range 4 {
@@ -614,6 +615,22 @@ func (wfs *WFS) loadInodeEntry(inode uint64, path util.FullPath) (util.FullPath,
 		entry, version, status = load(path)
 	}
 	return path, nil, entryVersion{}, fuse.ENOENT
+}
+
+// localEntry is an open handle's entry, cloned, when it may stand in for an
+// entry the filer does not have yet: unflushed, neither unlinked nor
+// refused, and its inode's object (Mountable). Read under the handle's
+// locks: async upload workers append chunks under entryLock.
+func (wfs *WFS) localEntry(fh *FileHandle) *filer_pb.Entry {
+	fhActiveLock := wfs.fhLockTable.AcquireLock("localEntry", fh.fh, util.SharedLock)
+	defer wfs.fhLockTable.ReleaseLock(fh.fh, fhActiveLock)
+	fh.entryLock.RLock()
+	defer fh.entryLock.RUnlock()
+	entry := fh.GetEntry().GetEntry()
+	if !fh.dirtyMetadata || fh.isDeleted || fh.persistErr != 0 || entry == nil || !wfs.inodeToPath.HoldsEntry(fh.inode, entry) {
+		return nil
+	}
+	return proto.Clone(entry).(*filer_pb.Entry)
 }
 
 // NamespaceEntry is the inode's entry as the namespace has it now: through
@@ -684,6 +701,19 @@ func (wfs *WFS) maybeLoadEntry(fullpath util.FullPath) (*filer_pb.Entry, entryVe
 	return entry.ToProtoEntry(), version, fuse.OK
 }
 
+// maybeLoadNamespaceEntry is maybeLoadEntry without local stand-ins: what
+// the namespace has at fullpath (Mountable).
+func (wfs *WFS) maybeLoadNamespaceEntry(fullpath util.FullPath) (*filer_pb.Entry, entryVersion, fuse.Status) {
+	if string(fullpath) == wfs.option.FilerMountRootPath {
+		return wfs.maybeLoadEntry(fullpath)
+	}
+	entry, version, status := wfs.lookupEntryFrom(fullpath, false)
+	if status != fuse.OK {
+		return nil, entryVersion{}, status
+	}
+	return entry.ToProtoEntry(), version, fuse.OK
+}
+
 // expiredDirRebuildCooldown limits how often a lookup re-attempts a failed
 // rebuild of an expired directory, so a transient listing failure does not
 // trigger a full rebuild (with backoff retries) on every later lookup while
@@ -697,6 +727,15 @@ const expiredDirRebuildCooldown = 30 * time.Second
 // It also returns the log position the entry reflects: the entry's stored
 // version, the lookup response's, or zero if unknown.
 func (wfs *WFS) lookupEntry(fullpath util.FullPath) (*filer.Entry, entryVersion, fuse.Status) {
+	return wfs.lookupEntryFrom(fullpath, true)
+}
+
+// lookupEntryFrom is lookupEntry; withLocal tells whether an entry the
+// filer does not have yet, a deferred create's, may answer from this
+// mount. Mountable: the namespace never takes it (see NamespaceEntry), and
+// an open handle answers only while it holds its own object, unflushed,
+// neither unlinked nor refused (localEntry).
+func (wfs *WFS) lookupEntryFrom(fullpath util.FullPath, withLocal bool) (*filer.Entry, entryVersion, fuse.Status) {
 	dir, _ := fullpath.DirAndName()
 	dirPath := util.FullPath(dir)
 
@@ -784,9 +823,12 @@ func (wfs *WFS) lookupEntry(fullpath util.FullPath) (*filer.Entry, entryVersion,
 			inode, inodeFound := wfs.inodeToPath.GetInode(fullpath)
 			hasDirtyHandle := false
 			hasPendingFlush := false
-			if inodeFound {
-				if fh, fhFound := wfs.fhMap.FindFileHandle(inode); fhFound && fh.dirtyMetadata {
-					hasDirtyHandle = true
+			if inodeFound && withLocal {
+				fh, fhFound := wfs.fhMap.FindFileHandle(inode)
+				var handleEntry *filer_pb.Entry
+				if fhFound {
+					handleEntry = wfs.localEntry(fh)
+					hasDirtyHandle = handleEntry != nil
 				}
 				wfs.pendingAsyncFlushMu.Lock()
 				_, hasPendingFlush = wfs.pendingAsyncFlush[inode]
@@ -802,21 +844,9 @@ func (wfs *WFS) lookupEntry(fullpath util.FullPath) (*filer.Entry, entryVersion,
 					// still holding the unflushed entry is authoritative for
 					// it, so read it from there rather than reporting a file
 					// that plainly exists as missing.
-					if fh, fhFound := wfs.fhMap.FindFileHandle(inode); fhFound {
-						// Async upload workers append chunks under this lock;
-						// hold it for reading so FromPbEntry does not walk the
-						// chunk slice mid-reallocation.
-						fh.entryLock.RLock()
-						pbEntry := fh.GetEntry().GetEntry()
-						var localEntry *filer.Entry
-						if pbEntry != nil {
-							localEntry = filer.FromPbEntry(dir, pbEntry)
-						}
-						fh.entryLock.RUnlock()
-						if localEntry != nil {
-							glog.V(4).Infof("lookupEntry found deferred entry on its open handle %s", fullpath)
-							return localEntry, entryVersion{}, fuse.OK
-						}
+					if handleEntry != nil {
+						glog.V(4).Infof("lookupEntry found deferred entry on its open handle %s", fullpath)
+						return filer.FromPbEntry(dir, handleEntry), entryVersion{}, fuse.OK
 					}
 				}
 			}

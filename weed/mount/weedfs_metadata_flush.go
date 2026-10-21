@@ -99,7 +99,11 @@ func (wfs *WFS) flushFileMetadata(fh *FileHandle) error {
 		return nil
 	}
 
-	fileFullPath := fh.FullPath()
+	// Written only where, and when, any flush would be (Mountable).
+	fileFullPath, write, err := wfs.persistDestination(fh, "")
+	if !write {
+		return err
+	}
 	dir, name := fileFullPath.DirAndName()
 
 	glog.V(4).Infof("flushFileMetadata %s fh %d", fileFullPath, fh.fh)
