@@ -2,7 +2,9 @@ package mount
 
 import (
 	"context"
+	"maps"
 	"os"
+	"slices"
 	"sync"
 	"syscall"
 	"testing"
@@ -562,6 +564,109 @@ func TestPlusListingsAndLookupsTellObjectsApart(t *testing.T) {
 			}
 		}
 	}
+}
+
+// Two names of one hard-link group listed plainly, one per page, the first
+// replaced by a symlink with the same stored inode between the pages,
+// cached and read-through: lookups, in either order, and plus listings
+// give the two objects distinct inodes and agree on them.
+func TestReplacedGroupNameIsToldApart(t *testing.T) {
+	for _, direct := range []bool{false, true} {
+		for _, order := range [][]string{{"a", "b"}, {"b", "a"}} {
+			dir := util.FullPath("/d")
+			wfs := newPagingWFS(t, dir, nil, 0)
+			store := &swapListFiler{entries: map[string]*filer_pb.Entry{}}
+			for _, name := range []string{"a", "b"} {
+				store.entries[name] = &filer_pb.Entry{Name: name, HardLinkId: []byte("group"), HardLinkCounter: 2,
+					Attributes: &filer_pb.FuseAttributes{FileMode: 0o644, Inode: 500, Crtime: 1, Mtime: 1}}
+			}
+			startFakeFiler(t, wfs, store)
+			cache := func(e *filer_pb.Entry) {
+				if err := wfs.metaCache.InsertEntry(context.Background(), filer.FromPbEntry(string(dir), e), 0); err != nil {
+					t.Fatalf("insert: %v", err)
+				}
+			}
+			if direct {
+				wfs.inodeToPath.MarkDirectoryReadThrough(dir, time.Now())
+			} else {
+				cache(store.entries["a"])
+				cache(store.entries["b"])
+			}
+			dirInode, _ := wfs.inodeToPath.GetInode(dir)
+			list := func(after string, plus bool, limit int) map[string]uint64 {
+				got, taken := map[string]uint64{}, 0
+				if _, st := wfs.ReadDirectoryAfter(dirInode, after, plus, func(string) bool { return taken < limit }, func(e *ListedEntry) bool {
+					taken++
+					got[e.Name] = e.Inode
+					return true
+				}); st != fuse.OK {
+					t.Fatalf("direct %v: list %v", direct, st)
+				}
+				return got
+			}
+			list("", false, 1)
+			symlink := &filer_pb.Entry{Name: "a", Attributes: &filer_pb.FuseAttributes{
+				FileMode: uint32(os.ModeSymlink | 0o777), Inode: 500, Crtime: 1, Mtime: 1, SymlinkTarget: "t"}}
+			store.set(symlink)
+			if !direct {
+				cache(symlink)
+			}
+			list("a", false, 1)
+			looked := map[string]uint64{}
+			for _, name := range order {
+				var out fuse.EntryOut
+				if st := wfs.Lookup(nil, &fuse.InHeader{NodeId: dirInode}, name, &out); st != fuse.OK {
+					t.Fatalf("direct %v: lookup %s: %v", direct, name, st)
+				}
+				looked[name] = out.NodeId
+			}
+			plus := list("", true, 2)
+			if looked["a"] == looked["b"] || plus["a"] != looked["a"] || plus["b"] != looked["b"] {
+				t.Fatalf("direct %v, order %v: looked up %v, plus listing %v", direct, order, looked, plus)
+			}
+		}
+	}
+}
+
+// swapListFiler lists and looks up its entries by name, which a test may
+// replace.
+type swapListFiler struct {
+	filer_pb.UnimplementedSeaweedFilerServer
+	mu      sync.Mutex
+	entries map[string]*filer_pb.Entry
+}
+
+func (f *swapListFiler) set(e *filer_pb.Entry) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.entries[e.Name] = e
+}
+
+func (f *swapListFiler) LookupDirectoryEntry(_ context.Context, r *filer_pb.LookupDirectoryEntryRequest) (*filer_pb.LookupDirectoryEntryResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if e := f.entries[r.Name]; e != nil {
+		return &filer_pb.LookupDirectoryEntryResponse{Entry: e}, nil
+	}
+	return nil, status.Error(codes.NotFound, filer_pb.ErrNotFound.Error())
+}
+
+func (f *swapListFiler) ListEntries(r *filer_pb.ListEntriesRequest, stream grpc.ServerStreamingServer[filer_pb.ListEntriesResponse]) error {
+	f.mu.Lock()
+	names := slices.Sorted(maps.Keys(f.entries))
+	var es []*filer_pb.Entry
+	for _, name := range names {
+		if name > r.StartFromFileName || name == r.StartFromFileName && r.InclusiveStartFrom {
+			es = append(es, f.entries[name])
+		}
+	}
+	f.mu.Unlock()
+	for _, e := range es {
+		if err := stream.Send(&filer_pb.ListEntriesResponse{Entry: e}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func pairEntries() []*filer_pb.Entry {
