@@ -65,6 +65,10 @@ func (wfs *WFS) lockFlushedHandle(inode uint64, uid, gid uint32) (*FileHandle, *
 		// The flush takes the handle's lock itself.
 		wfs.fhLockTable.ReleaseLock(fh.fh, lock)
 		if code := wfs.doFlush(context.Background(), fh, uid, gid, false); code != fuse.OK {
+			if code == fuse.Status(syscall.ESTALE) {
+				// The path no longer leads to the source: nothing to link.
+				return nil, nil, fuse.ENOENT
+			}
 			return nil, nil, code
 		}
 	}

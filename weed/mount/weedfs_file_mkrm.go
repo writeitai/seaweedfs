@@ -139,18 +139,29 @@ func (wfs *WFS) Create(cancel <-chan struct{}, in *fuse.CreateIn, name string, o
 		// the inode is in the table, and the file is what the namespace has
 		// under it now, on that inode, or nothing if it is gone.
 		known := false
-		if p, st := wfs.inodeToPath.GetPath(inode); wfs.option.EagerFilerCreate && st == fuse.OK {
-			path, latest, latestVersion, loaded := wfs.loadInodeEntry(inode, p)
-			switch {
-			case loaded == fuse.OK && latest.GetAttributes().GetInode() == newEntry.Attributes.Inode && PbEntryKind(latest) == PbEntryKind(newEntry):
-				newEntry, version, entryFullPath, known = latest, latestVersion, path, true
-				wfs.inodeToPath.IncrementNlookup(inode) // the reply's reference
-			case loaded == fuse.ENOENT:
+		if wfs.option.EagerFilerCreate && wfs.inodeToPath.HasInode(inode) {
+			// Whatever happened to it meanwhile decides: no name left, an
+			// error reading it, or another object on that inode, and the
+			// create fails, never rebinding the path to a second inode.
+			fail := func(code fuse.Status) fuse.Status {
 				if dlmLock != nil {
 					dlmLock.Stop()
 				}
-				return fuse.ENOENT // gone again before this reply
+				return code
 			}
+			p, st := wfs.inodeToPath.GetPath(inode)
+			if st != fuse.OK {
+				return fail(fuse.ENOENT) // unlinked again before this reply
+			}
+			path, latest, latestVersion, loaded := wfs.loadInodeEntry(inode, p)
+			switch {
+			case loaded != fuse.OK:
+				return fail(loaded)
+			case latest.GetAttributes().GetInode() != newEntry.Attributes.Inode || PbEntryKind(latest) != PbEntryKind(newEntry):
+				return fail(fuse.EIO)
+			}
+			newEntry, version, entryFullPath, known = latest, latestVersion, path, true
+			wfs.inodeToPath.IncrementNlookup(inode) // the reply's reference
 		}
 		if !known {
 			inode = wfs.inodeToPath.LookupLinked(entryFullPath, newEntry.Attributes.Crtime, PbEntryKind(newEntry), string(newEntry.HardLinkId), inode, true)
@@ -568,7 +579,10 @@ func (wfs *WFS) createRegularFileAt(dirFullPath util.FullPath, name string, mode
 
 	if err != nil {
 		if errors.Is(err, filer_pb.ErrEntryAlreadyExists) {
-			return 0, nil, entryVersion{}, fuse.Status(syscall.EEXIST) // the exclusive create lost
+			// The exclusive create lost to a creator this mount's cache does
+			// not know yet: the next lookup asks the filer, as after Mkdir.
+			wfs.inodeToPath.InvalidateChildrenCache(dirFullPath)
+			return 0, nil, entryVersion{}, fuse.Status(syscall.EEXIST)
 		}
 		return 0, nil, entryVersion{}, grpcErrorToFuseStatus(err)
 	}

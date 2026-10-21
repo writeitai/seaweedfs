@@ -669,6 +669,9 @@ func TestEagerCreateLeavesAWinnersFile(t *testing.T) {
 		if e := f.lookup("/new"); string(e.Content) != "the winner's" {
 			t.Fatalf("exclusive %v: the winner's file now holds %q", exclusive, e.Content)
 		}
+		if exclusive && wfs.inodeToPath.IsChildrenCached("/") {
+			t.Fatal("the lost create left the parent's cache, which lacks the winner")
+		}
 	}
 }
 
@@ -736,5 +739,50 @@ func TestUnlinkOfAFileTheFilerLacks(t *testing.T) {
 	}
 	if !fh.isDeleted {
 		t.Fatal("the open handle was not marked unlinked")
+	}
+}
+
+// A delayed eager Create whose new file was looked up and then lost its
+// only name, or cannot be read again, while the reply was on its way: the
+// create fails, and the name is never bound to a second inode.
+func TestDelayedCreateOfAFileGoneOrUnreadable(t *testing.T) {
+	for _, change := range []string{"unlinked", "unreadable"} {
+		f := newStoreFiler()
+		f.failLookup = map[util.FullPath]bool{}
+		wfs := newLinkTestWFS(t, f)
+		wfs.option.EagerFilerCreate = true
+		var seenInode uint64
+		var once sync.Once
+		f.afterCreate = func(r *filer_pb.CreateEntryRequest) (*filer_pb.CreateEntryResponse, error) {
+			f.mu.Lock()
+			stored := f.find(util.FullPath(r.Directory).Child(r.Entry.Name))
+			resp := &filer_pb.CreateEntryResponse{MetadataEvent: f.event(r.Directory, stored), LogTsNs: f.logTsNs}
+			f.mu.Unlock()
+			if r.Entry.Name == "new" {
+				once.Do(func() {
+					seenInode = seen(t, wfs, f, "new")
+					if change == "unlinked" {
+						if st := wfs.Unlink(nil, &fuse.InHeader{NodeId: 1, Caller: fuse.Caller{Owner: fuse.Owner{Uid: 99, Gid: 100}}}, "new"); st != fuse.OK {
+							t.Errorf("Unlink: %v", st)
+						}
+					} else {
+						wfs.inodeToPath.InvalidateChildrenCache("/")
+						f.mu.Lock()
+						f.failLookup["/new"] = true
+						f.mu.Unlock()
+					}
+				})
+			}
+			return resp, nil
+		}
+		h := fuse.InHeader{NodeId: 1, Caller: fuse.Caller{Owner: fuse.Owner{Uid: 99, Gid: 100}}}
+		var out fuse.CreateOut
+		st := wfs.Create(nil, &fuse.CreateIn{InHeader: h, Flags: syscall.O_WRONLY | syscall.O_CREAT, Mode: 0o644}, "new", &out)
+		if st == fuse.OK {
+			t.Fatalf("%s: Create succeeded, inode %d (looked up as %d)", change, out.NodeId, seenInode)
+		}
+		if inode, found := wfs.inodeToPath.GetInode("/new"); found && inode != seenInode {
+			t.Fatalf("%s: the name was bound to a second inode %d", change, inode)
+		}
 	}
 }

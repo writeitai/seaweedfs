@@ -39,6 +39,7 @@ type storeFiler struct {
 	afterCreate  func(*filer_pb.CreateEntryRequest) (*filer_pb.CreateEntryResponse, error)
 	locks        map[string]string // lock name -> token
 	locked       []string          // every lock name taken, in order
+	failLookup   map[util.FullPath]bool
 }
 
 func newStoreFiler() *storeFiler {
@@ -93,6 +94,9 @@ func entriesEqual(a, b *filer_pb.Entry) bool {
 func (f *storeFiler) LookupDirectoryEntry(_ context.Context, r *filer_pb.LookupDirectoryEntryRequest) (*filer_pb.LookupDirectoryEntryResponse, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.failLookup[util.FullPath(r.Directory).Child(r.Name)] {
+		return nil, status.Error(codes.Internal, "disk on fire")
+	}
 	if e := f.find(util.FullPath(r.Directory).Child(r.Name)); e != nil {
 		return &filer_pb.LookupDirectoryEntryResponse{Entry: e, LogTsNs: f.logTsNs}, nil
 	}
