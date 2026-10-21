@@ -562,6 +562,45 @@ func TestDelayedCreateKeepsNewerHandleState(t *testing.T) {
 	if len(entry.HardLinkId) == 0 || os.FileMode(entry.Attributes.FileMode).Perm() != 0o600 {
 		t.Fatalf("the handle holds %x, mode %o", entry.HardLinkId, os.FileMode(entry.Attributes.FileMode).Perm())
 	}
+	if out.Attr.Mode&0o777 != 0o600 {
+		t.Fatalf("Create reported mode %o", out.Attr.Mode&0o777)
+	}
+}
+
+// A chmod of the new file by path, no handle open, while the eager
+// create's reply is on its way: the create reports and opens the file as
+// the namespace has it now.
+func TestDelayedCreateTakesAPathChmod(t *testing.T) {
+	f := newStoreFiler()
+	wfs := newLinkTestWFS(t, f)
+	wfs.option.EagerFilerCreate = true
+	var once sync.Once
+	f.afterCreate = func(r *filer_pb.CreateEntryRequest) (*filer_pb.CreateEntryResponse, error) {
+		f.mu.Lock()
+		stored := f.find(util.FullPath(r.Directory).Child(r.Entry.Name))
+		resp := &filer_pb.CreateEntryResponse{MetadataEvent: f.event(r.Directory, stored), LogTsNs: f.logTsNs}
+		f.mu.Unlock()
+		if r.Entry.Name == "new" {
+			once.Do(func() {
+				inode := seen(t, wfs, f, "new")
+				var attr fuse.AttrOut
+				in := &fuse.SetAttrIn{SetAttrInCommon: fuse.SetAttrInCommon{InHeader: fuse.InHeader{NodeId: inode}, Valid: fuse.FATTR_MODE, Mode: 0o600}}
+				if st := wfs.SetAttr(nil, in, &attr); st != fuse.OK {
+					t.Errorf("chmod: %v", st)
+				}
+			})
+		}
+		return resp, nil
+	}
+	h := fuse.InHeader{NodeId: 1, Caller: fuse.Caller{Owner: fuse.Owner{Uid: 99, Gid: 100}}}
+	var out fuse.CreateOut
+	if st := wfs.Create(nil, &fuse.CreateIn{InHeader: h, Flags: syscall.O_WRONLY | syscall.O_CREAT, Mode: 0o644}, "new", &out); st != fuse.OK {
+		t.Fatalf("Create: %v", st)
+	}
+	entry := wfs.GetHandle(FileHandleId(out.Fh)).GetEntry().GetEntry()
+	if out.Attr.Mode&0o777 != 0o600 || os.FileMode(entry.Attributes.FileMode).Perm() != 0o600 {
+		t.Fatalf("reported %o, the handle holds %o", out.Attr.Mode&0o777, os.FileMode(entry.Attributes.FileMode).Perm())
+	}
 }
 
 // An unlink of a name this mount's cache takes for standalone, though
@@ -598,5 +637,104 @@ func TestUnlinkOfAStaleStandaloneNameTakesTheGroup(t *testing.T) {
 	}
 	if c := f.lookup("/c"); c == nil || c.HardLinkCounter != 2 {
 		t.Fatalf("after both: %v, want counter 2 (b, c)", c)
+	}
+}
+
+// An eager create that loses to a creator who came after its lookup: the
+// winner keeps its contents; a plain O_CREAT opens it, O_EXCL fails.
+func TestEagerCreateLeavesAWinnersFile(t *testing.T) {
+	for _, exclusive := range []bool{false, true} {
+		f := newStoreFiler()
+		wfs := newLinkTestWFS(t, f)
+		wfs.option.EagerFilerCreate = true
+		var once sync.Once
+		f.beforeCreate = func(r *filer_pb.CreateEntryRequest) {
+			if r.Entry.Name == "new" {
+				once.Do(func() { f.put(plainEntry("new", 9000, "the winner's")) })
+			}
+		}
+		flags := uint32(syscall.O_CREAT | syscall.O_WRONLY)
+		if exclusive {
+			flags |= syscall.O_EXCL
+		}
+		h := fuse.InHeader{NodeId: 1, Caller: fuse.Caller{Owner: fuse.Owner{Uid: 99, Gid: 100}}}
+		var out fuse.CreateOut
+		st := wfs.Create(nil, &fuse.CreateIn{InHeader: h, Flags: flags, Mode: 0o644}, "new", &out)
+		switch {
+		case exclusive && st != fuse.Status(syscall.EEXIST):
+			t.Fatalf("O_EXCL create: %v", st)
+		case !exclusive && (st != fuse.OK || out.Attr.Ino != 9000):
+			t.Fatalf("O_CREAT create: %v, ino %d", st, out.Attr.Ino)
+		}
+		if e := f.lookup("/new"); string(e.Content) != "the winner's" {
+			t.Fatalf("exclusive %v: the winner's file now holds %q", exclusive, e.Content)
+		}
+	}
+}
+
+// While an eager create's reply is on its way, the new file is looked up,
+// linked, and its first name unlinked: the create reports it on that one
+// inode, through the name that is left, and writes through it go there.
+func TestDelayedCreateOfAFileLinkedAndUnlinked(t *testing.T) {
+	f := newStoreFiler()
+	wfs := newLinkTestWFS(t, f)
+	wfs.option.EagerFilerCreate = true
+	var linked uint64
+	var once sync.Once
+	f.afterCreate = func(r *filer_pb.CreateEntryRequest) (*filer_pb.CreateEntryResponse, error) {
+		f.mu.Lock()
+		stored := f.find(util.FullPath(r.Directory).Child(r.Entry.Name))
+		resp := &filer_pb.CreateEntryResponse{MetadataEvent: f.event(r.Directory, stored), LogTsNs: f.logTsNs}
+		f.mu.Unlock()
+		if r.Entry.Name == "new" {
+			once.Do(func() {
+				linked = seen(t, wfs, f, "new")
+				if st := tryLink(wfs, linked, "alias"); st != fuse.OK {
+					t.Errorf("Link: %v", st)
+				}
+				if st := wfs.Unlink(nil, &fuse.InHeader{NodeId: 1, Caller: fuse.Caller{Owner: fuse.Owner{Uid: 99, Gid: 100}}}, "new"); st != fuse.OK {
+					t.Errorf("Unlink: %v", st)
+				}
+			})
+		}
+		return resp, nil
+	}
+	h := fuse.InHeader{NodeId: 1, Caller: fuse.Caller{Owner: fuse.Owner{Uid: 99, Gid: 100}}}
+	var out fuse.CreateOut
+	if st := wfs.Create(nil, &fuse.CreateIn{InHeader: h, Flags: syscall.O_WRONLY | syscall.O_CREAT, Mode: 0o644}, "new", &out); st != fuse.OK {
+		t.Fatalf("Create: %v", st)
+	}
+	if out.NodeId != linked {
+		t.Fatalf("Create reported inode %d, the file is %d", out.NodeId, linked)
+	}
+	fh := wfs.GetHandle(FileHandleId(out.Fh))
+	fh.dirtyMetadata = true
+	if st := wfs.Fsync(nil, &fuse.FsyncIn{InHeader: fuse.InHeader{NodeId: out.NodeId}, Fh: out.Fh}); st != fuse.OK {
+		t.Fatalf("fsync through the created handle: %v", st)
+	}
+}
+
+// Unlinking a file the filer does not have, deleted elsewhere while this
+// mount's cache still has it, clears this mount's state of it.
+func TestUnlinkOfAFileTheFilerLacks(t *testing.T) {
+	f := newStoreFiler()
+	wfs := newLinkTestWFS(t, f)
+	f.put(plainEntry("gone", 8100, "data"))
+	inode := seen(t, wfs, f, "gone")
+	fh, _ := wfs.fhMap.AcquireFileHandle(wfs, inode, f.lookup("/gone"), 0, 0)
+	f.mu.Lock()
+	delete(f.entries, "/gone") // elsewhere, the event not here yet
+	f.mu.Unlock()
+	if st := wfs.Unlink(nil, &fuse.InHeader{NodeId: 1, Caller: fuse.Caller{Owner: fuse.Owner{Uid: 99, Gid: 100}}}, "gone"); st != fuse.OK {
+		t.Fatalf("Unlink: %v", st)
+	}
+	if _, found := wfs.inodeToPath.GetInode("/gone"); found {
+		t.Fatal("the name still leads to the inode")
+	}
+	if cached, _, _ := wfs.metaCache.FindEntry(context.Background(), "/gone"); cached != nil {
+		t.Fatal("the cache still has the file")
+	}
+	if !fh.isDeleted {
+		t.Fatal("the open handle was not marked unlinked")
 	}
 }

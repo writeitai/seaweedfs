@@ -96,6 +96,8 @@ func (wfs *WFS) Create(cancel <-chan struct{}, in *fuse.CreateIn, name string, o
 		if dlmLock != nil {
 			dlmLock.Stop()
 		}
+		// The winner is not in this mount's cache yet: look it up afresh.
+		wfs.inodeToPath.InvalidateChildrenCache(dirFullPath)
 		newEntry, _, code = wfs.maybeLoadEntry(entryFullPath)
 		if code != fuse.OK {
 			return code
@@ -132,18 +134,28 @@ func (wfs *WFS) Create(cancel <-chan struct{}, in *fuse.CreateIn, name string, o
 		// (Mountable: see Link).
 		inodeLock := wfs.inodeLocks().AcquireLock("create", inode, util.SharedLock)
 		defer wfs.inodeLocks().ReleaseLock(inode, inodeLock)
-		// Only a lookup binds the path for a Link to name the file by, so
-		// with the path still unbound there is nothing to look for.
-		if _, bound := wfs.inodeToPath.GetInode(entryFullPath); wfs.option.EagerFilerCreate && bound {
-			if latest, latestVersion, st := wfs.maybeLoadEntry(entryFullPath); st == fuse.OK && len(latest.HardLinkId) > 0 &&
-				latest.GetAttributes().GetInode() == newEntry.Attributes.Inode {
-				newEntry, version = latest, latestVersion
+		// Another process may have looked the new file up while this reply
+		// was on its way, and linked it, renamed it, unlinked a name: then
+		// the inode is in the table, and the file is what the namespace has
+		// under it now, on that inode, or nothing if it is gone.
+		known := false
+		if p, st := wfs.inodeToPath.GetPath(inode); wfs.option.EagerFilerCreate && st == fuse.OK {
+			path, latest, latestVersion, loaded := wfs.loadInodeEntry(inode, p)
+			switch {
+			case loaded == fuse.OK && latest.GetAttributes().GetInode() == newEntry.Attributes.Inode && PbEntryKind(latest) == PbEntryKind(newEntry):
+				newEntry, version, entryFullPath, known = latest, latestVersion, path, true
+				wfs.inodeToPath.IncrementNlookup(inode) // the reply's reference
+			case loaded == fuse.ENOENT:
+				if dlmLock != nil {
+					dlmLock.Stop()
+				}
+				return fuse.ENOENT // gone again before this reply
 			}
 		}
-		inode = wfs.inodeToPath.LookupLinked(entryFullPath, newEntry.Attributes.Crtime, PbEntryKind(newEntry), string(newEntry.HardLinkId), inode, true)
+		if !known {
+			inode = wfs.inodeToPath.LookupLinked(entryFullPath, newEntry.Attributes.Crtime, PbEntryKind(newEntry), string(newEntry.HardLinkId), inode, true)
+		}
 	}
-
-	wfs.outputPbEntry(&out.EntryOut, inode, newEntry)
 
 	// For deferred creates, bypass AcquireHandle (which calls maybeReadEntry
 	// and would fail since the entry is not yet on the filer or in the meta cache).
@@ -180,6 +192,8 @@ func (wfs *WFS) Create(cancel <-chan struct{}, in *fuse.CreateIn, name string, o
 		wfs.fhLockTable.ReleaseLock(fileHandle.fh, fhActiveLock)
 	}
 	fileHandle.RememberPath(entryFullPath)
+	// The file as its handle has it, which may be newer than this reply.
+	wfs.outputPbEntry(&out.EntryOut, inode, fileHandle.GetEntry().GetEntry())
 
 	// Create bypasses AcquireHandle, so attach the lock acquired above.
 	// A surviving handle may already hold one; ours is redundant then.
@@ -280,15 +294,14 @@ func (wfs *WFS) Unlink(cancel <-chan struct{}, header *fuse.InHeader, name strin
 	// Link elsewhere, and the filer's unlink lowers a shared counter by a
 	// read and a write of its own, which only the group's lock keeps from
 	// interleaving with another mount's Link.
+	// One the filer does not have, a deferred create's or one deleted
+	// elsewhere, is no hard link there: it is unlinked here all the same.
 	if entry != nil && len(entry.HardLinkId) == 0 && !entry.IsDirectory {
 		fresh, _, _, freshErr := filer_pb.GetEntry(context.Background(), wfs, entryFullPath)
-		if errors.Is(freshErr, filer_pb.ErrNotFound) {
-			return fuse.OK
-		}
-		if freshErr != nil || fresh == nil {
+		if freshErr != nil && !errors.Is(freshErr, filer_pb.ErrNotFound) {
 			return fuse.EIO
 		}
-		if len(fresh.HardLinkId) > 0 {
+		if fresh != nil && len(fresh.HardLinkId) > 0 {
 			wfs.mapPbIdFromFilerToLocal(fresh)
 			entry = fresh
 		}
@@ -316,7 +329,11 @@ func (wfs *WFS) Unlink(cancel <-chan struct{}, header *fuse.InHeader, name strin
 		// reintroduce the stale-base update the lock is meant to prevent.
 		fresh, _, _, freshErr := filer_pb.GetEntry(context.Background(), wfs, entryFullPath)
 		if errors.Is(freshErr, filer_pb.ErrNotFound) {
-			return fuse.OK
+			// Gone at the filer, by another unlink: this mount's state of
+			// it is cleared below, the siblings' counters left alone.
+			entry = proto.Clone(entry).(*filer_pb.Entry)
+			entry.HardLinkId = nil
+			break
 		}
 		if freshErr != nil || fresh == nil {
 			return fuse.EIO
@@ -518,6 +535,10 @@ func (wfs *WFS) createRegularFileAt(dirFullPath util.FullPath, name string, mode
 		Entry:                    newEntry,
 		Signatures:               []int32{wfs.signature},
 		SkipCheckParentDirectory: true,
+		// Exclusive (Mountable): a creator that won since the lookup above
+		// keeps its file, and this create sees EEXIST, rather than the
+		// upsert replacing the winner's contents with an empty file.
+		OExcl: true,
 	}
 
 	glog.V(1).Infof("createFile: %v", request)
@@ -546,6 +567,9 @@ func (wfs *WFS) createRegularFileAt(dirFullPath util.FullPath, name string, mode
 	glog.V(3).Infof("createFile %s: %v", entryFullPath, err)
 
 	if err != nil {
+		if errors.Is(err, filer_pb.ErrEntryAlreadyExists) {
+			return 0, nil, entryVersion{}, fuse.Status(syscall.EEXIST) // the exclusive create lost
+		}
 		return 0, nil, entryVersion{}, grpcErrorToFuseStatus(err)
 	}
 
