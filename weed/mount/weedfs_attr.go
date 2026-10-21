@@ -110,25 +110,7 @@ func (wfs *WFS) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *fuse
 		truncated = size < oldFileSize
 		if size < oldFileSize {
 			// fmt.Printf("truncate %v \n", fullPath)
-			var chunks []*filer_pb.FileChunk
-			var truncatedChunks []*filer_pb.FileChunk
-			for _, chunk := range entry.GetChunks() {
-				int64Size := int64(chunk.Size)
-				if chunk.Offset+int64Size > int64(size) {
-					// this chunk is truncated
-					int64Size = int64(size) - chunk.Offset
-					if int64Size > 0 {
-						chunks = append(chunks, chunk)
-						glog.V(4).Infof("truncated chunk %+v from %d to %d\n", chunk.GetFileIdString(), chunk.Size, int64Size)
-						chunk.Size = uint64(int64Size)
-					} else {
-						glog.V(4).Infof("truncated whole chunk %+v\n", chunk.GetFileIdString())
-						truncatedChunks = append(truncatedChunks, chunk)
-					}
-				} else {
-					chunks = append(chunks, chunk)
-				}
-			}
+			chunks := truncatedChunks(entry.GetChunks(), size)
 			// set the new chunks and reset entry cache
 			entry.Chunks = chunks
 			if fh != nil {
@@ -543,4 +525,27 @@ func toOsFileType(mode uint32) os.FileMode {
 
 func toOsFileMode(mode uint32) os.FileMode {
 	return toOsFileType(mode) | os.FileMode(mode&07777)
+}
+
+// truncatedChunks is chunks cut at size: chunks past it dropped, the one
+// across it shortened in place.
+func truncatedChunks(chunks []*filer_pb.FileChunk, size uint64) []*filer_pb.FileChunk {
+	var kept []*filer_pb.FileChunk
+	for _, chunk := range chunks {
+		int64Size := int64(chunk.Size)
+		if chunk.Offset+int64Size > int64(size) {
+			// this chunk is truncated
+			int64Size = int64(size) - chunk.Offset
+			if int64Size > 0 {
+				kept = append(kept, chunk)
+				glog.V(4).Infof("truncated chunk %+v from %d to %d\n", chunk.GetFileIdString(), chunk.Size, int64Size)
+				chunk.Size = uint64(int64Size)
+			} else {
+				glog.V(4).Infof("truncated whole chunk %+v\n", chunk.GetFileIdString())
+			}
+		} else {
+			kept = append(kept, chunk)
+		}
+	}
+	return kept
 }

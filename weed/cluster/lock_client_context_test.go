@@ -199,3 +199,27 @@ func TestAcquiredLockIsRenewedUntilStop(t *testing.T) {
 		t.Fatal("Stop left the lock held")
 	}
 }
+
+// StopWithin gives up an unlock that stalls after its bound; the lease
+// then lapses.
+func TestStopWithinIsBounded(t *testing.T) {
+	f := &leaseFiler{}
+	lc := startLeaseFiler(t, f)
+	lock, err := lc.AcquireLock(context.Background(), "k", "me", time.Second)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	f.beforeUnlock = func(ctx context.Context) { <-ctx.Done() }
+	start := time.Now()
+	lock.StopWithin(200 * time.Millisecond)
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("StopWithin took %v", elapsed)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for f.held("k") && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if f.held("k") {
+		t.Fatal("the lease did not lapse")
+	}
+}

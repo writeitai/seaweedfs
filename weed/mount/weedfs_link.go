@@ -108,6 +108,13 @@ func (wfs *WFS) linkLocked(in *fuse.LinkIn, sourceInode uint64, oldEntryPath, ne
 		return code, nil
 	}
 	defer release()
+	return wfs.linkHeld(in, sourceInode, oldEntryPath, newParentPath, name, group, out, nil)
+}
+
+// linkHeld is linkLocked with the group's locks held. An NFS mutation's
+// step, when given, marks where the link begins changing things and
+// bounds its calls (Mountable: see NFSLink).
+func (wfs *WFS) linkHeld(in *fuse.LinkIn, sourceInode uint64, oldEntryPath, newParentPath util.FullPath, name string, group []byte, out *fuse.EntryOut, step *NFSStep) (fuse.Status, []byte) {
 	inodeLock := wfs.inodeLocks().AcquireLock("link", sourceInode, util.ExclusiveLock)
 	defer wfs.inodeLocks().ReleaseLock(sourceInode, inodeLock)
 	fh, fhLock, code := wfs.lockFlushedHandle(sourceInode, in.Uid, in.Gid)
@@ -129,7 +136,13 @@ func (wfs *WFS) linkLocked(in *fuse.LinkIn, sourceInode uint64, oldEntryPath, ne
 		return code, nil
 	}
 	oldParentPath, _ := oldEntryPath.DirAndName()
-	read, _, _, err := filer_pb.GetEntry(context.Background(), wfs, oldEntryPath)
+	var read *filer_pb.Entry
+	var err error
+	if step != nil {
+		read, err = wfs.lookupOnce(step.Prepare, oldEntryPath)
+	} else {
+		read, _, _, err = filer_pb.GetEntry(context.Background(), wfs, oldEntryPath)
+	}
 	if err != nil {
 		if errors.Is(err, filer_pb.ErrNotFound) {
 			return fuse.ENOENT, nil
@@ -168,6 +181,12 @@ func (wfs *WFS) linkLocked(in *fuse.LinkIn, sourceInode uint64, oldEntryPath, ne
 		}
 	}()
 	ctx := context.Background()
+	if step != nil {
+		if !step.Begin() {
+			return NFSRetryLater, nil
+		}
+		ctx = step.Mutate
+	}
 	updateResp, err := wfs.updateEntryOnce(ctx, &filer_pb.UpdateEntryRequest{
 		Directory:  oldParentPath,
 		Entry:      promoted,
@@ -178,6 +197,10 @@ func (wfs *WFS) linkLocked(in *fuse.LinkIn, sourceInode uint64, oldEntryPath, ne
 		glog.V(0).Infof("Link %v: promoting the source: %v", oldEntryPath, err)
 		if code := status.Code(err); code == codes.FailedPrecondition || isNotFound(err) {
 			return fuse.ENOENT, nil
+		}
+		if step != nil {
+			wfs.inodeToPath.InvalidateChildrenCache(util.FullPath(oldParentPath))
+			return nfsCallStatus(err, true), nil
 		}
 		return fuse.EIO, nil
 	}
@@ -249,6 +272,9 @@ func (wfs *WFS) linkLocked(in *fuse.LinkIn, sourceInode uint64, oldEntryPath, ne
 		// The extra reference stays, which keeps chunks longer, never too
 		// short, and Link fails.
 		glog.V(0).Infof("Link %v -> %s: %v %s", oldEntryPath, newEntryPath, err, createResp.GetError())
+		if step != nil {
+			wfs.inodeToPath.InvalidateChildrenCache(newParentPath)
+		}
 		return fuse.EIO, nil
 	}
 	createEvent := createResp.GetMetadataEvent()
@@ -260,7 +286,11 @@ func (wfs *WFS) linkLocked(in *fuse.LinkIn, sourceInode uint64, oldEntryPath, ne
 		glog.Warningf("link %s: best-effort metadata apply failed: %v", newEntryPath, applyErr)
 		wfs.inodeToPath.InvalidateChildrenCache(newParentPath)
 	}
-	wfs.touchDirMtimeCtimeBest(newParentPath)
+	if step != nil {
+		wfs.nfsTouchDir(*step, newParentPath)
+	} else {
+		wfs.touchDirMtimeCtimeBest(newParentPath)
+	}
 
 	wfs.inodeToPath.AddPath(sourceInode, newEntryPath)
 	// The group as the filer has it, also for a source this mount knew as

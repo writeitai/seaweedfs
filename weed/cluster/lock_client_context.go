@@ -116,16 +116,40 @@ func (lock *LiveLock) attempt(ctx context.Context, lockDuration time.Duration) (
 
 // release unlocks a lock that was never handed out, within
 // lockCleanupTimeout.
-func (lock *LiveLock) release() {
-	ctx, cancel := context.WithTimeout(context.Background(), lockCleanupTimeout)
+func (lock *LiveLock) release() { lock.unlockWithin(lockCleanupTimeout) }
+
+// StopWithin is Stop bounded by d: the renewal ends, and the unlock is
+// given up after d, the lease then lapsing on its own.
+func (lock *LiveLock) StopWithin(d time.Duration) {
+	select {
+	case <-lock.cancelCh:
+	default:
+		close(lock.cancelCh)
+	}
+	if lock.renewalDone != nil {
+		timer := time.NewTimer(d)
+		defer timer.Stop()
+		select {
+		case <-lock.renewalDone:
+		case <-timer.C:
+			return // a renewal in flight may still rotate the token
+		}
+	}
+	lock.unlockWithin(d)
+}
+
+func (lock *LiveLock) unlockWithin(d time.Duration) {
+	ctx, cancel := context.WithTimeout(context.Background(), d)
 	defer cancel()
 	err := withFilerClient(ctx, lock, func(client filer_pb.SeaweedFilerClient) error {
 		_, callErr := client.DistributedUnlock(ctx, &filer_pb.UnlockRequest{Name: lock.key, RenewToken: lock.renewToken})
 		return callErr
 	})
 	if err != nil {
-		glog.V(1).Infof("lock %s: unlocking an abandoned grant: %v; it lapses with its lease", lock.key, err)
+		glog.V(1).Infof("lock %s: unlocking: %v; it lapses with its lease", lock.key, err)
+		return
 	}
+	atomic.StoreInt32(&lock.isLocked, 0)
 }
 
 // startRenewal renews the lock every half lease until Stop, as
