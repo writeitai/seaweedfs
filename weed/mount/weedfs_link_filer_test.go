@@ -35,6 +35,7 @@ type storeFiler struct {
 	// replace the reply.
 	beforeUpdate func(*filer_pb.UpdateEntryRequest)
 	beforeCreate func(*filer_pb.CreateEntryRequest)
+	duringDelete func(*filer_pb.DeleteEntryRequest)
 	afterCreate  func(*filer_pb.CreateEntryRequest) (*filer_pb.CreateEntryResponse, error)
 	locks        map[string]string // lock name -> token
 	locked       []string          // every lock name taken, in order
@@ -154,10 +155,29 @@ func (f *storeFiler) UpdateEntry(_ context.Context, r *filer_pb.UpdateEntryReque
 	return &filer_pb.UpdateEntryResponse{MetadataEvent: f.event(r.Directory, stored), LogTsNs: f.logTsNs}, nil
 }
 
+// DeleteEntry deletes a name as the filer's DeleteHardLink does: the
+// shared counter is read, then written lowered, in two steps another
+// writer can come between (duringDelete, when set, runs between them).
 func (f *storeFiler) DeleteEntry(_ context.Context, r *filer_pb.DeleteEntryRequest) (*filer_pb.DeleteEntryResponse, error) {
+	p := util.FullPath(r.Directory).Child(r.Name)
+	f.mu.Lock()
+	e := f.entries[p]
+	counter := int32(0)
+	if rec := f.shared[string(e.GetHardLinkId())]; len(e.GetHardLinkId()) > 0 && rec != nil {
+		counter = rec.HardLinkCounter
+	}
+	f.mu.Unlock()
+	if hook := f.duringDelete; hook != nil {
+		hook(r)
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.remove(util.FullPath(r.Directory).Child(r.Name))
+	if rec := f.shared[string(e.GetHardLinkId())]; len(e.GetHardLinkId()) > 0 && rec != nil {
+		if rec.HardLinkCounter = counter - 1; rec.HardLinkCounter <= 0 {
+			delete(f.shared, string(e.HardLinkId))
+		}
+	}
+	delete(f.entries, p)
 	f.logTsNs++
 	return &filer_pb.DeleteEntryResponse{}, nil
 }

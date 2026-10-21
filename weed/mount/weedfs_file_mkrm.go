@@ -132,7 +132,9 @@ func (wfs *WFS) Create(cancel <-chan struct{}, in *fuse.CreateIn, name string, o
 		// (Mountable: see Link).
 		inodeLock := wfs.inodeLocks().AcquireLock("create", inode, util.SharedLock)
 		defer wfs.inodeLocks().ReleaseLock(inode, inodeLock)
-		if wfs.option.EagerFilerCreate {
+		// Only a lookup binds the path for a Link to name the file by, so
+		// with the path still unbound there is nothing to look for.
+		if _, bound := wfs.inodeToPath.GetInode(entryFullPath); wfs.option.EagerFilerCreate && bound {
 			if latest, latestVersion, st := wfs.maybeLoadEntry(entryFullPath); st == fuse.OK && len(latest.HardLinkId) > 0 &&
 				latest.GetAttributes().GetInode() == newEntry.Attributes.Inode {
 				newEntry, version = latest, latestVersion
@@ -151,25 +153,33 @@ func (wfs *WFS) Create(cancel <-chan struct{}, in *fuse.CreateIn, name string, o
 	// incarnation takes the new entry as its base, under its lock, and
 	// nothing of that one's state carries over.
 	fileHandle, existed := wfs.fhMap.AcquireFileHandle(wfs, inode, newEntry, version.tsNs, version.signature)
-	fhActiveLock := wfs.fhLockTable.AcquireLock("create", fileHandle.fh, util.ExclusiveLock)
-	if existed {
-		// A create is authoritative for the entry it just made, so it takes
-		// effect even on a handle that outlived a previous incarnation,
-		// and nothing of that one's state carries over (Mountable).
-		fileHandle.ResetDirtyPages()
-		fileHandle.SetEntry(newEntry)
-		fileHandle.setAuthoritativeBase(proto.Clone(newEntry).(*filer_pb.Entry))
-		fileHandle.isDeleted, fileHandle.isRenamed, fileHandle.persistErr = false, false, 0
-		fileHandle.entryVersionTsNs.Store(version.tsNs)
-		fileHandle.entryVersionSignature.Store(version.signature)
+	if existed && wfs.option.EagerFilerCreate && wfs.handleHolds(fileHandle) {
+		// A handle of the new file itself, registered by an open while this
+		// reply was on its way: the create's acknowledgement goes in only if
+		// the handle has no newer state, nothing written and no later
+		// acknowledgement.
+		fileHandle.installAckedEntry(newEntry, version.tsNs, version.signature)
+	} else {
+		fhActiveLock := wfs.fhLockTable.AcquireLock("create", fileHandle.fh, util.ExclusiveLock)
+		if existed {
+			// A create is authoritative for the entry it just made, so it
+			// takes effect on a handle that outlived a previous incarnation,
+			// and nothing of that one's state carries over.
+			fileHandle.ResetDirtyPages()
+			fileHandle.SetEntry(newEntry)
+			fileHandle.setAuthoritativeBase(proto.Clone(newEntry).(*filer_pb.Entry))
+			fileHandle.isDeleted, fileHandle.isRenamed, fileHandle.persistErr = false, false, 0
+			fileHandle.entryVersionTsNs.Store(version.tsNs)
+			fileHandle.entryVersionSignature.Store(version.signature)
+		}
+		// Mark dirty so the deferred filer create happens on Flush, even if
+		// the file is closed without any writes. An eager create has already
+		// persisted the entry, so its handle starts clean.
+		fileHandle.dirtyMetadata = !wfs.option.EagerFilerCreate
+		fileHandle.pendingCreate = !wfs.option.EagerFilerCreate
+		wfs.fhLockTable.ReleaseLock(fileHandle.fh, fhActiveLock)
 	}
 	fileHandle.RememberPath(entryFullPath)
-	// Mark dirty so the deferred filer create happens on Flush, even if the
-	// file is closed without any writes. An eager create has already
-	// persisted the entry, so its handle starts clean.
-	fileHandle.dirtyMetadata = !wfs.option.EagerFilerCreate
-	fileHandle.pendingCreate = !wfs.option.EagerFilerCreate
-	wfs.fhLockTable.ReleaseLock(fileHandle.fh, fhActiveLock)
 
 	// Create bypasses AcquireHandle, so attach the lock acquired above.
 	// A surviving handle may already hold one; ours is redundant then.
@@ -265,10 +275,24 @@ func (wfs *WFS) Unlink(cancel <-chan struct{}, header *fuse.InHeader, name strin
 	// in writeitai/fsit).
 	//
 	// When the cache was wrong about the group, the filer's is locked and
-	// the entry read again under it. A name the cache took for standalone
-	// is unlinked without a group lock: a Link of it elsewhere then fails
-	// its promotion's condition, or keeps a counter one too high, never too
-	// low.
+	// the entry read again under it. A file the cache takes for
+	// standalone is read from the filer first: the cache may be behind a
+	// Link elsewhere, and the filer's unlink lowers a shared counter by a
+	// read and a write of its own, which only the group's lock keeps from
+	// interleaving with another mount's Link.
+	if entry != nil && len(entry.HardLinkId) == 0 && !entry.IsDirectory {
+		fresh, _, _, freshErr := filer_pb.GetEntry(context.Background(), wfs, entryFullPath)
+		if errors.Is(freshErr, filer_pb.ErrNotFound) {
+			return fuse.OK
+		}
+		if freshErr != nil || fresh == nil {
+			return fuse.EIO
+		}
+		if len(fresh.HardLinkId) > 0 {
+			wfs.mapPbIdFromFilerToLocal(fresh)
+			entry = fresh
+		}
+	}
 	var releaseGroup func()
 	defer func() {
 		if releaseGroup != nil {
@@ -509,6 +533,7 @@ func (wfs *WFS) createRegularFileAt(dirFullPath util.FullPath, name string, mode
 		event := resp.GetMetadataEvent()
 		if event == nil {
 			event = metadataCreateEvent(string(dirFullPath), newEntry)
+			event.TsNs = ackVersionTsNs(resp)
 		}
 		if applyErr := wfs.applyLocalMetadataEvent(context.Background(), event); applyErr != nil {
 			glog.Warningf("createFile %s: best-effort metadata apply failed: %v", entryFullPath, applyErr)

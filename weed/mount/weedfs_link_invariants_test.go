@@ -2,6 +2,7 @@ package mount
 
 import (
 	"context"
+	"os"
 	"slices"
 	"sync"
 	"syscall"
@@ -517,5 +518,85 @@ func TestLinkSerialisesAGroupBetweenMounts(t *testing.T) {
 	}
 	if a := f.lookup("/a"); a.HardLinkCounter != 4 {
 		t.Fatalf("counter %d, want 4 (a, b, c, d)", a.HardLinkCounter)
+	}
+}
+
+// A delayed eager Create does not discard what happened to the new file
+// meanwhile: a lookup, a link, an open and a chmod. The handle keeps that
+// state, the create's older acknowledgement left out.
+func TestDelayedCreateKeepsNewerHandleState(t *testing.T) {
+	f := newStoreFiler()
+	wfs := newLinkTestWFS(t, f)
+	wfs.option.EagerFilerCreate = true
+	var once sync.Once
+	f.afterCreate = func(r *filer_pb.CreateEntryRequest) (*filer_pb.CreateEntryResponse, error) {
+		f.mu.Lock()
+		stored := f.find(util.FullPath(r.Directory).Child(r.Entry.Name))
+		resp := &filer_pb.CreateEntryResponse{MetadataEvent: f.event(r.Directory, stored), LogTsNs: f.logTsNs}
+		f.mu.Unlock()
+		if r.Entry.Name == "new" {
+			once.Do(func() {
+				inode := seen(t, wfs, f, "new")
+				if st := tryLink(wfs, inode, "alias"); st != fuse.OK {
+					t.Errorf("Link: %v", st)
+				}
+				var opened fuse.OpenOut
+				if st := wfs.Open(nil, &fuse.OpenIn{InHeader: fuse.InHeader{NodeId: inode}, Flags: syscall.O_RDONLY}, &opened); st != fuse.OK {
+					t.Errorf("Open: %v", st)
+				}
+				var attr fuse.AttrOut
+				in := &fuse.SetAttrIn{SetAttrInCommon: fuse.SetAttrInCommon{InHeader: fuse.InHeader{NodeId: inode}, Valid: fuse.FATTR_MODE, Mode: 0o600}}
+				if st := wfs.SetAttr(nil, in, &attr); st != fuse.OK {
+					t.Errorf("chmod: %v", st)
+				}
+			})
+		}
+		return resp, nil
+	}
+	h := fuse.InHeader{NodeId: 1, Caller: fuse.Caller{Owner: fuse.Owner{Uid: 99, Gid: 100}}}
+	var out fuse.CreateOut
+	if st := wfs.Create(nil, &fuse.CreateIn{InHeader: h, Flags: syscall.O_WRONLY | syscall.O_CREAT, Mode: 0o644}, "new", &out); st != fuse.OK {
+		t.Fatalf("Create: %v", st)
+	}
+	entry := wfs.GetHandle(FileHandleId(out.Fh)).GetEntry().GetEntry()
+	if len(entry.HardLinkId) == 0 || os.FileMode(entry.Attributes.FileMode).Perm() != 0o600 {
+		t.Fatalf("the handle holds %x, mode %o", entry.HardLinkId, os.FileMode(entry.Attributes.FileMode).Perm())
+	}
+}
+
+// An unlink of a name this mount's cache takes for standalone, though
+// another mount made it a hard link, while that mount links the group
+// again: the filer lowers the counter by a read and a write of its own,
+// so only the group's lock keeps the two apart, and the counter ends right.
+func TestUnlinkOfAStaleStandaloneNameTakesTheGroup(t *testing.T) {
+	f := newStoreFiler()
+	one, two := newLinkTestWFS(t, f), newLinkTestWFS(t, f)
+	stale := plainEntry("a", 8001, "shared")
+	if err := one.metaCache.InsertEntry(context.Background(), filer.FromPbEntry("/", stale), 0); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	one.inodeToPath.LookupLinked("/a", 1, 0, "", 8001, true)
+	for _, name := range []string{"a", "b"} {
+		e := plainEntry(name, 8001, "shared")
+		e.HardLinkId, e.HardLinkCounter = []byte("group"), 2
+		f.put(e)
+	}
+	b := seen(t, two, f, "b")
+	var once sync.Once
+	linked := make(chan fuse.Status, 1)
+	f.duringDelete = func(*filer_pb.DeleteEntryRequest) {
+		once.Do(func() {
+			go func() { linked <- tryLink(two, b, "c") }()
+			time.Sleep(300 * time.Millisecond)
+		})
+	}
+	if st := one.Unlink(nil, &fuse.InHeader{NodeId: 1, Caller: fuse.Caller{Owner: fuse.Owner{Uid: 99, Gid: 100}}}, "a"); st != fuse.OK {
+		t.Fatalf("Unlink: %v", st)
+	}
+	if st := <-linked; st != fuse.OK {
+		t.Fatalf("Link: %v", st)
+	}
+	if c := f.lookup("/c"); c == nil || c.HardLinkCounter != 2 {
+		t.Fatalf("after both: %v, want counter 2 (b, c)", c)
 	}
 }
