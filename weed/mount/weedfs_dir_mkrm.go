@@ -91,6 +91,9 @@ func (wfs *WFS) Mkdir(cancel <-chan struct{}, in *fuse.MkdirIn, name string, out
 	if err != nil {
 		glog.V(0).Infof("mkdir %s: %v", entryFullPath, err)
 	} else {
+		// The inode the filer stored, before anything caches the entry
+		// (Mountable).
+		inode = wfs.adoptStoredInode(entryFullPath, newEntry, resp)
 		event := resp.GetMetadataEvent()
 		if event == nil {
 			event = metadataCreateEvent(string(dirFullPath), newEntry)

@@ -445,6 +445,9 @@ func (wfs *WFS) createRegularFile(dirFullPath util.FullPath, name string, mode u
 	if err != nil {
 		glog.V(0).Infof("createFile %s: %v", entryFullPath, err)
 	} else {
+		// The inode the filer stored, before anything caches the entry
+		// (Mountable).
+		inode = wfs.adoptStoredInode(entryFullPath, newEntry, resp)
 		event := resp.GetMetadataEvent()
 		if event == nil {
 			event = metadataCreateEvent(string(dirFullPath), newEntry)
