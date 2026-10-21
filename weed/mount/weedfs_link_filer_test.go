@@ -109,6 +109,13 @@ func (f *storeFiler) CreateEntry(_ context.Context, r *filer_pb.CreateEntryReque
 		f.mu.Unlock()
 		return &filer_pb.CreateEntryResponse{Error: "exists", ErrorCode: filer_pb.FilerError_ENTRY_ALREADY_EXISTS}, nil
 	}
+	for _, c := range r.GetCondition().GetClauses() {
+		current, expected := f.find(p), c.GetExpectedEntry()
+		if c.Kind == filer_pb.WriteCondition_IF_ENTRY_EQUAL && ((current == nil) != (expected == nil) || current != nil && !entriesEqual(current, expected)) {
+			f.mu.Unlock()
+			return &filer_pb.CreateEntryResponse{Error: "precondition failed", ErrorCode: filer_pb.FilerError_PRECONDITION_FAILED}, nil
+		}
+	}
 	stored := f.store(p, r.Entry)
 	resp := &filer_pb.CreateEntryResponse{MetadataEvent: f.event(r.Directory, stored), LogTsNs: f.logTsNs}
 	hook := f.afterCreate
