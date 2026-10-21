@@ -59,6 +59,11 @@ func (wfs *WFS) lockFlushedHandle(inode uint64, uid, gid uint32) (*FileHandle, *
 		// A pending async flush needs the lock to finish: drained first.
 		wfs.waitForPendingAsyncFlush(inode)
 		lock := wfs.fhLockTable.AcquireLock("link", fh.fh, util.ExclusiveLock)
+		if fh.isDeleted {
+			// Unlinked here, its flush writing nothing: nothing to link.
+			wfs.fhLockTable.ReleaseLock(fh.fh, lock)
+			return nil, nil, fuse.ENOENT
+		}
 		if !fh.dirtyMetadata {
 			return fh, lock, fuse.OK
 		}
