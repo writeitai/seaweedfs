@@ -1,6 +1,7 @@
 package mount
 
 import (
+	"math/rand/v2"
 	"os"
 	"slices"
 	"sync"
@@ -349,18 +350,33 @@ func (i *InodeToPath) InodeForListing(path util.FullPath, unixTime int64, possib
 	return path.AsInode(unixTime)
 }
 
+// AllocateInode returns the inode for an object being created at path: a
+// random 63-bit number, never 0 or 1 (the mount root), and none the table
+// holds. unixTime is unused.
+//
+// Mountable (writeitai/seaweedfs, branch mountable): stored inodes are
+// unique per creation, so a file recreated at the same path within one
+// second is another object to every identity check, where
+// hash(path) + 37 × seconds made it the same. Every candidate is checked;
+// upstream's probe returned the one after the last occupied candidate
+// unchecked. See D43 and architecture §4 obligation 13 in writeitai/fsit.
 func (i *InodeToPath) AllocateInode(path util.FullPath, unixTime int64) uint64 {
 	if path == "/" {
 		return 1
 	}
 	i.Lock()
 	defer i.Unlock()
-	inode := path.AsInode(unixTime)
-	for _, found := i.inode2path[inode]; found; inode++ {
-		_, found = i.inode2path[inode]
+	for {
+		inode := randomInode()
+		if _, taken := i.inode2path[inode]; inode > 1 && !taken {
+			return inode
+		}
 	}
-	return inode
 }
+
+// randomInode draws a 63-bit number; a variable so tests can force
+// collisions.
+var randomInode = func() uint64 { return rand.Uint64() >> 1 }
 
 func (i *InodeToPath) GetInode(path util.FullPath) (uint64, bool) {
 	if path == "/" {

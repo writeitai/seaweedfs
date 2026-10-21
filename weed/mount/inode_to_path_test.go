@@ -444,3 +444,38 @@ func TestBindingsMoveWatchesOn(t *testing.T) {
 		t.Fatal("a slow miss undid a Rename's binding")
 	}
 }
+
+// AllocateInode draws until a candidate is neither reserved (0, the root's
+// 1) nor in the table, checking every one.
+func TestAllocateInodeSkipsReservedAndTaken(t *testing.T) {
+	m := NewInodeToPath(util.FullPath("/"), 0)
+	m.Lookup("/a", 1, false, false, 100, true)
+	m.Lookup("/b", 1, false, false, 102, true)
+	draws := []uint64{0, 1, 100, 102, 101}
+	saved := randomInode
+	defer func() { randomInode = saved }()
+	randomInode = func() uint64 {
+		next := draws[0]
+		draws = draws[1:]
+		return next
+	}
+	if got := m.AllocateInode("/c", 1); got != 101 {
+		t.Fatalf("allocated %d, want 101", got)
+	}
+	if len(draws) != 0 {
+		t.Fatalf("%d draws left", len(draws))
+	}
+}
+
+// Real draws are 63-bit and differ for one path in one second.
+func TestAllocateInodeIsRandom(t *testing.T) {
+	m := NewInodeToPath(util.FullPath("/"), 0)
+	seen := map[uint64]bool{}
+	for range 1000 {
+		inode := m.AllocateInode("/same", 1)
+		if inode <= 1 || inode >= 1<<63 || seen[inode] {
+			t.Fatalf("allocated %d", inode)
+		}
+		seen[inode] = true
+	}
+}
