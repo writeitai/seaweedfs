@@ -671,11 +671,16 @@ func (wfs *WFS) NFSOpenForWrite(ctx context.Context, inode uint64, uid, gid uint
 	if code != fuse.OK {
 		return 0, code
 	}
+	// Marked under the map's lock, which the periodic flush reads the
+	// handles under: no flush that saw the handle unmarked is still
+	// looking when the first WRITE starts.
+	wfs.fhMap.Lock()
+	fh.nfsWrite.Store(true)
+	wfs.fhMap.Unlock()
 	if code := wfs.acquireWriteLeaseContext(ctx, fh); code != fuse.OK {
 		wfs.ReleaseHandle(fh.fh)
 		return 0, code
 	}
-	fh.nfsWrite.Store(true)
 	return fh.fh, fuse.OK
 }
 

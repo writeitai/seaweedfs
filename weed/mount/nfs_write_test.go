@@ -419,3 +419,61 @@ func TestNFSWritesWithThePeriodicFlush(t *testing.T) {
 		}
 	}
 }
+
+// Opening the NFS write handle, an abandoned WRITE through it and the
+// periodic metadata flush, all at once: the flush never persists the
+// WRITE, which sends no entry write of its own.
+func TestNFSOpenWriteAndThePeriodicFlush(t *testing.T) {
+	wfs, f, id := newVolumeTestWFS(t)
+	inode := wfs.GetHandle(id).inode
+	wfs.NFSCloseWrite(id, false)
+	stop := make(chan struct{})
+	flushed := make(chan struct{})
+	go func() {
+		defer close(flushed)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				wfs.flushAllDirtyMetadata()
+			}
+		}
+	}()
+	for range 50 {
+		h, st := wfs.NFSOpenForWrite(context.Background(), inode, 99, 100)
+		if st != fuse.OK {
+			t.Fatalf("open: %v", st)
+		}
+		abandoned, _ := nfsStep(t, time.Nanosecond, time.Second)
+		time.Sleep(time.Microsecond)
+		if _, st := wfs.NFSWrite(abandoned, h, 1, []byte("XXXX"), 99, 100); st != NFSRetryLater {
+			t.Fatalf("write: %v", st)
+		}
+		wfs.NFSCloseWrite(h, false)
+	}
+	close(stop)
+	<-flushed
+	if f.sent() != 0 || f.lookup("/a").Attributes.FileSize != 1 {
+		t.Fatalf("%d entry writes, stored %v", f.sent(), f.lookup("/a"))
+	}
+}
+
+// A file patched in place in its second half keeps its first chunk
+// partly visible, so rewriting the whole file in place counts every patch
+// too: past the cap, even its first WRITE is EFBIG (the published limit;
+// saving to a fresh file or after truncating starts with no chunks).
+func TestNFSWriteFullRewriteInPlaceOfAPatchedFile(t *testing.T) {
+	const base = 2 << 20
+	e := plainEntry("a", 8001, "")
+	e.Content = nil
+	e.Attributes.FileSize = base
+	e.Chunks = []*filer_pb.FileChunk{{FileId: "3,ff0abcdef", Offset: 0, Size: base, ModifiedTsNs: 1}}
+	for i := 1; i <= nfsMaxChunks-1; i++ { // patches in the second half
+		e.Chunks = append(e.Chunks, &filer_pb.FileChunk{FileId: fmt.Sprintf("3,%x0abcdef", i), Offset: int64(base/2 + 2*i), Size: 1, ModifiedTsNs: int64(i + 1)})
+	}
+	wfs, _, id := newVolumeTestWFSWith(t, e)
+	if _, st := wfs.NFSWrite(step(t), id, 0, make([]byte, 1<<20), 99, 100); st != fuse.Status(syscall.EFBIG) {
+		t.Fatalf("the first MiB of a rewrite in place: %v", st)
+	}
+}
