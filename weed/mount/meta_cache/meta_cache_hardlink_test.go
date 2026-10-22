@@ -37,19 +37,50 @@ func TestHardLinkChangeThroughAnUncachedName(t *testing.T) {
 	mc.WaitForEntryInvalidations()
 }
 
-// A listing written in a batch is the group as the filer has it: an older
-// record kept from before does not override it.
-func TestBatchListingRefreshesAHardLinkRecord(t *testing.T) {
-	mc, _, _, _ := newTestMetaCache(t, map[util.FullPath]bool{"/": true, "/d": true})
+// list rebuilds dir from a listing of entries at snapshot, as EnsureVisited
+// does.
+func list(t *testing.T, mc *MetaCache, dir util.FullPath, snapshot int64, entries ...*filer.Entry) {
+	t.Helper()
 	ctx := context.Background()
-	if err := mc.InsertEntry(ctx, hardLink("/d/a", 0o644), 0); err != nil {
-		t.Fatalf("insert: %v", err)
+	if err := mc.BeginDirectoryBuild(ctx, dir); err != nil {
+		t.Fatalf("begin: %v", err)
 	}
-	if err := mc.doBatchInsertEntries(ctx, []*filer.Entry{hardLink("/d/a", 0o600)}); err != nil {
+	if err := mc.doBatchInsertEntries(ctx, entries); err != nil {
 		t.Fatalf("batch insert: %v", err)
 	}
+	var links []*filer.Entry
+	for _, e := range entries {
+		if len(e.HardLinkId) > 0 {
+			links = append(links, e)
+		}
+	}
+	if err := mc.completeDirectoryBuild(ctx, dir, snapshot, nil, links); err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+}
+
+// A listing is the group as the filer had it at the listing's snapshot: it
+// replaces an older record, and never a record a later event wrote.
+func TestListingAndHardLinkRecordVersions(t *testing.T) {
+	mc, _, _, _ := newTestMetaCache(t, map[util.FullPath]bool{"/": true, "/d": true})
+	ctx := context.Background()
+	if err := mc.InsertEntry(ctx, hardLink("/d/a", 0o644), 1000); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	list(t, mc, "/d", 2000, hardLink("/d/a", 0o600))
 	if e, _, err := mc.FindEntry(ctx, "/d/a"); err != nil || e.Attr.Mode.Perm() != 0o600 {
-		t.Fatalf("after the listing: %v (%v)", e, err)
+		t.Fatalf("after a newer listing: %v (%v)", e, err)
+	}
+	acked := hardLink("/d/a", 0o640).ToProtoEntry()
+	event := &filer_pb.SubscribeMetadataResponse{Directory: "/d", TsNs: 3000, EventNotification: &filer_pb.EventNotification{
+		OldEntry: &filer_pb.Entry{Name: "a"}, NewEntry: acked, NewParentPath: "/d",
+	}}
+	if err := mc.ApplyMetadataResponse(ctx, event, LocalMetadataResponseApplyOptions); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	list(t, mc, "/d", 2500, hardLink("/d/a", 0o644)) // delayed, from before the event
+	if e, _, err := mc.FindEntry(ctx, "/d/a"); err != nil || e.Attr.Mode.Perm() != 0o640 {
+		t.Fatalf("after a delayed listing: %v (%v)", e, err)
 	}
 	mc.WaitForEntryInvalidations()
 }

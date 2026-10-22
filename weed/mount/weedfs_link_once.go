@@ -49,8 +49,9 @@ func (wfs *WFS) lockHardLinkGroup(linkID []byte) (release func(), code fuse.Stat
 }
 
 // lockFlushedHandle takes the open handle of inode, if there is one, with
-// its dirty data flushed first, and returns it with its lock held.
-func (wfs *WFS) lockFlushedHandle(inode uint64, uid, gid uint32) (*FileHandle, *util.ActiveLock, fuse.Status) {
+// its dirty data flushed first, and returns it with its lock held. Its
+// waits for the handle's lock end with ctx (NFSRetryLater).
+func (wfs *WFS) lockFlushedHandle(ctx context.Context, inode uint64, uid, gid uint32) (*FileHandle, *util.ActiveLock, fuse.Status) {
 	fh, found := wfs.fhMap.FindFileHandle(inode)
 	if !found {
 		return nil, nil, fuse.OK
@@ -58,7 +59,10 @@ func (wfs *WFS) lockFlushedHandle(inode uint64, uid, gid uint32) (*FileHandle, *
 	for range 3 {
 		// A pending async flush needs the lock to finish: drained first.
 		wfs.waitForPendingAsyncFlush(inode)
-		lock := wfs.fhLockTable.AcquireLock("link", fh.fh, util.ExclusiveLock)
+		lock, ok := lockWithin(ctx, wfs.fhLockTable, "link", fh.fh, util.ExclusiveLock)
+		if !ok {
+			return nil, nil, NFSRetryLater
+		}
 		if fh.isDeleted {
 			// Unlinked here, its flush writing nothing: nothing to link.
 			wfs.fhLockTable.ReleaseLock(fh.fh, lock)
@@ -69,7 +73,7 @@ func (wfs *WFS) lockFlushedHandle(inode uint64, uid, gid uint32) (*FileHandle, *
 		}
 		// The flush takes the handle's lock itself.
 		wfs.fhLockTable.ReleaseLock(fh.fh, lock)
-		if code := wfs.doFlush(context.Background(), fh, uid, gid, false); code != fuse.OK {
+		if code := wfs.doFlush(ctx, fh, uid, gid, false); code != fuse.OK {
 			if code == fuse.Status(syscall.ESTALE) {
 				// The path no longer leads to the source: nothing to link.
 				return nil, nil, fuse.ENOENT
@@ -78,6 +82,24 @@ func (wfs *WFS) lockFlushedHandle(inode uint64, uid, gid uint32) (*FileHandle, *
 		}
 	}
 	return nil, nil, fuse.Status(syscall.EAGAIN) // written to all along
+}
+
+// lockWithin takes key's lock in table unless ctx ends first; a lock got
+// after that is let go at once (Mountable: NFS waits end with their
+// preparation).
+func lockWithin[T comparable](ctx context.Context, table *util.LockTable[T], intention string, key T, lockType util.LockType) (*util.ActiveLock, bool) {
+	if ctx.Done() == nil {
+		return table.AcquireLock(intention, key, lockType), true
+	}
+	got := make(chan *util.ActiveLock, 1)
+	go func() { got <- table.AcquireLock(intention, key, lockType) }()
+	select {
+	case lock := <-got:
+		return lock, true
+	case <-ctx.Done():
+		go func() { table.ReleaseLock(key, <-got) }()
+		return nil, false
+	}
 }
 
 // entryEqual is the condition that the stored entry is still entry, in the

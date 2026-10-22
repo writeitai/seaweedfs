@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"slices"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -31,6 +32,12 @@ func (f *storeFiler) StreamRenameEntry(r *filer_pb.StreamRenameEntryRequest, str
 	delete(f.entries, from)
 	raw.Name = r.NewName
 	f.entries[to] = raw
+	for p, e := range f.entries { // what is below a directory moves with it
+		if strings.HasPrefix(string(p), string(from)+"/") {
+			delete(f.entries, p)
+			f.entries[to+p[len(from):]] = e
+		}
+	}
 	f.logTsNs++
 	moved, ts := f.find(to), f.logTsNs
 	f.mu.Unlock()
@@ -656,5 +663,98 @@ func TestNFSLinkLaterRefusalIsIO(t *testing.T) {
 	startFakeFiler(t, wfs, deniedFiler{f, "l"})
 	if st := wfs.NFSLink(step(t), inode, 1, "l", 99, 100); st != fuse.EIO {
 		t.Fatalf("link: %v", st)
+	}
+}
+
+// A LINK whose source another open holds stops waiting with its
+// preparation, letting go of the group's lease it took.
+func TestNFSLinkWaitsEndWithThePreparation(t *testing.T) {
+	f := newStoreFiler()
+	wfs := newLinkTestWFS(t, f)
+	f.put(plainEntry("a", 8001, "a"))
+	inode := seen(t, wfs, f, "a")
+	held := wfs.inodeLocks().AcquireLock("an open", inode, util.SharedLock)
+	s, _ := nfsStep(t, 300*time.Millisecond, 5*time.Second)
+	start := time.Now()
+	if st := wfs.NFSLink(s, inode, 1, "l", 99, 100); st != NFSRetryLater {
+		t.Fatalf("link: %v", st)
+	}
+	if took := time.Since(start); took > 2*time.Second {
+		t.Fatalf("took %v", took)
+	}
+	waitUnlocked(t, f)
+	wfs.inodeLocks().ReleaseLock(inode, held)
+	if st := wfs.NFSLink(step(t), inode, 1, "l", 99, 100); st != fuse.OK {
+		t.Fatalf("link once free: %v", st)
+	}
+}
+
+// A guard is the change time GETATTR reports: the modification time for
+// an entry that stores none.
+func TestNFSSetAttrGuardIsTheReportedCtime(t *testing.T) {
+	f := newStoreFiler()
+	wfs := newLinkTestWFS(t, f)
+	e := plainEntry("a", 8001, "data")
+	e.Attributes.Mtime, e.Attributes.MtimeNs, e.Attributes.Ctime = 500, 7, 0
+	f.put(e)
+	inode := seen(t, wfs, f, "a")
+	f.mu.Lock()
+	f.entries["/a"].Attributes.Ctime = 0 // as stored, whatever put made of it
+	f.mu.Unlock()
+	reported := time.Unix(500, 7)
+	mode := uint32(0o600)
+	if st := wfs.NFSSetAttr(step(t), inode, NFSAttrs{Mode: &mode}, &reported, false); st != fuse.OK {
+		t.Fatalf("guarded by the reported ctime: %v", st)
+	}
+}
+
+// The root's mode and owner change while GetAttr reads them without a
+// race.
+func TestRootAttributesChangeSafely(t *testing.T) {
+	f := newStoreFiler()
+	wfs := newLinkTestWFS(t, f)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := range 20 {
+			in := &fuse.SetAttrIn{SetAttrInCommon: fuse.SetAttrInCommon{InHeader: fuse.InHeader{NodeId: 1}, Valid: fuse.FATTR_MODE, Mode: uint32(0o700 + i%2)}}
+			var out fuse.AttrOut
+			wfs.SetAttr(nil, in, &out)
+		}
+	}()
+	for {
+		select {
+		case <-done:
+			return
+		default:
+		}
+		var out fuse.AttrOut
+		wfs.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{NodeId: 1}}, &out)
+	}
+}
+
+// A directory's rename moves the names below it in the table too, so
+// their inodes lead to where they are now; the cache reads both
+// directories again.
+func TestNFSRenameMovesASubtree(t *testing.T) {
+	f := newStoreFiler()
+	wfs := newLinkTestWFS(t, f)
+	wfs.inodeToPath.MarkChildrenCached("/")
+	if _, st := wfs.NFSMkdir(step(t), 1, "d", NFSAttrs{}, 99, 100); st != fuse.OK {
+		t.Fatalf("mkdir: %v", st)
+	}
+	dir, _ := wfs.inodeToPath.GetInode("/d")
+	child, st := wfs.NFSCreate(step(t), dir, "f", NFSGuarded, NFSAttrs{}, [8]byte{}, 99, 100, nil)
+	if st != fuse.OK {
+		t.Fatalf("create: %v", st)
+	}
+	if st := wfs.NFSRename(step(t), 1, "d", 1, "e"); st != fuse.OK {
+		t.Fatalf("rename: %v", st)
+	}
+	if p, _ := wfs.inodeToPath.GetPath(child); p != "/e/f" {
+		t.Fatalf("the child is at %s", p)
+	}
+	if wfs.inodeToPath.IsChildrenCached("/") {
+		t.Fatal("the parent is still taken from the cache")
 	}
 }

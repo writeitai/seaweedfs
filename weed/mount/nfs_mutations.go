@@ -422,7 +422,7 @@ func (wfs *WFS) NFSRename(step NFSStep, fromDir uint64, fromName string, toDir u
 		NewDirectory: string(newDir),
 		NewName:      toName,
 		Signatures:   []int32{wfs.signature},
-	}, newPath)
+	})
 	if err != nil {
 		if targetInode != 0 {
 			wfs.clearHandleDeleted(targetInode, epoch)
@@ -431,6 +431,19 @@ func (wfs *WFS) NFSRename(step NFSStep, fromDir uint64, fromName string, toDir u
 		wfs.inodeToPath.InvalidateChildrenCache(oldDir)
 		wfs.inodeToPath.InvalidateChildrenCache(newDir)
 		return nfsCallStatus(err, true)
+	}
+	// Committed. Neither directory is taken from the cache any more, lookups
+	// reading them again; the moved names keep their inodes.
+	wfs.inodeToPath.InvalidateChildrenCache(oldDir)
+	wfs.inodeToPath.InvalidateChildrenCache(newDir)
+	sourceInode, moving := wfs.inodeToPath.GetInode(oldPath)
+	if source.IsDirectory {
+		wfs.inodeToPath.MoveSubtree(oldPath, newPath)
+	} else {
+		wfs.inodeToPath.MovePath(oldPath, newPath)
+	}
+	if fh, open := wfs.fhMap.FindFileHandle(sourceInode); moving && open {
+		fh.RememberPath(newPath)
 	}
 	wfs.inodeToPath.TouchDirectory(oldDir)
 	wfs.inodeToPath.TouchDirectory(newDir)
@@ -479,7 +492,11 @@ func (wfs *WFS) NFSLink(step NFSStep, source, dir uint64, name string, uid, gid 
 		if code != fuse.OK {
 			return code
 		}
-		local := wfs.hardLinkLockTable.AcquireLock("hardlink", string(group), util.ExclusiveLock)
+		local, ok := lockWithin(step.Prepare, wfs.hardLinkLockTable, "hardlink", string(group), util.ExclusiveLock)
+		if !ok {
+			release()
+			return NFSRetryLater
+		}
 		code, other := wfs.linkHeld(in, source, oldEntryPath, newParentPath, name, group, &fuse.EntryOut{}, &step)
 		wfs.hardLinkLockTable.ReleaseLock(string(group), local)
 		release()
@@ -515,7 +532,7 @@ func (wfs *WFS) NFSSetAttr(step NFSStep, inode uint64, attrs NFSAttrs, guard *ti
 	}
 	// The root's times are WFS's own, the time of each call (setRootAttr),
 	// so no guard can name them: the root's is not checked.
-	if guard != nil && inode != 1 && (entry.Attributes.Ctime != guard.Unix() || entry.Attributes.CtimeNs != int32(guard.Nanosecond())) {
+	if guard != nil && inode != 1 && !guard.Equal(effectiveCtime(entry.Attributes)) {
 		return NFSNotSync
 	}
 	if attrs.Size != nil && *attrs.Size > filer.FileSize(entry) && wfs.IsOverQuotaWithUncommitted() {
@@ -561,8 +578,10 @@ func (wfs *WFS) NFSSetAttr(step NFSStep, inode uint64, attrs NFSAttrs, guard *ti
 	if inode == 1 {
 		// WFS reports the root from these, as after a FUSE SetAttr, as the
 		// filer acknowledged them.
+		wfs.rootMu.Lock()
 		wfs.option.MountMode = os.FileMode(chmod(uint32(wfs.option.MountMode), updated.Attributes.FileMode))
 		wfs.option.MountUid, wfs.option.MountGid = updated.Attributes.Uid, updated.Attributes.Gid
+		wfs.rootMu.Unlock()
 	}
 	if attrs.Atime != nil || clearVerifier {
 		// WFS keeps access times in memory; GetAttr reports this one.
@@ -858,37 +877,33 @@ func (wfs *WFS) deleteEntryOnce(ctx context.Context, req *filer_pb.DeleteEntryRe
 	return resp, err
 }
 
-// renameOnce sends one StreamRenameEntry and, once the filer reports it
-// committed (the stream's end), applies its events as a FUSE rename does:
-// the filer sends them as it moves, before its transaction commits, which
-// may still fail.
-func (wfs *WFS) renameOnce(ctx context.Context, req *filer_pb.StreamRenameEntryRequest, newPath util.FullPath) error {
-	var events []*filer_pb.StreamRenameEntryResponse
-	err := wfs.withFilerOnce(ctx, func(client filer_pb.SeaweedFilerClient) error {
+// renameOnce sends one StreamRenameEntry and reads it to its end, which
+// is the filer's commit. Its events, which the filer sends while it moves,
+// before the commit, are not applied: the caller brings the mount up to
+// the committed rename (NFSRename).
+func (wfs *WFS) renameOnce(ctx context.Context, req *filer_pb.StreamRenameEntryRequest) error {
+	return wfs.withFilerOnce(ctx, func(client filer_pb.SeaweedFilerClient) error {
 		stream, err := client.StreamRenameEntry(ctx, req)
 		if err != nil {
 			return err
 		}
 		for {
-			resp, err := stream.Recv()
-			if errors.Is(err, io.EOF) {
+			if _, err := stream.Recv(); errors.Is(err, io.EOF) {
 				return nil
-			}
-			if err != nil {
+			} else if err != nil {
 				return err
 			}
-			events = append(events, resp)
 		}
 	})
-	if err != nil {
-		return err
+}
+
+// effectiveCtime is the change time GetAttr reports: the stored one, or
+// the modification time for an entry that has none (setAttrByPbEntry).
+func effectiveCtime(a *filer_pb.FuseAttributes) time.Time {
+	if a.Ctime == 0 {
+		return time.Unix(a.Mtime, int64(a.MtimeNs))
 	}
-	for _, resp := range events {
-		if err := wfs.handleRenameResponse(context.Background(), resp, newPath, nil); err != nil {
-			return err
-		}
-	}
-	return nil
+	return time.Unix(a.Ctime, int64(a.CtimeNs))
 }
 
 // sameObject reports whether two entries are names of one file: one hard

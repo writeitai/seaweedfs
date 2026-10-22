@@ -115,9 +115,18 @@ func (wfs *WFS) linkLocked(in *fuse.LinkIn, sourceInode uint64, oldEntryPath, ne
 // step, when given, marks where the link begins changing things and
 // bounds its calls (Mountable: see NFSLink).
 func (wfs *WFS) linkHeld(in *fuse.LinkIn, sourceInode uint64, oldEntryPath, newParentPath util.FullPath, name string, group []byte, out *fuse.EntryOut, step *NFSStep) (fuse.Status, []byte) {
-	inodeLock := wfs.inodeLocks().AcquireLock("link", sourceInode, util.ExclusiveLock)
+	// An NFS link waits for these local locks only within its preparation
+	// (Mountable: see NFSLink).
+	ctx := context.Background()
+	if step != nil {
+		ctx = step.Prepare
+	}
+	inodeLock, ok := lockWithin(ctx, wfs.inodeLocks(), "link", sourceInode, util.ExclusiveLock)
+	if !ok {
+		return NFSRetryLater, nil
+	}
 	defer wfs.inodeLocks().ReleaseLock(sourceInode, inodeLock)
-	fh, fhLock, code := wfs.lockFlushedHandle(sourceInode, in.Uid, in.Gid)
+	fh, fhLock, code := wfs.lockFlushedHandle(ctx, sourceInode, in.Uid, in.Gid)
 	if code != fuse.OK {
 		return code, nil
 	}
@@ -185,7 +194,6 @@ func (wfs *WFS) linkHeld(in *fuse.LinkIn, sourceInode uint64, oldEntryPath, newP
 			wfs.inodeToPath.EndLink(sourceInode, group, linked)
 		}
 	}()
-	ctx := context.Background()
 	if step != nil {
 		if !step.Begin() {
 			return NFSRetryLater, nil

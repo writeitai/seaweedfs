@@ -220,6 +220,10 @@ type WFS struct {
 	// lockClient is the DLM client for cross-mount write coordination.
 	// Non-nil only when EnableDistributedLock is true.
 	lockClient *cluster.LockClient
+
+	// rootMu guards the root's mode and owner in option, which SetAttr of
+	// the root changes while GetAttr reads them (Mountable).
+	rootMu sync.RWMutex
 }
 
 const defaultDirIdleEvict = 10 * time.Minute
@@ -700,14 +704,15 @@ func (wfs *WFS) maybeLoadEntry(fullpath util.FullPath) (*filer_pb.Entry, entryVe
 
 	// return a valid entry for the mount root
 	if string(fullpath) == wfs.option.FilerMountRootPath {
+		mode, uid, gid := wfs.rootAttrs()
 		return &filer_pb.Entry{
 			Name:        name,
 			IsDirectory: true,
 			Attributes: &filer_pb.FuseAttributes{
 				Mtime:    wfs.option.MountMtime.Unix(),
-				FileMode: uint32(wfs.option.MountMode),
-				Uid:      wfs.option.MountUid,
-				Gid:      wfs.option.MountGid,
+				FileMode: uint32(mode),
+				Uid:      uid,
+				Gid:      gid,
 				Crtime:   wfs.option.MountCtime.Unix(),
 			},
 		}, entryVersion{}, fuse.OK

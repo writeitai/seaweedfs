@@ -4,6 +4,7 @@ import (
 	"math/rand/v2"
 	"os"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -1051,6 +1052,38 @@ func (i *InodeToPath) MovePath(sourcePath, targetPath util.FullPath) (sourceInod
 		glog.Errorf("MovePath %s to %s: sourceInode %d not found", sourcePath, targetPath, sourceInode)
 	}
 	return
+}
+
+// MoveSubtree is MovePath for a directory and every path below it, which a
+// rename moves with it.
+//
+// Mountable (writeitai/seaweedfs, branch nfs-writes): an NFS rename moves
+// its table at once, without the filer's per-entry events (see
+// NFSRename).
+func (i *InodeToPath) MoveSubtree(sourcePath, targetPath util.FullPath) {
+	i.MovePath(sourcePath, targetPath)
+	i.Lock()
+	defer i.Unlock()
+	prefix := string(sourcePath) + "/"
+	for path, inode := range i.path2inode {
+		if !strings.HasPrefix(string(path), prefix) {
+			continue
+		}
+		moved := targetPath + path[len(sourcePath):]
+		i.boundLocked(path)
+		i.boundLocked(moved)
+		delete(i.path2inode, path)
+		i.path2inode[moved] = inode
+		if entry := i.inode2path[inode]; entry != nil {
+			entry.replacePath(path, moved)
+		}
+		if d := i.dirStates[inode]; d != nil && d.path == path {
+			i.dropDirPath(inode)
+			d.path = moved
+			i.dirPaths[moved] = d
+			d.resetCacheState()
+		}
+	}
 }
 
 // Forget drops nlookup references. onRelease, if given, runs at the moment the
