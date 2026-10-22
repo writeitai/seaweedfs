@@ -84,3 +84,51 @@ func TestListingAndHardLinkRecordVersions(t *testing.T) {
 	}
 	mc.WaitForEntryInvalidations()
 }
+
+// A section refresh, and a mount's own change to a group, go through the
+// group's version: a delayed refresh listing another name of the group
+// leaves a later change, and a later refresh replaces it.
+func TestHardLinkRecordFenceCoversRefreshesAndOwnChanges(t *testing.T) {
+	mc, _, _, _ := newTestMetaCache(t, map[util.FullPath]bool{"/": true, "/d": true})
+	ctx := context.Background()
+	buildSectionedDir(t, mc, "/d", 1000, nil)
+	acked := hardLink("/d/a", 0o640).ToProtoEntry()
+	event := &filer_pb.SubscribeMetadataResponse{Directory: "/d", TsNs: 3000, EventNotification: &filer_pb.EventNotification{
+		OldEntry: &filer_pb.Entry{Name: "a"}, NewEntry: acked, NewParentPath: "/d",
+	}}
+	if err := mc.ApplyMetadataResponse(ctx, event, LocalMetadataResponseApplyOptions); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	refresh := func(snapshot int64, mode os.FileMode) {
+		t.Helper()
+		if err := mc.enqueueAndWait(ctx, metadataApplyRequest{
+			kind:      metadataSectionRefresh,
+			buildPath: "/d",
+			refresh:   &sectionRefresh{entries: []*filer.Entry{hardLink("/d/a", 0o640), hardLink("/d/b", mode)}, snapshotTsNs: snapshot},
+		}); err != nil {
+			t.Fatalf("refresh: %v", err)
+		}
+	}
+	mode := func() os.FileMode {
+		t.Helper()
+		e, _, err := mc.FindEntry(ctx, "/d/a")
+		if err != nil {
+			t.Fatalf("find: %v", err)
+		}
+		return e.Attr.Mode.Perm()
+	}
+	refresh(2500, 0o644) // delayed, from before the event
+	if m := mode(); m != 0o640 {
+		t.Fatalf("after a delayed refresh: %o", m)
+	}
+	refresh(4000, 0o600)
+	if m := mode(); m != 0o600 {
+		t.Fatalf("after a later refresh: %o", m)
+	}
+	mc.UpdateHardLinkRecord(ctx, hardLink("/d/b", 0o604), 5000) // a removal's decrement, say
+	list(t, mc, "/d", 4500, hardLink("/d/a", 0o644), hardLink("/d/b", 0o644))
+	if m := mode(); m != 0o604 {
+		t.Fatalf("after a listing older than the mount's change: %o", m)
+	}
+	mc.WaitForEntryInvalidations()
+}

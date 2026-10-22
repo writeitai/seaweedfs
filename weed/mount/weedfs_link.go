@@ -126,7 +126,7 @@ func (wfs *WFS) linkHeld(in *fuse.LinkIn, sourceInode uint64, oldEntryPath, newP
 		return NFSRetryLater, nil
 	}
 	defer wfs.inodeLocks().ReleaseLock(sourceInode, inodeLock)
-	fh, fhLock, code := wfs.lockFlushedHandle(ctx, sourceInode, in.Uid, in.Gid)
+	fh, fhLock, code := wfs.lockFlushedHandle(ctx, sourceInode, in.Uid, in.Gid, step == nil)
 	if code != fuse.OK {
 		return code, nil
 	}
@@ -319,7 +319,7 @@ func (wfs *WFS) linkHeld(in *fuse.LinkIn, sourceInode uint64, oldEntryPath, newP
 	// existing sibling link (other than the source we just wrote) returns
 	// the old nlink from the local metacache — pjdfstest link/00.t catches
 	// this after `link n1 n2` when it stats n0.
-	wfs.syncHardLinkSiblings(sourceInode, acked, oldEntryPath, newEntryPath)
+	wfs.syncHardLinkSiblings(sourceInode, acked, ackVersionTsNs(createResp), oldEntryPath, newEntryPath)
 
 	// Map back to local uid/gid before writing attributes to the kernel.
 	reported := proto.Clone(alias).(*filer_pb.Entry)
@@ -333,9 +333,10 @@ func (wfs *WFS) linkHeld(in *fuse.LinkIn, sourceInode uint64, oldEntryPath, newP
 // syncHardLinkSiblings rewrites the cached HardLinkCounter (and ctime) on
 // every sibling link of the given inode, and invalidates the kernel's inode
 // attr cache. `authoritativeEntry` carries the counter/ctime that should be
-// propagated. `skipPaths` are the link paths already updated by the caller
+// propagated, as of `tsNs`, the filer log position of the change (0 when
+// unknown). `skipPaths` are the link paths already updated by the caller
 // (typically the source and/or the newly created/removed link).
-func (wfs *WFS) syncHardLinkSiblings(inode uint64, authoritativeEntry *filer_pb.Entry, skipPaths ...util.FullPath) {
+func (wfs *WFS) syncHardLinkSiblings(inode uint64, authoritativeEntry *filer_pb.Entry, tsNs int64, skipPaths ...util.FullPath) {
 	if authoritativeEntry == nil || len(authoritativeEntry.HardLinkId) == 0 {
 		return
 	}
@@ -368,9 +369,9 @@ func (wfs *WFS) syncHardLinkSiblings(inode uint64, authoritativeEntry *filer_pb.
 		if authoritativeEntry.Attributes != nil {
 			sibling.Attr.Ctime = time.Unix(authoritativeEntry.Attributes.Ctime, int64(authoritativeEntry.Attributes.CtimeNs))
 		}
-		if err := wfs.metaCache.UpdateEntry(ctx, sibling); err != nil {
-			glog.V(4).Infof("syncHardLinkSiblings update %s: %v", p, err)
-		}
+		// The group's record, at the change's log position (Mountable:
+		// see MetaCache.UpdateHardLinkRecord).
+		wfs.metaCache.UpdateHardLinkRecord(ctx, sibling, tsNs)
 	}
 	// Note: we deliberately do NOT call fuseServer.InodeNotify here. That
 	// call would be made from the FUSE Link request handler goroutine, and

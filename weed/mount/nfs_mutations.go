@@ -316,7 +316,7 @@ func (wfs *WFS) NFSRemove(step NFSStep, dir uint64, name string) fuse.Status {
 		decremented.HardLinkCounter--
 		now := time.Now()
 		decremented.Attributes.Ctime, decremented.Attributes.CtimeNs = now.Unix(), int32(now.Nanosecond())
-		wfs.syncHardLinkSiblings(sharedInode, decremented, path)
+		wfs.syncHardLinkSiblings(sharedInode, decremented, event.GetTsNs(), path)
 	}
 	return fuse.OK
 }
@@ -412,15 +412,20 @@ func (wfs *WFS) NFSRename(step NFSStep, fromDir uint64, fromName string, toDir u
 		return NFSRetryLater
 	}
 	// What the target held is deleted: an open handle on it stops writing
-	// the name back, as for a FUSE rename, unless another name keeps it.
-	var targetInode, epoch uint64
-	if target != nil && lastName(target) {
+	// the name back, as for a FUSE rename, unless another name keeps it,
+	// whose group then has one name less.
+	var targetInode, epoch, survivor uint64
+	if target != nil {
 		sourceInode, _ := wfs.inodeToPath.GetInode(oldPath)
 		if inode, found := wfs.inodeToPath.GetInode(newPath); found && inode != sourceInode {
-			targetInode, epoch = inode, wfs.markHandleDeleted(inode)
+			if lastName(target) {
+				targetInode, epoch = inode, wfs.markHandleDeleted(inode)
+			} else {
+				survivor = inode
+			}
 		}
 	}
-	err = wfs.renameOnce(step.Mutate, &filer_pb.StreamRenameEntryRequest{
+	tsNs, err := wfs.renameOnce(step.Mutate, &filer_pb.StreamRenameEntryRequest{
 		OldDirectory: string(oldDir),
 		OldName:      fromName,
 		NewDirectory: string(newDir),
@@ -448,6 +453,14 @@ func (wfs *WFS) NFSRename(step NFSStep, fromDir uint64, fromName string, toDir u
 	}
 	if fh, open := wfs.fhMap.FindFileHandle(sourceInode); moving && open {
 		fh.RememberPath(newPath)
+	}
+	if survivor != 0 {
+		// Under the group's lease: its record as the filer has it now.
+		decremented := proto.Clone(target).(*filer_pb.Entry)
+		decremented.HardLinkCounter--
+		now := time.Now()
+		decremented.Attributes.Ctime, decremented.Attributes.CtimeNs = now.Unix(), int32(now.Nanosecond())
+		wfs.syncHardLinkSiblings(survivor, decremented, tsNs, newPath)
 	}
 	wfs.inodeToPath.TouchDirectory(oldDir)
 	wfs.inodeToPath.TouchDirectory(newDir)
@@ -485,6 +498,12 @@ func (wfs *WFS) NFSLink(step NFSStep, source, dir uint64, name string, uid, gid 
 	}
 	if wfs.IsOverQuotaWithUncommitted() {
 		return fuse.Status(syscall.ENOSPC)
+	}
+	// The source's writes are flushed before the group's lease is taken:
+	// a flush, which cannot be cancelled, never holds it past the
+	// preparation. One written since answers "retry later" under it.
+	if code := wfs.nfsFlushOpen(step.Prepare, source, uid, gid); code != fuse.OK {
+		return code
 	}
 	group := read.HardLinkId
 	if len(group) == 0 {
@@ -896,21 +915,25 @@ func (wfs *WFS) deleteEntryOnce(ctx context.Context, req *filer_pb.DeleteEntryRe
 // renameOnce sends one StreamRenameEntry and reads it to its end, which
 // is the filer's commit. Its events, which the filer sends while it moves,
 // before the commit, are not applied: the caller brings the mount up to
-// the committed rename (NFSRename).
-func (wfs *WFS) renameOnce(ctx context.Context, req *filer_pb.StreamRenameEntryRequest) error {
-	return wfs.withFilerOnce(ctx, func(client filer_pb.SeaweedFilerClient) error {
+// the committed rename (NFSRename). It returns the latest log position
+// they carry.
+func (wfs *WFS) renameOnce(ctx context.Context, req *filer_pb.StreamRenameEntryRequest) (tsNs int64, err error) {
+	err = wfs.withFilerOnce(ctx, func(client filer_pb.SeaweedFilerClient) error {
 		stream, err := client.StreamRenameEntry(ctx, req)
 		if err != nil {
 			return err
 		}
 		for {
-			if _, err := stream.Recv(); errors.Is(err, io.EOF) {
+			resp, err := stream.Recv()
+			if errors.Is(err, io.EOF) {
 				return nil
 			} else if err != nil {
 				return err
 			}
+			tsNs = max(tsNs, resp.GetTsNs())
 		}
 	})
+	return tsNs, err
 }
 
 // effectiveCtime is the change time GetAttr reports: the stored one, or

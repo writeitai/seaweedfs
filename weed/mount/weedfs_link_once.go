@@ -50,13 +50,18 @@ func (wfs *WFS) lockHardLinkGroup(linkID []byte) (release func(), code fuse.Stat
 
 // lockFlushedHandle takes the open handle of inode, if there is one, with
 // its dirty data flushed first, and returns it with its lock held. Its
-// waits for the handle's lock end with ctx (NFSRetryLater).
-func (wfs *WFS) lockFlushedHandle(ctx context.Context, inode uint64, uid, gid uint32) (*FileHandle, *util.ActiveLock, fuse.Status) {
+// waits for the handle's lock end with ctx (NFSRetryLater). Unless flush,
+// a handle to flush is not flushed here, under the caller's locks: the
+// call is to be retried (NFSRetryLater; Mountable: see NFSLink).
+func (wfs *WFS) lockFlushedHandle(ctx context.Context, inode uint64, uid, gid uint32, flush bool) (*FileHandle, *util.ActiveLock, fuse.Status) {
 	fh, found := wfs.fhMap.FindFileHandle(inode)
 	if !found {
 		return nil, nil, fuse.OK
 	}
 	for range 3 {
+		if !flush && wfs.asyncFlushPending(inode) {
+			return nil, nil, NFSRetryLater
+		}
 		// A pending async flush needs the lock to finish: drained first.
 		wfs.waitForPendingAsyncFlush(inode)
 		lock, ok := lockWithin(ctx, wfs.fhLockTable, "link", fh.fh, util.ExclusiveLock)
@@ -73,6 +78,9 @@ func (wfs *WFS) lockFlushedHandle(ctx context.Context, inode uint64, uid, gid ui
 		}
 		// The flush takes the handle's lock itself.
 		wfs.fhLockTable.ReleaseLock(fh.fh, lock)
+		if !flush {
+			return nil, nil, NFSRetryLater // written to since the caller's flush
+		}
 		if code := wfs.doFlush(ctx, fh, uid, gid, false); code != fuse.OK {
 			if code == fuse.Status(syscall.ESTALE) {
 				// The path no longer leads to the source: nothing to link.
@@ -82,6 +90,37 @@ func (wfs *WFS) lockFlushedHandle(ctx context.Context, inode uint64, uid, gid ui
 		}
 	}
 	return nil, nil, fuse.Status(syscall.EAGAIN) // written to all along
+}
+
+// nfsFlushOpen flushes the open handle of inode, if it holds writes not
+// flushed, within ctx. A flush cannot be cancelled: one outlasting ctx
+// goes on alone, and the call is to be retried (NFSRetryLater).
+func (wfs *WFS) nfsFlushOpen(ctx context.Context, inode uint64, uid, gid uint32) fuse.Status {
+	fh, found := wfs.fhMap.FindFileHandle(inode)
+	if !found {
+		return fuse.OK
+	}
+	done := make(chan fuse.Status, 1)
+	go func() {
+		wfs.waitForPendingAsyncFlush(inode)
+		lock := wfs.fhLockTable.AcquireLock("link", fh.fh, util.ExclusiveLock)
+		dirty := fh.dirtyMetadata && !fh.isDeleted
+		wfs.fhLockTable.ReleaseLock(fh.fh, lock)
+		if !dirty {
+			done <- fuse.OK
+			return
+		}
+		done <- wfs.doFlush(context.Background(), fh, uid, gid, false)
+	}()
+	select {
+	case code := <-done:
+		if code == fuse.Status(syscall.ESTALE) {
+			return fuse.ENOENT // the path no longer leads to the source
+		}
+		return code
+	case <-ctx.Done():
+		return NFSRetryLater
+	}
 }
 
 // lockWithin takes key's lock in table unless ctx ends first; a lock got

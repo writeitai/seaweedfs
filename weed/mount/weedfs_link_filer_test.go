@@ -43,8 +43,10 @@ type storeFiler struct {
 	locks       map[string]string // lock name -> token
 	locked      []string          // every lock name taken, in order
 	failLookup  map[util.FullPath]bool
-	// beforeLookup, when set, runs unlocked before a lookup is answered.
+	// beforeLookup, when set, runs unlocked before a lookup is answered;
+	// beforeLock before a lock is granted or renewed.
 	beforeLookup func(ctx context.Context, p util.FullPath)
+	beforeLock   func(name string)
 }
 
 func newStoreFiler() *storeFiler {
@@ -227,6 +229,9 @@ func (f *storeFiler) remove(p util.FullPath) {
 }
 
 func (f *storeFiler) DistributedLock(_ context.Context, r *filer_pb.LockRequest) (*filer_pb.LockResponse, error) {
+	if hook := f.beforeLock; hook != nil {
+		hook(r.Name)
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if token, held := f.locks[r.Name]; held && token != r.RenewToken {

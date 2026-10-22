@@ -799,10 +799,117 @@ func TestNFSRemovingAHardLinkKeepsItsHandle(t *testing.T) {
 	if st := wfs.NFSRemove(step(t), 1, "a"); st != fuse.OK || h.isDeleted {
 		t.Fatalf("remove a: %v, deleted %v", st, h.isDeleted)
 	}
+	// A change through the handle is written through a name that is left.
+	lock := wfs.fhLockTable.AcquireLock("test", h.fh, util.ExclusiveLock)
+	h.GetEntry().GetEntry().Attributes.FileMode = 0o600
+	h.dirtyMetadata = true
+	wfs.fhLockTable.ReleaseLock(h.fh, lock)
+	if st := wfs.Fsync(nil, &fuse.FsyncIn{InHeader: fuse.InHeader{NodeId: inode}, Fh: uint64(h.fh)}); st != fuse.OK || f.lookup("/d").Attributes.FileMode&0o777 != 0o600 {
+		t.Fatalf("flush after the remove: %v, %v", st, f.lookup("/d").Attributes)
+	}
 	if st := wfs.NFSRename(step(t), 1, "c", 1, "b"); st != fuse.OK || h.isDeleted {
 		t.Fatalf("rename over b: %v, deleted %v", st, h.isDeleted)
 	}
+	// The name left reads the group as the filer has it.
+	if e, _, err := wfs.metaCache.FindEntry(context.Background(), "/d"); err != nil || e.HardLinkCounter != f.lookup("/d").HardLinkCounter {
+		t.Fatalf("the cache has %v (%v), the filer %d", e, err, f.lookup("/d").HardLinkCounter)
+	}
 	if st := wfs.NFSRemove(step(t), 1, "d"); st != fuse.OK || !h.isDeleted {
 		t.Fatalf("remove d: %v, deleted %v", st, h.isDeleted)
+	}
+}
+
+// groupLocked reports whether a hard-link group's lock is held.
+func (f *storeFiler) groupLocked() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for key := range f.locks {
+		if strings.HasPrefix(key, "hardlink/") {
+			return true
+		}
+	}
+	return false
+}
+
+// dirtyHandle opens name's write handle with metadata not flushed.
+func dirtyHandle(t *testing.T, wfs *WFS, inode uint64) *FileHandle {
+	t.Helper()
+	id, st := wfs.NFSOpenForWrite(context.Background(), inode, 99, 100)
+	if st != fuse.OK {
+		t.Fatalf("open for write: %v", st)
+	}
+	t.Cleanup(func() { wfs.NFSCloseWrite(id, true) })
+	fh := wfs.GetHandle(id)
+	lock := wfs.fhLockTable.AcquireLock("test", fh.fh, util.ExclusiveLock)
+	fh.dirtyMetadata = true
+	wfs.fhLockTable.ReleaseLock(fh.fh, lock)
+	return fh
+}
+
+// LINK flushes its source's writes before it takes the group's lease: a
+// flush outlasting the preparation answers "retry later" with no lease
+// held; one the source needs again under the lease, as a WRITE came in
+// between, answers "retry later" too, letting it go.
+func TestNFSLinkFlushesBeforeTheGroupLease(t *testing.T) {
+	f := newStoreFiler()
+	wfs := newLinkTestWFS(t, f)
+	f.put(plainEntry("a", 8001, "a"))
+	inode := seen(t, wfs, f, "a")
+	fh := dirtyHandle(t, wfs, inode)
+	gate := make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-gate:
+		default:
+			close(gate)
+		}
+	})
+	var flushedUnderTheLease []bool
+	f.beforeCreate = func(r *filer_pb.CreateEntryRequest) {
+		if r.Entry.Name == "a" && len(r.Entry.HardLinkId) == 0 { // the flush
+			flushedUnderTheLease = append(flushedUnderTheLease, f.groupLocked())
+			<-gate
+		}
+	}
+	s, _ := nfsStep(t, 300*time.Millisecond, 5*time.Second)
+	if st := wfs.NFSLink(s, inode, 1, "l", 99, 100); st != NFSRetryLater || f.groupLocked() {
+		t.Fatalf("stalled flush: %v, group locked %v", st, f.groupLocked())
+	}
+	close(gate)
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		lock := wfs.fhLockTable.AcquireLock("test", fh.fh, util.ExclusiveLock)
+		dirty := fh.dirtyMetadata
+		wfs.fhLockTable.ReleaseLock(fh.fh, lock)
+		if !dirty {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the abandoned flush did not finish")
+		}
+	}
+	f.beforeLock = func(name string) {
+		if strings.HasPrefix(name, "hardlink/") { // a WRITE, as the lease is taken
+			lock := wfs.fhLockTable.AcquireLock("test", fh.fh, util.ExclusiveLock)
+			fh.dirtyMetadata = true
+			wfs.fhLockTable.ReleaseLock(fh.fh, lock)
+		}
+	}
+	if st := wfs.NFSLink(step(t), inode, 1, "l", 99, 100); st != NFSRetryLater {
+		t.Fatalf("written under the lease: %v", st)
+	}
+	if f.groupLocked() {
+		t.Fatal("the group's lease is held")
+	}
+	f.beforeLock = nil
+	if st := wfs.NFSLink(step(t), inode, 1, "l", 99, 100); st != fuse.OK {
+		t.Fatalf("link: %v", st)
+	}
+	for _, locked := range flushedUnderTheLease {
+		if locked {
+			t.Fatalf("flushed under the group's lease: %v", flushedUnderTheLease)
+		}
+	}
+	if len(flushedUnderTheLease) != 2 {
+		t.Fatalf("%d flushes", len(flushedUnderTheLease))
 	}
 }

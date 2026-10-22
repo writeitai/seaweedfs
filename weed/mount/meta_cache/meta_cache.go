@@ -194,7 +194,8 @@ func (mc *MetaCache) doBatchInsertEntries(ctx context.Context, entries []*filer.
 // of the group take their attributes and chunks from, as the filer store
 // keeps them, is versioned by the group: the filer log position it
 // reflects, under its own key. A write through one name, a change through
-// a name whose directory is not cached, and a listing all go through
+// a name whose directory is not cached, a listing, a section refresh and a
+// mount's own change to the group's counter all go through
 // setHardLinkRecordLocked, which never lets an older state replace a newer
 // one.
 //
@@ -259,6 +260,36 @@ func (mc *MetaCache) setHardLinkRecordLocked(ctx context.Context, entry *filer.E
 		return
 	}
 	mc.setHardLinkVersionLocked(ctx, entry.HardLinkId, tsNs)
+}
+
+// insertListedLocked stores an entry a listing at snapshotTsNs returned. A
+// hard link's group record is written through its version gate; a listing
+// with no snapshot, which orders against nothing, only fills a record none
+// keeps.
+func (mc *MetaCache) insertListedLocked(ctx context.Context, entry *filer.Entry, snapshotTsNs int64) error {
+	if len(entry.HardLinkId) == 0 {
+		return mc.localStore.InsertEntry(ctx, entry)
+	}
+	if err := mc.leveldbStore.InsertEntry(ctx, entry); err != nil { // the name
+		return err
+	}
+	if snapshotTsNs == 0 {
+		if _, err := mc.localStore.KvGet(ctx, entry.HardLinkId); err == nil {
+			return nil
+		}
+	}
+	mc.setHardLinkRecordLocked(ctx, entry, snapshotTsNs, true)
+	return nil
+}
+
+// UpdateHardLinkRecord writes entry as its group's record, kept for a
+// cached name of the group, at tsNs, the filer log position of the change
+// it reflects, unless the record reflects a later one (Mountable: see
+// setHardLinkRecordLocked).
+func (mc *MetaCache) UpdateHardLinkRecord(ctx context.Context, entry *filer.Entry, tsNs int64) {
+	mc.Lock()
+	defer mc.Unlock()
+	mc.setHardLinkRecordLocked(ctx, entry, tsNs, false)
 }
 
 func (mc *MetaCache) AtomicUpdateEntryFromFiler(ctx context.Context, oldPath util.FullPath, newEntry *filer.Entry) error {
@@ -458,9 +489,6 @@ func (mc *MetaCache) UpdateEntry(ctx context.Context, entry *filer.Entry) error 
 		return err
 	}
 	mc.markEntryUnversionedLocked(ctx, entry.FullPath)
-	if len(entry.HardLinkId) > 0 {
-		mc.setHardLinkVersionLocked(ctx, entry.HardLinkId, 0) // no position describes it
-	}
 	return nil
 }
 
