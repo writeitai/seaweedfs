@@ -1,13 +1,13 @@
 package mount
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"syscall"
 
 	"github.com/seaweedfs/go-fuse/v2/fuse"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
@@ -77,7 +77,7 @@ func (wfs *WFS) nfsPersist(step NFSStep, fh *FileHandle, uid, gid uint32) fuse.S
 	if !step.Begin() {
 		return NFSRetryLater
 	}
-	if err := wfs.flushMetadataToFiler(step.Mutate, fh, "", "", uid, gid); err != nil {
+	if err := wfs.flushMetadata(step.Mutate, fh, "", "", uid, gid, true); err != nil {
 		if errors.As(err, &refused) {
 			return fuse.Status(refused)
 		}
@@ -98,21 +98,40 @@ func (wfs *WFS) nfsDiscard(fh *FileHandle) {
 }
 
 // nfsUploadStatus is a WRITE's status for an upload that failed before its
-// entry write: the byte quota or a spending cap the gateway refused the
-// chunk for, or EIO.
+// entry write, when nothing is visible yet: the byte quota or a spending
+// cap the gateway refused the chunk for is EDQUOT; a transient failure
+// (the gateway unavailable, a reset, a timeout) is to be retried later;
+// anything else EIO.
 func nfsUploadStatus(err error) fuse.Status {
-	msg := err.Error()
-	if strings.Contains(msg, "quota exceeded") || strings.Contains(msg, "spending_cap_reached") {
+	// The byte quota comes back as the assignment's error text, which
+	// ends the message; a cap as the gateway's status, whose own message
+	// is read, never the file name around it.
+	if strings.HasSuffix(err.Error(), ": quota exceeded") {
 		return fuse.Status(syscall.EDQUOT)
+	}
+	if st, ok := util.ServerStatus(err); ok {
+		switch {
+		case st.Code() == codes.ResourceExhausted && strings.Contains(st.Message(), "spending_cap_reached"):
+			return fuse.Status(syscall.EDQUOT)
+		case st.Code() == codes.Unavailable, st.Code() == codes.DeadlineExceeded:
+			return NFSRetryLater
+		}
+	}
+	if util.IsTransientError(err) || errors.Is(err, context.DeadlineExceeded) {
+		return NFSRetryLater
 	}
 	return fuse.EIO
 }
 
 // nfsWriteStatus is a WRITE's status for its entry write's error.
 func nfsWriteStatus(err error) fuse.Status {
-	msg := err.Error()
+	st, ok := util.ServerStatus(err)
+	if !ok {
+		return fuse.EIO
+	}
+	msg := st.Message() // the gateway's, never the file name around it
 	var resent resentError
-	switch code := status.Code(err); {
+	switch code := st.Code(); {
 	case code == codes.ResourceExhausted && strings.Contains(msg, "metadata rate"):
 		if errors.As(err, &resent) {
 			return fuse.EIO // a re-send's: the WRITE has been under way

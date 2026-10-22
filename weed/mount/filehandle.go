@@ -77,6 +77,11 @@ type FileHandle struct {
 	// Acquired in AcquireHandle, released in ReleaseHandle.
 	dlmLock *cluster.LiveLock
 
+	// nfsWrite marks the NFS server's shared write handle, whose writes
+	// each persist before their reply (D45): no background flush may
+	// persist one that is still in progress (Mountable).
+	nfsWrite atomic.Bool
+
 	// remoteInstallMu serializes downloadRemoteEntry's install, which holds
 	// only the handle's shared lock and so races a second concurrent read.
 	remoteInstallMu sync.Mutex

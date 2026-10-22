@@ -675,6 +675,7 @@ func (wfs *WFS) NFSOpenForWrite(ctx context.Context, inode uint64, uid, gid uint
 		wfs.ReleaseHandle(fh.fh)
 		return 0, code
 	}
+	fh.nfsWrite.Store(true)
 	return fh.fh, fuse.OK
 }
 
@@ -974,13 +975,19 @@ func nfsReadStatus(err error) fuse.Status {
 // is EIO: the outcome is unknown.
 func nfsCallStatus(err error, first bool) fuse.Status {
 	msg := err.Error()
+	// A refusal is told by the gateway's own message, never by the names
+	// around it in the error.
+	refusal := ""
+	if st, ok := util.ServerStatus(err); ok {
+		refusal = st.Message()
+	}
 	switch code := status.Code(err); {
-	case code == codes.ResourceExhausted && strings.Contains(msg, "metadata rate"):
+	case code == codes.ResourceExhausted && strings.Contains(refusal, "metadata rate"):
 		if first {
 			return NFSRetryLater
 		}
 		return fuse.EIO
-	case code == codes.ResourceExhausted && strings.Contains(msg, "file too large"):
+	case code == codes.ResourceExhausted && strings.Contains(refusal, "file too large"):
 		return fuse.Status(syscall.EFBIG)
 	case code == codes.ResourceExhausted:
 		return fuse.Status(syscall.EDQUOT) // a quota or spending cap

@@ -32,6 +32,7 @@ type volumeFiler struct {
 	assignErr func() (*filer_pb.AssignVolumeResponse, error)
 	refuse    func(r *filer_pb.CreateEntryRequest, send int) (*filer_pb.CreateEntryResponse, error)
 	sends     int
+	uploads   int // chunk uploads the proxy took
 }
 
 func (v *volumeFiler) AssignVolume(context.Context, *filer_pb.AssignVolumeRequest) (*filer_pb.AssignVolumeResponse, error) {
@@ -61,13 +62,22 @@ func (v *volumeFiler) CreateEntry(ctx context.Context, r *filer_pb.CreateEntryRe
 // newVolumeTestWFS is newLinkTestWFS whose writes upload to a fake volume
 // server, with the file "a" holding "a" open for writing.
 func newVolumeTestWFS(t *testing.T) (*WFS, *volumeFiler, FileHandleId) {
+	return newVolumeTestWFSWith(t, plainEntry("a", 8001, "a"))
+}
+
+// newVolumeTestWFSWith is newVolumeTestWFS with entry open.
+func newVolumeTestWFSWith(t *testing.T, entry *filer_pb.Entry) (*WFS, *volumeFiler, FileHandleId) {
 	t.Helper()
 	f := &volumeFiler{storeFiler: newStoreFiler()}
 	wfs := newLinkTestWFS(t, f.storeFiler)
-	f.volume = startProxyFiler(t, wfs, f)
+	f.volume = startProxyFiler(t, wfs, f, func() {
+		f.mu.Lock()
+		f.uploads++
+		f.mu.Unlock()
+	})
 	wfs.concurrentWriters = util.NewLimitedConcurrentExecutor(4) // as a mount's
-	f.put(plainEntry("a", 8001, "a"))
-	inode := seen(t, wfs, f.storeFiler, "a")
+	f.put(entry)
+	inode := seen(t, wfs, f.storeFiler, entry.Name)
 	id, st := wfs.NFSOpenForWrite(context.Background(), inode, 99, 100)
 	if st != fuse.OK {
 		t.Fatalf("open for write: %v", st)
@@ -79,10 +89,15 @@ func newVolumeTestWFS(t *testing.T) (*WFS, *volumeFiler, FileHandleId) {
 // startProxyFiler serves fake as the mount's filer, with its chunk proxy,
 // which takes uploads, at the HTTP address the gRPC one derives from (its
 // port 10000 lower), as the mount's filerProxy uploads need.
-func startProxyFiler(t *testing.T, wfs *WFS, fake filer_pb.SeaweedFilerServer) *httptest.Server {
+func startProxyFiler(t *testing.T, wfs *WFS, fake filer_pb.SeaweedFilerServer, uploaded func()) *httptest.Server {
 	t.Helper()
 	upload := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet { // a chunk read: zeros
+			_, _ = w.Write(make([]byte, 100))
+			return
+		}
 		body, _ := io.ReadAll(r.Body)
+		uploaded()
 		w.WriteHeader(http.StatusCreated)
 		_ = json.NewEncoder(w).Encode(map[string]any{"size": len(body)})
 	})
@@ -232,5 +247,112 @@ func TestNFSWriteAbandonedBeforeItsEntryWrite(t *testing.T) {
 	}
 	if f.sent() != 0 || wfs.GetHandle(id).dirtyMetadata || len(wfs.GetHandle(id).GetEntry().GetEntry().Chunks) != 0 {
 		t.Fatalf("%d entry writes; the handle keeps %v", f.sent(), wfs.GetHandle(id).GetEntry().GetEntry())
+	}
+}
+
+// A WRITE to a file whose chunks hold more than twice its size does not
+// merge them, which would re-read and re-upload the whole file inside the
+// WRITE's deadline: it uploads its own chunk only.
+func TestNFSWriteDoesNotMergeABloatedFile(t *testing.T) {
+	bloated := plainEntry("a", 8001, "")
+	bloated.Content = nil
+	bloated.Attributes.FileSize = 100
+	for i, size := range []uint64{100, 99, 98} { // each newer one leaves a byte of the older visible
+		bloated.Chunks = append(bloated.Chunks, &filer_pb.FileChunk{FileId: fmt.Sprintf("3,%02x0abcdef", i+1), Offset: 0, Size: size, ModifiedTsNs: int64(i + 1)})
+	}
+	wfs, f, id := newVolumeTestWFSWith(t, bloated)
+	if _, st := wfs.NFSWrite(step(t), id, 100, []byte("X"), 99, 100); st != fuse.OK {
+		t.Fatalf("write: %v", st)
+	}
+	f.mu.Lock()
+	uploads := f.uploads
+	f.mu.Unlock()
+	if uploads != 1 || f.lookup("/a").Attributes.FileSize != 101 {
+		t.Fatalf("%d uploads, stored %v", uploads, f.lookup("/a"))
+	}
+}
+
+// An upload that fails transiently, before anything is visible, is to be
+// retried later, and leaves nothing behind.
+func TestNFSWriteTransientUploadFailure(t *testing.T) {
+	saved := util.RetryWaitTime
+	util.RetryWaitTime = 1500 * time.Millisecond // one attempt and one retry
+	t.Cleanup(func() { util.RetryWaitTime = saved })
+	wfs, f, id := newVolumeTestWFS(t)
+	f.mu.Lock()
+	f.assignErr = func() (*filer_pb.AssignVolumeResponse, error) {
+		return nil, status.Error(codes.Unavailable, "connection reset")
+	}
+	f.mu.Unlock()
+	if _, st := wfs.NFSWrite(step(t), id, 0, []byte("XXXX"), 99, 100); st != NFSRetryLater {
+		t.Fatalf("write: %v", st)
+	}
+	if f.sent() != 0 || wfs.GetHandle(id).dirtyMetadata {
+		t.Fatalf("%d entry writes, dirty %v", f.sent(), wfs.GetHandle(id).dirtyMetadata)
+	}
+}
+
+// The periodic metadata flush leaves the NFS write handle alone: a WRITE
+// still in progress (its data uploaded, its entry write not yet sent) is
+// not persisted behind its back.
+func TestPeriodicFlushSkipsTheNFSWriteHandle(t *testing.T) {
+	wfs, f, id := newVolumeTestWFS(t)
+	fh := wfs.GetHandle(id)
+	in := &fuse.WriteIn{InHeader: fuse.InHeader{NodeId: fh.inode}, Fh: uint64(id), Offset: 1, Size: 3}
+	if _, st := wfs.Write(nil, in, []byte("bcd")); st != fuse.OK {
+		t.Fatalf("write: %v", st)
+	}
+	if err := fh.dirtyPages.FlushData(); err != nil { // uploaded, its entry write not sent yet
+		t.Fatal(err)
+	}
+	wfs.flushAllDirtyMetadata()
+	if f.sent() != 0 || f.lookup("/a").Attributes.FileSize != 1 {
+		t.Fatalf("%d entry writes, stored %v", f.sent(), f.lookup("/a"))
+	}
+}
+
+// chunked is a file of n one-byte chunks.
+func chunked(n int) *filer_pb.Entry {
+	e := plainEntry("a", 8001, "")
+	e.Content = nil
+	e.Attributes.FileSize = uint64(n)
+	for i := range n {
+		e.Chunks = append(e.Chunks, &filer_pb.FileChunk{FileId: fmt.Sprintf("3,%x0abcdef", i+1), Offset: int64(i), Size: 1, ModifiedTsNs: 1})
+	}
+	return e
+}
+
+// A WRITE that would take a file past the gateway's 9,999 chunks is EFBIG
+// before anything is sent, folding nothing into manifests; one that
+// reaches exactly the cap is stored.
+func TestNFSWriteChunkCap(t *testing.T) {
+	wfs, f, id := newVolumeTestWFSWith(t, chunked(nfsMaxChunks-1))
+	if _, st := wfs.NFSWrite(step(t), id, nfsMaxChunks-1, []byte("X"), 99, 100); st != fuse.OK {
+		t.Fatalf("the write reaching the cap: %v", st)
+	}
+	if n := len(f.lookup("/a").Chunks); n != nfsMaxChunks {
+		t.Fatalf("%d chunks stored", n)
+	}
+	if _, st := wfs.NFSWrite(step(t), id, nfsMaxChunks, []byte("Y"), 99, 100); st != fuse.Status(syscall.EFBIG) {
+		t.Fatalf("the write past the cap: %v", st)
+	}
+	if f.sent() != 1 || len(f.lookup("/a").Chunks) != nfsMaxChunks {
+		t.Fatalf("%d entry writes, %d chunks stored", f.sent(), len(f.lookup("/a").Chunks))
+	}
+}
+
+// A refusal is read from the gateway's own message, never from the file
+// name the error also carries.
+func TestNFSWriteRefusalsIgnoreTheFileName(t *testing.T) {
+	refusal := status.Error(codes.ResourceExhausted, "filesystem_spending_cap_reached: the filesystem's monthly spending cap is reached")
+	for _, name := range []string{"metadata rate", "file too large", "quota exceeded"} {
+		e := plainEntry(name, 8001, "a")
+		wfs, f, id := newVolumeTestWFSWith(t, e)
+		f.mu.Lock()
+		f.refuse = func(*filer_pb.CreateEntryRequest, int) (*filer_pb.CreateEntryResponse, error) { return nil, refusal }
+		f.mu.Unlock()
+		if _, st := wfs.NFSWrite(step(t), id, 0, []byte("X"), 99, 100); st != fuse.Status(syscall.EDQUOT) {
+			t.Fatalf("%q: %v", name, st)
+		}
 	}
 }

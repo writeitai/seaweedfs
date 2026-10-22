@@ -247,6 +247,20 @@ func fuseFlushStatus(err error) fuse.Status {
 // as it is under the handle lock. Either way, that destination is the one
 // checked, and written to.
 func (wfs *WFS) flushMetadataToFiler(ctx context.Context, fh *FileHandle, dir, name string, uid, gid uint32) error {
+	return wfs.flushMetadata(ctx, fh, dir, name, uid, gid, false)
+}
+
+// nfsMaxChunks is the most chunks the gateway stores in one entry; past
+// it the mount would fold chunks into manifests, which the gateway does
+// not take.
+const nfsMaxChunks = 9_999
+
+// flushMetadata is flushMetadataToFiler. Mountable: for an NFS WRITE (D45)
+// it runs neither the bloat merge, which re-reads and re-uploads the whole
+// file, nor the manifest fold, either of which would run inside the
+// WRITE's deadline; a file past the gateway's chunk cap is EFBIG instead,
+// before anything is sent.
+func (wfs *WFS) flushMetadata(ctx context.Context, fh *FileHandle, dir, name string, uid, gid uint32, nfsWrite bool) error {
 	fhActiveLock := fh.wfs.fhLockTable.AcquireLock("doFlush", fh.fh, util.ExclusiveLock)
 	defer fh.wfs.fhLockTable.ReleaseLock(fh.fh, fhActiveLock)
 
@@ -283,18 +297,26 @@ func (wfs *WFS) flushMetadataToFiler(ctx context.Context, fh *FileHandle, dir, n
 
 	chunks, _ := filer.CompactFileChunks(context.Background(), wfs.LookupFn(), nonManifestChunks)
 
-	if mergedChunks, mergeErr := wfs.maybeMergeChunks(fileFullPath, chunks, manifestChunks); mergeErr != nil {
-		glog.V(0).Infof("maybeMergeChunks %s: %v", fileFullPath, mergeErr)
-	} else if mergedChunks != nil {
-		chunks = mergedChunks
-		manifestChunks = nil
+	if nfsWrite && len(chunks)+len(manifestChunks) > nfsMaxChunks {
+		return syscall.EFBIG
+	}
+	if !nfsWrite {
+		if mergedChunks, mergeErr := wfs.maybeMergeChunks(fileFullPath, chunks, manifestChunks); mergeErr != nil {
+			glog.V(0).Infof("maybeMergeChunks %s: %v", fileFullPath, mergeErr)
+		} else if mergedChunks != nil {
+			chunks = mergedChunks
+			manifestChunks = nil
+		}
 	}
 
-	// no chunk deleter here: a failed fold reports the blobs it saved
-	chunks, manifestErr := filer.MaybeManifestize(wfs.saveDataAsChunk(fileFullPath), nil, chunks)
-	if manifestErr != nil {
-		// not good, but should be ok
-		glog.V(0).Infof("MaybeManifestize: %v", manifestErr)
+	if !nfsWrite {
+		// no chunk deleter here: a failed fold reports the blobs it saved
+		var manifestErr error
+		chunks, manifestErr = filer.MaybeManifestize(wfs.saveDataAsChunk(fileFullPath), nil, chunks)
+		if manifestErr != nil {
+			// not good, but should be ok
+			glog.V(0).Infof("MaybeManifestize: %v", manifestErr)
+		}
 	}
 	entry.Chunks = append(chunks, manifestChunks...)
 

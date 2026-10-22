@@ -125,7 +125,8 @@ type Option struct {
 	// RefusalsAreFinal stops filer calls from retrying a refusal the
 	// gateway made definite (a quota, a spending cap, the chunk cap, the
 	// metadata rate), which upstream retries as load shedding for seconds.
-	// Mountable (writeitai/seaweedfs, branch mountable): an NFS WRITE is
+	// Mountable (writeitai/seaweedfs, branch mountable), fork-only: it
+	// matches the messages of Mountable's gateway. An NFS WRITE is
 	// write-through (D45), and a refused one held its file's writes back.
 	RefusalsAreFinal bool
 
