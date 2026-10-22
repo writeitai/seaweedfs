@@ -79,7 +79,8 @@ type FileHandle struct {
 
 	// nfsWrite marks the NFS server's shared write handle, whose writes
 	// each persist before their reply (D45): no background flush may
-	// persist one that is still in progress (Mountable).
+	// persist one that is still in progress (Mountable). It is never
+	// cleared: on macOS no other path writes through this handle.
 	nfsWrite atomic.Bool
 
 	// remoteInstallMu serializes downloadRemoteEntry's install, which holds

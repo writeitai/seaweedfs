@@ -113,12 +113,15 @@ func nfsUploadStatus(err error) fuse.Status {
 		switch {
 		case st.Code() == codes.ResourceExhausted && strings.Contains(st.Message(), "spending_cap_reached"):
 			return fuse.Status(syscall.EDQUOT)
-		case st.Code() == codes.Unavailable, st.Code() == codes.DeadlineExceeded:
+		case st.Code() == codes.ResourceExhausted && strings.Contains(st.Message(), "metadata rate"),
+			st.Code() == codes.Unavailable, st.Code() == codes.DeadlineExceeded:
 			return NFSRetryLater
+		case st.Code() == codes.ResourceExhausted:
+			return fuse.EIO // a refusal this does not know: no stall
 		}
 	}
 	if util.IsTransientError(err) || errors.Is(err, context.DeadlineExceeded) {
-		return NFSRetryLater
+		return NFSRetryLater // the network
 	}
 	return fuse.EIO
 }

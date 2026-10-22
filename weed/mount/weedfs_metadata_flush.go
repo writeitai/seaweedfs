@@ -48,7 +48,7 @@ func (wfs *WFS) flushAllDirtyMetadata() {
 	var dirtyHandles []*FileHandle
 	wfs.fhMap.RLock()
 	for _, fh := range wfs.fhMap.inode2fh {
-		if fh.dirtyMetadata && !fh.nfsWrite.Load() {
+		if !fh.nfsWrite.Load() && fh.dirtyMetadata {
 			dirtyHandles = append(dirtyHandles, fh)
 		}
 	}

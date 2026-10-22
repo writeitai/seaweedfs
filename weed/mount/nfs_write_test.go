@@ -356,3 +356,66 @@ func TestNFSWriteRefusalsIgnoreTheFileName(t *testing.T) {
 		}
 	}
 }
+
+// An upload refused with a ResourceExhausted the classification does not
+// know is EIO, not a stall answered "retry later".
+func TestNFSWriteUnknownUploadRefusalIsIO(t *testing.T) {
+	saved := util.RetryWaitTime
+	util.RetryWaitTime = 1500 * time.Millisecond // one attempt and one retry
+	t.Cleanup(func() { util.RetryWaitTime = saved })
+	wfs, f, id := newVolumeTestWFS(t)
+	f.mu.Lock()
+	f.assignErr = func() (*filer_pb.AssignVolumeResponse, error) {
+		return nil, status.Error(codes.ResourceExhausted, "some new limit")
+	}
+	f.mu.Unlock()
+	if _, st := wfs.NFSWrite(step(t), id, 0, []byte("X"), 99, 100); st != fuse.EIO {
+		t.Fatalf("write: %v", st)
+	}
+}
+
+// Rewrites in place each keep a chunk (no merge runs on an NFS WRITE), so
+// a file rewritten in place reaches the gateway's 9,999 chunks and its
+// next rewrite is EFBIG: the published limit.
+func TestNFSWriteInPlaceRewritesReachTheChunkCap(t *testing.T) {
+	e := plainEntry("a", 8001, "")
+	e.Content = nil
+	e.Attributes.FileSize = 2 * nfsMaxChunks
+	e.Chunks = []*filer_pb.FileChunk{{FileId: "3,ff0abcdef", Offset: 0, Size: 2 * nfsMaxChunks, ModifiedTsNs: 1}}
+	for i := 1; i < nfsMaxChunks-1; i++ { // earlier rewrites of single bytes
+		e.Chunks = append(e.Chunks, &filer_pb.FileChunk{FileId: fmt.Sprintf("3,%x0abcdef", i), Offset: int64(2 * i), Size: 1, ModifiedTsNs: int64(i + 1)})
+	}
+	wfs, f, id := newVolumeTestWFSWith(t, e)
+	if _, st := wfs.NFSWrite(step(t), id, 2*(nfsMaxChunks-1), []byte("X"), 99, 100); st != fuse.OK || len(f.lookup("/a").Chunks) != nfsMaxChunks {
+		t.Fatalf("a rewrite reaching the cap: %v, %d chunks", st, len(f.lookup("/a").Chunks))
+	}
+	if _, st := wfs.NFSWrite(step(t), id, 1, []byte("Y"), 99, 100); st != fuse.Status(syscall.EFBIG) {
+		t.Fatalf("the next rewrite in place: %v", st)
+	}
+}
+
+// WRITEs and the periodic metadata flush run concurrently without a race
+// on the handle, and every WRITE is stored.
+func TestNFSWritesWithThePeriodicFlush(t *testing.T) {
+	wfs, f, id := newVolumeTestWFS(t)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := range 20 {
+			if _, st := wfs.NFSWrite(step(t), id, uint64(1+i), []byte("x"), 99, 100); st != fuse.OK {
+				t.Errorf("write %d: %v", i, st)
+			}
+		}
+	}()
+	for {
+		select {
+		case <-done:
+			if size := f.lookup("/a").Attributes.FileSize; size != 21 {
+				t.Fatalf("stored %d bytes", size)
+			}
+			return
+		default:
+			wfs.flushAllDirtyMetadata()
+		}
+	}
+}
