@@ -195,7 +195,8 @@ func TestNFSWriteRefusals(t *testing.T) {
 }
 
 // A chunk refused at assignment, for the byte quota or a spending cap,
-// is EDQUOT, and no entry write is sent.
+// is EDQUOT at once, as the refusal is final for the CLI's macOS engine,
+// and no entry write is sent.
 func TestNFSWriteUploadRefusals(t *testing.T) {
 	for _, refuse := range []func() (*filer_pb.AssignVolumeResponse, error){
 		func() (*filer_pb.AssignVolumeResponse, error) {
@@ -206,11 +207,13 @@ func TestNFSWriteUploadRefusals(t *testing.T) {
 		},
 	} {
 		wfs, f, id := newVolumeTestWFS(t)
+		wfs.option.RefusalsAreFinal = true
 		f.mu.Lock()
 		f.assignErr = refuse
 		f.mu.Unlock()
-		if _, st := wfs.NFSWrite(step(t), id, 0, []byte("XXXX"), 99, 100); st != fuse.Status(syscall.EDQUOT) {
-			t.Fatalf("write: %v", st)
+		start := time.Now()
+		if _, st := wfs.NFSWrite(step(t), id, 0, []byte("XXXX"), 99, 100); st != fuse.Status(syscall.EDQUOT) || time.Since(start) > time.Second {
+			t.Fatalf("write: %v after %v", st, time.Since(start))
 		}
 		if f.sent() != 0 || wfs.GetHandle(id).dirtyMetadata {
 			t.Fatalf("%d entry writes, dirty %v", f.sent(), wfs.GetHandle(id).dirtyMetadata)
