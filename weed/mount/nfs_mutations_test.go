@@ -913,3 +913,56 @@ func TestNFSLinkFlushesBeforeTheGroupLease(t *testing.T) {
 		t.Fatalf("%d flushes", len(flushedUnderTheLease))
 	}
 }
+
+// flushRefusingFiler refuses the creates of a name with err.
+type flushRefusingFiler struct {
+	*storeFiler
+	refuse string
+	err    error
+}
+
+func (q flushRefusingFiler) CreateEntry(ctx context.Context, r *filer_pb.CreateEntryRequest) (*filer_pb.CreateEntryResponse, error) {
+	if r.Entry.Name == q.refuse {
+		return nil, q.err
+	}
+	return q.storeFiler.CreateEntry(ctx, r)
+}
+
+// NFSFsync classifies a flush's refused metadata write for a COMMIT: what
+// is to be retried later keeps the handle's writes; FUSE's Fsync answers
+// as it did.
+func TestNFSFsyncRefusals(t *testing.T) {
+	saved := metadataFlushSleep
+	metadataFlushSleep = func(context.Context, time.Duration) {}
+	t.Cleanup(func() { metadataFlushSleep = saved })
+	for _, c := range []struct {
+		err       error
+		nfs, fuse fuse.Status
+	}{
+		{status.Error(codes.ResourceExhausted, "metadata rate limit exceeded"), NFSRetryLater, fuse.EIO},
+		{status.Error(codes.Unavailable, "connection refused"), NFSRetryLater, fuse.EIO},
+		{status.Error(codes.DeadlineExceeded, "deadline exceeded"), NFSRetryLater, fuse.EIO},
+		{status.Error(codes.ResourceExhausted, "file too large"), fuse.Status(syscall.EFBIG), fuse.EIO},
+		{status.Error(codes.ResourceExhausted, "entry quota exceeded"), fuse.Status(syscall.EDQUOT), fuse.EIO},
+		{status.Error(codes.Internal, "disk on fire"), fuse.EIO, fuse.EIO},
+	} {
+		f := newStoreFiler()
+		wfs := newLinkTestWFS(t, f)
+		f.put(plainEntry("a", 8001, "a"))
+		inode := seen(t, wfs, f, "a")
+		startFakeFiler(t, wfs, flushRefusingFiler{f, "a", c.err})
+		fh := dirtyHandle(t, wfs, inode)
+		if st := wfs.NFSFsync(fh.fh, 99, 100); st != c.nfs {
+			t.Errorf("%v: NFSFsync %v, want %v", c.err, st, c.nfs)
+		}
+		lock := wfs.fhLockTable.AcquireLock("test", fh.fh, util.ExclusiveLock)
+		dirty := fh.dirtyMetadata
+		wfs.fhLockTable.ReleaseLock(fh.fh, lock)
+		if !dirty {
+			t.Errorf("%v: the writes were dropped", c.err)
+		}
+		if st := wfs.Fsync(nil, &fuse.FsyncIn{InHeader: fuse.InHeader{NodeId: inode}, Fh: uint64(fh.fh)}); st != c.fuse {
+			t.Errorf("%v: Fsync %v, want %v", c.err, st, c.fuse)
+		}
+	}
+}

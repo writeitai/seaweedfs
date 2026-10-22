@@ -130,5 +130,10 @@ func TestHardLinkRecordFenceCoversRefreshesAndOwnChanges(t *testing.T) {
 	if m := mode(); m != 0o604 {
 		t.Fatalf("after a listing older than the mount's change: %o", m)
 	}
+	mc.UpdateHardLinkRecord(ctx, hardLink("/d/b", 0o606), 0) // with no log position
+	list(t, mc, "/d", 4800, hardLink("/d/a", 0o644), hardLink("/d/b", 0o644))
+	if m := mode(); m != 0o606 {
+		t.Fatalf("after a listing older than a change with no position: %o", m)
+	}
 	mc.WaitForEntryInvalidations()
 }

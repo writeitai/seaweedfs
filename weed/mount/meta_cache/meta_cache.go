@@ -238,7 +238,8 @@ func (mc *MetaCache) hardLinkRecordIsNewerLocked(ctx context.Context, id []byte,
 // setHardLinkRecordLocked writes entry, at tsNs, as its group's record,
 // unless the record reflects a later position. Unless always, only a
 // record already kept is written: one for a group none of whose names is
-// cached would only accumulate.
+// cached would only accumulate. A state with no position (tsNs 0) keeps
+// the record's version, which still fences older listings.
 func (mc *MetaCache) setHardLinkRecordLocked(ctx context.Context, entry *filer.Entry, tsNs int64, always bool) {
 	if mc.hardLinkRecordIsNewerLocked(ctx, entry.HardLinkId, tsNs) {
 		return
@@ -259,7 +260,9 @@ func (mc *MetaCache) setHardLinkRecordLocked(ctx context.Context, entry *filer.E
 		glog.V(1).Infof("hard link record %x: %v", entry.HardLinkId, err)
 		return
 	}
-	mc.setHardLinkVersionLocked(ctx, entry.HardLinkId, tsNs)
+	if tsNs != 0 {
+		mc.setHardLinkVersionLocked(ctx, entry.HardLinkId, tsNs)
+	}
 }
 
 // insertListedLocked stores an entry a listing at snapshotTsNs returned. A
