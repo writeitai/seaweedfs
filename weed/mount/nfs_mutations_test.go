@@ -29,6 +29,7 @@ func (f *storeFiler) StreamRenameEntry(r *filer_pb.StreamRenameEntryRequest, str
 		f.mu.Unlock()
 		return status.Errorf(codes.NotFound, "%s not found", from)
 	}
+	f.remove(to) // what the target held, its group's counter with it
 	delete(f.entries, from)
 	raw.Name = r.NewName
 	f.entries[to] = raw
@@ -454,12 +455,15 @@ func TestNFSLinkStatuses(t *testing.T) {
 	wfs := newLinkTestWFS(t, f)
 	f.put(plainEntry("a", 8001, "a"))
 	inode := seen(t, wfs, f, "a")
-	lookups := 0
 	f.beforeLookup = func(ctx context.Context, p util.FullPath) {
-		if p == "/a" {
-			if lookups++; lookups == 2 { // the read under the group's lock
-				<-ctx.Done()
-			}
+		f.mu.Lock()
+		grouped := false
+		for key := range f.locks {
+			grouped = grouped || strings.HasPrefix(key, "hardlink/")
+		}
+		f.mu.Unlock()
+		if p == "/a" && grouped { // the read under the group's lock
+			<-ctx.Done()
 		}
 	}
 	s, _ := nfsStep(t, 300*time.Millisecond, 5*time.Second)
@@ -756,5 +760,49 @@ func TestNFSRenameMovesASubtree(t *testing.T) {
 	}
 	if wfs.inodeToPath.IsChildrenCached("/") {
 		t.Fatal("the parent is still taken from the cache")
+	}
+}
+
+// A create the filer acknowledged whose stored inode cannot be read is
+// EIO, never a status saying nothing was made.
+func TestNFSCreateUnreadInodeIsIO(t *testing.T) {
+	f := newStoreFiler()
+	wfs := newLinkTestWFS(t, f)
+	f.afterCreate = func(r *filer_pb.CreateEntryRequest) (*filer_pb.CreateEntryResponse, error) {
+		f.remove(util.FullPath(r.Directory).Child(r.Entry.Name)) // another client's, at once
+		return &filer_pb.CreateEntryResponse{}, nil              // no event: the inode is looked up
+	}
+	if _, st := wfs.NFSCreate(step(t), 1, "n", NFSGuarded, NFSAttrs{}, [8]byte{}, 99, 100, nil); st != fuse.EIO {
+		t.Fatalf("create: %v", st)
+	}
+}
+
+// Removing or replacing one name of a hard link keeps the object's open
+// handle writing: another name still has it. Its last name ends that.
+func TestNFSRemovingAHardLinkKeepsItsHandle(t *testing.T) {
+	f := newStoreFiler()
+	wfs := newLinkTestWFS(t, f)
+	f.put(plainEntry("a", 8001, "a"))
+	f.put(plainEntry("c", 8002, "c"))
+	inode := seen(t, wfs, f, "a")
+	seen(t, wfs, f, "c")
+	for _, n := range []string{"b", "d"} {
+		if st := wfs.NFSLink(step(t), inode, 1, n, 99, 100); st != fuse.OK {
+			t.Fatalf("link %s: %v", n, st)
+		}
+	}
+	h, st := wfs.AcquireHandle(inode, syscall.O_RDONLY, 99, 100)
+	if st != fuse.OK {
+		t.Fatalf("open: %v", st)
+	}
+	defer wfs.NFSCloseRead(h.fh)
+	if st := wfs.NFSRemove(step(t), 1, "a"); st != fuse.OK || h.isDeleted {
+		t.Fatalf("remove a: %v, deleted %v", st, h.isDeleted)
+	}
+	if st := wfs.NFSRename(step(t), 1, "c", 1, "b"); st != fuse.OK || h.isDeleted {
+		t.Fatalf("rename over b: %v, deleted %v", st, h.isDeleted)
+	}
+	if st := wfs.NFSRemove(step(t), 1, "d"); st != fuse.OK || !h.isDeleted {
+		t.Fatalf("remove d: %v, deleted %v", st, h.isDeleted)
 	}
 }

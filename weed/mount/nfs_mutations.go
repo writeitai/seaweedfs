@@ -231,14 +231,18 @@ func (wfs *WFS) nfsCreateEntry(step NFSStep, dirPath util.FullPath, entry *filer
 	if err == nil && resp.GetError() != "" {
 		err = errors.New(resp.GetError())
 	}
-	var inode uint64
-	if err == nil {
-		inode, err = wfs.adoptStoredInode(step.Mutate, path, entry, resp)
-	}
 	if err != nil {
 		glog.V(0).Infof("nfs create %s: %v", path, err)
 		wfs.inodeToPath.InvalidateChildrenCache(dirPath)
 		return 0, nfsCallStatus(err, true)
+	}
+	inode, err := wfs.adoptStoredInode(step.Mutate, path, entry, resp)
+	if err != nil {
+		// Made, but not to be reported under a number the filer may not
+		// store: whether it happened is the client's to find out.
+		glog.V(0).Infof("nfs create %s: %v", path, err)
+		wfs.inodeToPath.InvalidateChildrenCache(dirPath)
+		return 0, fuse.EIO
 	}
 	event := resp.GetMetadataEvent()
 	if event == nil {
@@ -275,7 +279,7 @@ func (wfs *WFS) NFSRemove(step NFSStep, dir uint64, name string) fuse.Status {
 	}
 	inode, found := wfs.inodeToPath.GetInode(path)
 	epoch := uint64(0)
-	if found {
+	if found && lastName(entry) {
 		epoch = wfs.markHandleDeleted(inode)
 	}
 	resp, err := wfs.deleteEntryOnce(step.Mutate, &filer_pb.DeleteEntryRequest{
@@ -408,9 +412,9 @@ func (wfs *WFS) NFSRename(step NFSStep, fromDir uint64, fromName string, toDir u
 		return NFSRetryLater
 	}
 	// What the target held is deleted: an open handle on it stops writing
-	// the name back, as for a FUSE rename.
+	// the name back, as for a FUSE rename, unless another name keeps it.
 	var targetInode, epoch uint64
-	if target != nil {
+	if target != nil && lastName(target) {
 		sourceInode, _ := wfs.inodeToPath.GetInode(oldPath)
 		if inode, found := wfs.inodeToPath.GetInode(newPath); found && inode != sourceInode {
 			targetInode, epoch = inode, wfs.markHandleDeleted(inode)
@@ -705,6 +709,18 @@ func (wfs *WFS) acquireWriteLeaseContext(ctx context.Context, fh *FileHandle) fu
 // reply waits for, so the client's next call on the same object finds it
 // free.
 const nfsUnlockTimeout = time.Second
+
+// NFSReleaseTime is the longest an NFS mutation takes to let its locks go
+// once its Mutate step returned: up to three, one after another, each
+// StopWithin(nfsUnlockTimeout) taking up to twice that. A caller answering
+// within a deadline ends Mutate this much before it.
+const NFSReleaseTime = 3 * 2 * nfsUnlockTimeout
+
+// lastName reports whether entry is its object's only name: removing it
+// removes the object, and a hard link with other names does not.
+func lastName(entry *filer_pb.Entry) bool {
+	return len(entry.HardLinkId) == 0 || entry.HardLinkCounter <= 1
+}
 
 // nfsChildPath is the path of name in the directory dir.
 func (wfs *WFS) nfsChildPath(dir uint64, name string) (util.FullPath, util.FullPath, fuse.Status) {
