@@ -138,7 +138,8 @@ func (wfs *WFS) nfsFold(ctx context.Context, fh *FileHandle, persisted nfsFoldSn
 	defer cancel()
 	// Entries hold no manifest chunks (the gateway refuses them), so these
 	// resolve nothing remote; an ended context would leave them nothing.
-	if compacted, _ := filer.CompactFileChunks(context.Background(), wfs.LookupFn(), chunks); len(compacted) <= nfsFoldMark {
+	compacted, _ := filer.CompactFileChunks(context.Background(), wfs.LookupFn(), chunks)
+	if len(compacted) <= nfsFoldMark {
 		return
 	}
 	quota := wfs.nfsFoldQuota(ctx)
@@ -183,6 +184,7 @@ func (wfs *WFS) nfsFold(ctx context.Context, fh *FileHandle, persisted nfsFoldSn
 		}
 	})
 	if added {
+		glog.V(0).Infof("nfs fold %s: %d chunks; %d pieces, %d bytes, folded into one", fh.FullPath(), len(compacted), hi-lo+1, span)
 		// The handle's reads see the same bytes with or without the fold,
 		// so its read index takes it without making the WRITE wait for
 		// a READ holding that index. A late add is safe: intervals sort
