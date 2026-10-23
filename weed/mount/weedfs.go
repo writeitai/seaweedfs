@@ -149,6 +149,7 @@ type WFS struct {
 	metaCache             *meta_cache.MetaCache
 	stats                 statsCache
 	chunkCache            *chunk_cache.TieredChunkCache
+	nfsFolds              nfsFoldBudget // Mountable: D47
 	readerCacheBudget     *filer.ReaderCacheBudget
 	manifestCache         *filer.ChunkManifestCache
 	writeBufferAccountant *page_writer.WriteBufferAccountant

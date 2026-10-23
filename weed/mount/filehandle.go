@@ -82,6 +82,9 @@ type FileHandle struct {
 	// persist one that is still in progress (Mountable). It is never
 	// cleared: on macOS no other path writes through this handle.
 	nfsWrite atomic.Bool
+	// nfsFoldPausedUntil is when the NFS write handle may fold again after
+	// an abandoned fold, in Unix nanoseconds (Mountable, D47).
+	nfsFoldPausedUntil atomic.Int64
 
 	// remoteInstallMu serializes downloadRemoteEntry's install, which holds
 	// only the handle's shared lock and so races a second concurrent read.
