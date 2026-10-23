@@ -184,7 +184,7 @@ func (wfs *WFS) nfsFold(ctx context.Context, fh *FileHandle, persisted nfsFoldSn
 		}
 	})
 	if added {
-		glog.V(0).Infof("nfs fold %s: %d chunks; %d pieces, %d bytes, folded into one", fh.FullPath(), len(compacted), hi-lo+1, span)
+		glog.V(1).Infof("nfs fold %s: %d chunks; %d pieces, %d bytes, folded into one", fh.FullPath(), len(compacted), hi-lo+1, span)
 		// The handle's reads see the same bytes with or without the fold,
 		// so its read index takes it without making the WRITE wait for
 		// a READ holding that index. A late add is safe: intervals sort
