@@ -345,7 +345,7 @@ func TestNFSWriteFoldOnASlowLink(t *testing.T) {
 	wfs, f, id := newFoldTestWFS(t, e, store)
 	s, _ := nfsStep(t, 6*time.Second, 5*time.Second)
 	start := time.Now()
-	if _, st := wfs.NFSWrite(s, id, 3, []byte{9}, 99, 100); st != fuse.OK || time.Since(start) > nfsFoldTime+2*time.Second {
+	if _, st := wfs.NFSWrite(s, id, 3, []byte{9}, 99, 100); st != fuse.OK || time.Since(start) > 6*time.Second { // within its preparation, not JUKEBOX
 		t.Fatalf("the WRITE: %v after %v", st, time.Since(start))
 	}
 	copy(content[3:], []byte{9})
@@ -737,7 +737,7 @@ func TestNFSWriteFoldBesideABusyCache(t *testing.T) {
 	t.Cleanup(wfs.chunkCache.Unlock)
 	start := time.Now()
 	writeAt(t, wfs, id, content, 3, []byte{9})
-	if took := time.Since(start); took > nfsFoldTime+2*time.Second {
+	if took := time.Since(start); took > 10*time.Second { // without the cut it waits for the cache
 		t.Fatalf("the WRITE took %v", took)
 	}
 }
