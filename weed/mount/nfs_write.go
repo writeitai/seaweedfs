@@ -3,7 +3,6 @@ package mount
 import (
 	"context"
 	"errors"
-	"slices"
 	"strings"
 	"syscall"
 
@@ -69,7 +68,7 @@ func (wfs *WFS) nfsPersist(step NFSStep, fh *FileHandle, uid, gid uint32) fuse.S
 	case wfs.IsOverQuotaWithUncommitted():
 		return fuse.Status(syscall.EDQUOT)
 	}
-	persisted := slices.Clone(fh.GetEntry().GetChunks())
+	persisted := newNFSFoldSnapshot(fh)
 	if err := fh.dirtyPages.FlushData(); err != nil {
 		return nfsUploadStatus(err)
 	}

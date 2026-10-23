@@ -17,6 +17,8 @@ import (
 	"time"
 
 	"github.com/seaweedfs/go-fuse/v2/fuse"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
@@ -105,10 +107,16 @@ func foldFile(store *chunkStore, size, patches, patch int, rng *rand.Rand) (*fil
 // bytes as set.
 type foldFiler struct {
 	*volumeFiler
-	used atomic.Uint64
+	used      atomic.Uint64
+	statsDown atomic.Bool
+	asked     atomic.Int32
 }
 
 func (f *foldFiler) Statistics(context.Context, *filer_pb.StatisticsRequest) (*filer_pb.StatisticsResponse, error) {
+	f.asked.Add(1)
+	if f.statsDown.Load() {
+		return nil, status.Error(codes.Unavailable, "down")
+	}
 	return &filer_pb.StatisticsResponse{TotalSize: 1 << 40, UsedSize: f.used.Load()}, nil
 }
 
@@ -638,5 +646,81 @@ func TestNFSWriteFoldAfterATruncation(t *testing.T) {
 	}
 	if got, _ := stored(t, f, store); !bytes.Equal(got, content) {
 		t.Fatal("the file does not read back as written")
+	}
+}
+
+// A truncation that keeps every chunk, shortening one in place, also
+// leaves the fold out.
+func TestNFSWriteFoldOverAChunkTruncatedInPlace(t *testing.T) {
+	store := &chunkStore{data: map[string][]byte{}}
+	e, _ := foldFile(store, 200_000, nfsFoldMark+10, 4, rand.New(rand.NewSource(15)))
+	wfs, f, id := newFoldTestWFS(t, e, store)
+	var once sync.Once
+	store.read = func(http.ResponseWriter, *http.Request) bool {
+		once.Do(func() {
+			wfs.GetHandle(id).UpdateEntry(func(e *filer_pb.Entry) {
+				e.Chunks[0].Size -= 5 // the base, as truncatedChunks trims it
+				e.Attributes.FileSize -= 5
+			})
+		})
+		return false
+	}
+	if _, st := wfs.NFSWrite(foldStep(t), id, 3, []byte{9}, 99, 100); st != fuse.OK {
+		t.Fatalf("the WRITE: %v", st)
+	}
+	for _, c := range f.lookup("/a").Chunks {
+		if c.Size > 4 && c.Offset != 0 {
+			t.Fatalf("the fold went in: %v", c)
+		}
+	}
+}
+
+// Statistics the gateway cannot give, or a refresh that fails, mean no
+// fold, at once.
+func TestNFSWriteFoldWithoutStatistics(t *testing.T) {
+	store := &chunkStore{data: map[string][]byte{}}
+	e, content := foldFile(store, 200_000, nfsFoldMark+300, 4, rand.New(rand.NewSource(17)))
+	wfs, f, id := newFoldTestWFSWith(t, e, store)
+	writeAt(t, wfs, id, content, 3, []byte{9}) // folds, with fresh statistics
+	f.statsDown.Store(true)
+	wfs.nfsFolds.mu.Lock()
+	wfs.nfsFolds.checked = time.Now().Add(-time.Minute)
+	wfs.nfsFolds.mu.Unlock()
+	asked := f.asked.Load()
+	start := time.Now()
+	for i := range 5 {
+		writeAt(t, wfs, id, content, 11+8*i, []byte{9})
+	}
+	if uploads, _ := store.counts(); uploads != 7 || time.Since(start) > 4*nfsFoldTime || f.asked.Load() != asked+1 {
+		t.Fatalf("%d uploads after %v, statistics asked %d times", uploads, time.Since(start), f.asked.Load()-asked)
+	}
+}
+
+// The pause after an abandoned fold is the file's, not its write
+// handle's: a new handle does not fold either.
+func TestNFSWriteFoldPauseOutlivesTheHandle(t *testing.T) {
+	store := &chunkStore{data: map[string][]byte{}}
+	e, content := foldFile(store, 200_000, nfsFoldMark+10, 4, rand.New(rand.NewSource(18)))
+	store.read = func(w http.ResponseWriter, _ *http.Request) bool {
+		http.Error(w, "no", http.StatusInternalServerError)
+		return true
+	}
+	wfs, _, id := newFoldTestWFS(t, e, store)
+	writeAt(t, wfs, id, content, 3, []byte{9})
+	inode := wfs.GetHandle(id).inode
+	wfs.NFSCloseWrite(id, false)
+	id, st := wfs.NFSOpenForWrite(context.Background(), inode, 99, 100)
+	if st != fuse.OK {
+		t.Fatalf("open for write: %v", st)
+	}
+	t.Cleanup(func() { wfs.NFSCloseWrite(id, false) })
+	store.mu.Lock()
+	reads := store.reads
+	store.mu.Unlock()
+	writeAt(t, wfs, id, content, 7, []byte{9})
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.reads != reads {
+		t.Fatalf("%d more reads: the new handle folded", store.reads-reads)
 	}
 }
