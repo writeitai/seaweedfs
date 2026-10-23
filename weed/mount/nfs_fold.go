@@ -123,8 +123,8 @@ func (wfs *WFS) nfsFoldReserve(quota uint64, n int64) bool {
 // nfsFoldTime: on any failure nothing of it goes into the entry, and the
 // WRITE persists as it would without it.
 func (wfs *WFS) nfsFold(ctx context.Context, fh *FileHandle, persisted nfsFoldSnapshot) {
-	if wfs.nfsFoldPaused(fh.inode) {
-		return
+	if persisted.chunks == nil || wfs.nfsFoldPaused(fh.inode) {
+		return // far from the mark, or paused
 	}
 	entry := fh.GetEntry()
 	chunks := entry.GetChunks()
@@ -185,7 +185,9 @@ func (wfs *WFS) nfsFold(ctx context.Context, fh *FileHandle, persisted nfsFoldSn
 	if added {
 		// The handle's reads see the same bytes with or without the fold,
 		// so its read index takes it without making the WRITE wait for
-		// a READ holding that index.
+		// a READ holding that index. A late add is safe: intervals sort
+		// by timestamp, not by when they are added, and a group replaced
+		// meanwhile is discarded, the new one built from the entry.
 		go fh.entryChunkGroup.AddChunk(chunk)
 	}
 }
@@ -278,17 +280,27 @@ func (wfs *WFS) nfsFoldChunk(ctx context.Context, fh *FileHandle, pieces []*file
 	start := pieces[0].ViewOffset
 	last := pieces[len(pieces)-1]
 	data := make([]byte, last.ViewOffset+int64(last.ViewSize)-start)
-	reads, readCtx := errgroup.WithContext(ctx)
-	reads.SetLimit(nfsFoldReads)
-	for _, p := range pieces {
-		buf := data[p.ViewOffset-start : p.ViewOffset-start+int64(p.ViewSize)]
-		reads.Go(func() error { return wfs.nfsFoldRead(readCtx, p, buf) })
+	// Nothing past ctx is waited for: not the reads, whose local cache
+	// takes no context, and not the upload, which takes none either; a
+	// chunk it sealed then is never referenced.
+	read := make(chan error, 1)
+	go func() {
+		reads, readCtx := errgroup.WithContext(ctx)
+		reads.SetLimit(nfsFoldReads)
+		for _, p := range pieces {
+			buf := data[p.ViewOffset-start : p.ViewOffset-start+int64(p.ViewSize)]
+			reads.Go(func() error { return wfs.nfsFoldRead(readCtx, p, buf) })
+		}
+		read <- reads.Wait()
+	}()
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case err := <-read:
+		if err != nil {
+			return nil, err
+		}
 	}
-	if err := reads.Wait(); err != nil {
-		return nil, err
-	}
-	// The upload takes no context: past the deadline its result is not
-	// waited for, and a chunk it sealed is never referenced.
 	type uploaded struct {
 		chunk *filer_pb.FileChunk
 		err   error
@@ -307,7 +319,7 @@ func (wfs *WFS) nfsFoldChunk(ctx context.Context, fh *FileHandle, pieces []*file
 			return nil, up.err
 		}
 		if wfs.chunkCache != nil {
-			wfs.chunkCache.SetChunk(up.chunk.FileId, data) // later folds read it here
+			go wfs.chunkCache.SetChunk(up.chunk.FileId, data) // later folds read it here
 		}
 		return up.chunk, nil
 	}

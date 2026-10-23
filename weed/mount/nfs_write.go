@@ -68,7 +68,10 @@ func (wfs *WFS) nfsPersist(step NFSStep, fh *FileHandle, uid, gid uint32) fuse.S
 	case wfs.IsOverQuotaWithUncommitted():
 		return fuse.Status(syscall.EDQUOT)
 	}
-	persisted := newNFSFoldSnapshot(fh)
+	var persisted nfsFoldSnapshot
+	if len(fh.GetEntry().GetChunks()) > nfsFoldMark-2 { // a WRITE adds at most two
+		persisted = newNFSFoldSnapshot(fh)
+	}
 	if err := fh.dirtyPages.FlushData(); err != nil {
 		return nfsUploadStatus(err)
 	}

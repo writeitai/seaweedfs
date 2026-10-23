@@ -24,6 +24,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
 	"github.com/seaweedfs/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/util/chunk_cache"
 )
 
 // chunkStore is a volume behind the chunk proxy that keeps what is
@@ -722,5 +723,21 @@ func TestNFSWriteFoldPauseOutlivesTheHandle(t *testing.T) {
 	defer store.mu.Unlock()
 	if store.reads != reads {
 		t.Fatalf("%d more reads: the new handle folded", store.reads-reads)
+	}
+}
+
+// A local chunk cache that holds its lock does not hold up the WRITE past
+// the fold's 2 seconds.
+func TestNFSWriteFoldBesideABusyCache(t *testing.T) {
+	store := &chunkStore{data: map[string][]byte{}}
+	e, content := foldFile(store, 200_000, nfsFoldMark+10, 4, rand.New(rand.NewSource(19)))
+	wfs, _, id := newFoldTestWFS(t, e, store)
+	wfs.chunkCache = chunk_cache.NewTieredChunkCache(16, t.TempDir(), 16, 1<<20)
+	wfs.chunkCache.Lock() // a cache busy with something slow
+	t.Cleanup(wfs.chunkCache.Unlock)
+	start := time.Now()
+	writeAt(t, wfs, id, content, 3, []byte{9})
+	if took := time.Since(start); took > nfsFoldTime+2*time.Second {
+		t.Fatalf("the WRITE took %v", took)
 	}
 }
