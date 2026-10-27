@@ -145,7 +145,7 @@ func TestPathCacheRootNeverCached(t *testing.T) {
 func TestCacheKey(t *testing.T) {
 	for path, want := range map[string]string{
 		`/a/b`:   "a/b",
-		`\a\b`:   "a/b",
+		`/a\b`:   `a\b`, // a backslash is part of the name
 		`a//b/`:  "a/b",
 		`/`:      "",
 		``:       "",

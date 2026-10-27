@@ -20,8 +20,10 @@ func TestSplitPath(t *testing.T) {
 		{"/foo/bar", []string{"foo", "bar"}},
 		{"/foo//bar", []string{"foo", "bar"}},
 		{"/foo/./bar", []string{"foo", "bar"}},
-		{`\foo\bar`, []string{"foo", "bar"}},
-		{`/foo\bar`, []string{"foo", "bar"}},
+		// A backslash is part of a name: WinFsp has already turned the
+		// separators into "/".
+		{`/foo\bar`, []string{`foo\bar`}},
+		{`/a\/b`, []string{`a\`, "b"}},
 		{"/foo bar/baz qux", []string{"foo bar", "baz qux"}},
 		{"/eñe/日本", []string{"eñe", "日本"}},
 		// ".." is a name like any other here; the filer resolves it, and
@@ -55,7 +57,7 @@ func TestSplitParent(t *testing.T) {
 		{"/foo", "", "foo", true},
 		{"/foo/bar", "foo", "bar", true},
 		{"/foo/bar/baz", "foo/bar", "baz", true},
-		{`\foo\bar`, "foo", "bar", true},
+		{`/foo\bar`, "", `foo\bar`, true}, // one name with a backslash
 		{"/foo/bar/", "foo", "bar", true},
 	}
 	for _, c := range cases {
@@ -70,7 +72,7 @@ func TestSplitParent(t *testing.T) {
 // The root has no parent, so operations that need one must be rejected rather
 // than silently acting on the root itself.
 func TestSplitParentRejectsRoot(t *testing.T) {
-	for _, root := range []string{"/", "", "//", `\`} {
+	for _, root := range []string{"/", "", "//", "/./"} {
 		if _, _, ok := splitParent(root); ok {
 			t.Errorf("splitParent(%q) accepted the root", root)
 		}

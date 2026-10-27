@@ -2,12 +2,14 @@ package winfsp
 
 import "strings"
 
-// splitPath breaks a WinFsp path into the components to walk. WinFsp normally
-// hands out forward slashes, but callers reach the mount with either separator,
-// and empty or "." components have to drop out rather than become a lookup for
-// a name that does not exist.
+// splitPath breaks a WinFsp path into the components to walk. WinFsp's FUSE
+// layer turns every Windows separator into "/" before the adapter sees the
+// path, and turns a backslash that is part of a name (shown to Windows as
+// U+F05C) back into a backslash. So "/" is the only separator: a backslash is a
+// character of the name, as on every other mount. Empty or "." components have
+// to drop out rather than become a lookup for a name that does not exist.
 func splitPath(path string) []string {
-	trimmed := strings.Trim(strings.ReplaceAll(path, `\`, "/"), "/")
+	trimmed := strings.Trim(path, "/")
 	if trimmed == "" {
 		return nil
 	}
