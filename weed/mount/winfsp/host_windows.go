@@ -39,6 +39,12 @@ type Options struct {
 	// ExtraOptions are passed through to WinFsp as -o arguments, after the
 	// defaults, so they win when they name the same option.
 	ExtraOptions []string
+
+	// Wrap, if set, is given the adapter and returns the filesystem WinFsp
+	// is served, so an embedder can add its own policy around every
+	// operation (what it reports, when it refuses). The result must pass
+	// each operation on to the adapter it was given.
+	Wrap func(cgofuse.FileSystemInterface) cgofuse.FileSystemInterface
 }
 
 // Host is a WinFsp mount that has not been started yet.
@@ -51,7 +57,11 @@ type Host struct {
 // New wires wfs up to WinFsp. Nothing is mounted until Serve.
 func New(wfs *mount.WFS, options Options) *Host {
 	fs := NewWinFS(wfs, options.Uid, options.Gid, options.ReadOnly, options.CacheTimeout)
-	host := cgofuse.NewFileSystemHost(fs)
+	var served cgofuse.FileSystemInterface = fs
+	if options.Wrap != nil {
+		served = options.Wrap(fs)
+	}
+	host := cgofuse.NewFileSystemHost(served)
 	host.SetCapReaddirPlus(true)
 	host.SetUseIno(true)
 	return &Host{host: host, fs: fs, options: options}
