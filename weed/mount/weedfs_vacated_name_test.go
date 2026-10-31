@@ -122,8 +122,8 @@ func TestVacatedNameInForgottenDirectoryKeepsNothing(t *testing.T) {
 	}
 }
 
-// An mtime set explicitly after names left is the one reported, past or
-// future: what was kept for the vacated names gives way to it.
+// An mtime set through this mount after names left is the one reported,
+// past or future: what was kept for the vacated names gives way to it.
 func TestSetMtimeSupersedesVacatedNames(t *testing.T) {
 	for _, set := range []time.Time{time.Unix(1000, 7), time.Now().Add(time.Hour).Truncate(time.Second)} {
 		f := newStoreFiler()
@@ -141,6 +141,30 @@ func TestSetMtimeSupersedesVacatedNames(t *testing.T) {
 		}
 		if got := dirMtime(t, wfs, inode); !got.Equal(set) {
 			t.Errorf("directory mtime %v after setting it to %v", got, set)
+		}
+	}
+}
+
+// So is an mtime another client set: whatever the store reports next, the
+// vacated names have been told by the change itself.
+func TestStoredMtimeChangeSupersedesVacatedNames(t *testing.T) {
+	for _, set := range []time.Time{time.Unix(1000, 7), time.Now().Add(time.Hour).Truncate(time.Second)} {
+		wfs, inode, old := newVacatedNameWFS(t, -time.Hour)
+		wfs.onEntryInvalidation(meta_cache.EntryInvalidation{Path: "/d/gone", Deleted: true})
+		if got := dirMtime(t, wfs, inode); !got.After(old) {
+			t.Fatalf("directory mtime %v after a name left it, want later than %v", got, old)
+		}
+		if err := wfs.metaCache.UpdateEntry(context.Background(), &filer.Entry{
+			FullPath: "/d",
+			Attr:     filer.Attr{Mode: os.ModeDir | 0o755, Mtime: set, Crtime: old},
+		}); err != nil {
+			t.Fatalf("set the stored mtime: %v", err)
+		}
+		if got := dirMtime(t, wfs, inode); !got.Equal(set) {
+			t.Errorf("directory mtime %v after the store's became %v", got, set)
+		}
+		if len(wfs.vacatedDirs) != 0 {
+			t.Errorf("still keeping %v", wfs.vacatedDirs)
 		}
 	}
 }

@@ -65,7 +65,6 @@ func (wfs *WFS) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *fuse
 		return fuse.Status(syscall.ENOSPC)
 	}
 
-	vacated := wfs.vacatedCount(input.NodeId)
 	path, fh, entry, status := wfs.maybeReadEntry(input.NodeId)
 	if status != fuse.OK || entry == nil {
 		return status
@@ -206,14 +205,10 @@ func (wfs *WFS) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *fuse
 	}
 
 	if truncated {
-		code = wfs.saveEntry(path, entry)
-	} else {
-		code = wfs.saveAttributes(path, entry)
+		return wfs.saveEntry(path, entry)
 	}
-	if _, ok := input.GetMTime(); ok && code == fuse.OK {
-		wfs.supersedeVacated(input.NodeId, vacated)
-	}
-	return code
+	return wfs.saveAttributes(path, entry)
+
 }
 
 // rootAttrs is the root's mode and owner, read together.
@@ -392,45 +387,41 @@ func (wfs *WFS) applyInMemoryDirMtime(out *fuse.Attr, inode uint64) {
 		}
 	}
 	if v, ok := wfs.vacatedDirs[inode]; ok {
-		t := v.at
-		if mtime := time.Unix(int64(out.Mtime), int64(out.Mtimensec)); !t.After(mtime) {
-			// The mtime is ahead of this clock: each vacated name moves it
-			// a nanosecond instead, so it still changes.
-			t = mtime.Add(time.Duration(v.count))
+		mtime := time.Unix(int64(out.Mtime), int64(out.Mtimensec))
+		if v.bump > 0 && !mtime.Equal(v.base) {
+			// The mtime changed since: that tells the client, and it is
+			// the mtime from now on.
+			v.bump = 0
 		}
-		// Only the mtime: a guarded SETATTR compares the stored ctime.
-		out.Mtime, out.Mtimensec = uint64(t.Unix()), uint32(t.Nanosecond())
+		if v.pending {
+			if v.bump == 0 {
+				v.base = mtime
+			}
+			v.bump++
+			v.pending = false
+		}
+		if v.bump == 0 {
+			delete(wfs.vacatedDirs, inode)
+		} else {
+			wfs.vacatedDirs[inode] = v
+			// Only the mtime: a guarded SETATTR compares the stored ctime.
+			t := v.base.Add(time.Duration(v.bump))
+			out.Mtime, out.Mtimensec = uint64(t.Unix()), uint32(t.Nanosecond())
+		}
 	}
 	wfs.dirMtimeMu.Unlock()
 }
 
-// vacatedDir is what noteNameVacated keeps of a directory: when a name last
-// left it and how many have. It lives as long as the inode, unbounded,
-// because losing it would bring back the mtime the client already holds,
-// or until the mtime is set explicitly.
+// vacatedDir is what noteNameVacated keeps of a directory until its mtime
+// next changes: whether a name left since the mtime was last reported, and
+// how many nanoseconds the reported mtime is past base, the mtime it had
+// then. No clock is involved, so neither skew nor an mtime set ahead keeps
+// the reported one from moving. It is never evicted, since losing it would
+// bring back the mtime the client already holds.
 type vacatedDir struct {
-	at    time.Time
-	count int64
-}
-
-// vacatedCount is how many names noteNameVacated has seen leave the
-// directory at inode, for a later supersedeVacated.
-func (wfs *WFS) vacatedCount(inode uint64) int64 {
-	wfs.dirMtimeMu.Lock()
-	defer wfs.dirMtimeMu.Unlock()
-	return wfs.vacatedDirs[inode].count
-}
-
-// supersedeVacated drops what noteNameVacated keeps of the directory at
-// inode once its mtime was set explicitly, so the set mtime is what is
-// reported. A name that left after count was read is kept: the set mtime
-// need not differ from what the client already holds.
-func (wfs *WFS) supersedeVacated(inode uint64, count int64) {
-	wfs.dirMtimeMu.Lock()
-	defer wfs.dirMtimeMu.Unlock()
-	if v, ok := wfs.vacatedDirs[inode]; ok && v.count == count {
-		delete(wfs.vacatedDirs, inode)
-	}
+	pending bool
+	base    time.Time
+	bump    int64
 }
 
 const atimeMapMaxSize = 8192

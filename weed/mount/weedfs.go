@@ -1069,7 +1069,8 @@ func (wfs *WFS) noteNameVacated(path util.FullPath) {
 			wfs.vacatedDirs = make(map[uint64]vacatedDir)
 		}
 		v := wfs.vacatedDirs[inode]
-		wfs.vacatedDirs[inode] = vacatedDir{at: time.Now(), count: v.count + 1}
+		v.pending = true
+		wfs.vacatedDirs[inode] = v
 	})
 }
 
