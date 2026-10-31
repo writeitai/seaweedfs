@@ -363,6 +363,9 @@ const dirMtimeMapMaxSize = 8192
 func (wfs *WFS) setDirMtime(inode uint64, t time.Time) {
 	wfs.dirMtimeMu.Lock()
 	defer wfs.dirMtimeMu.Unlock()
+	if wfs.dirMtimeMap == nil {
+		wfs.dirMtimeMap = make(map[uint64]time.Time)
+	}
 	if len(wfs.dirMtimeMap) >= dirMtimeMapMaxSize {
 		for k := range wfs.dirMtimeMap {
 			delete(wfs.dirMtimeMap, k)
