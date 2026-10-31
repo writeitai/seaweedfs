@@ -363,9 +363,6 @@ const dirMtimeMapMaxSize = 8192
 func (wfs *WFS) setDirMtime(inode uint64, t time.Time) {
 	wfs.dirMtimeMu.Lock()
 	defer wfs.dirMtimeMu.Unlock()
-	if wfs.dirMtimeMap == nil {
-		wfs.dirMtimeMap = make(map[uint64]time.Time)
-	}
 	if len(wfs.dirMtimeMap) >= dirMtimeMapMaxSize {
 		for k := range wfs.dirMtimeMap {
 			delete(wfs.dirMtimeMap, k)
@@ -389,7 +386,25 @@ func (wfs *WFS) applyInMemoryDirMtime(out *fuse.Attr, inode uint64) {
 			out.Ctimensec = nsec
 		}
 	}
+	if v, ok := wfs.vacatedDirs[inode]; ok {
+		t := v.at
+		if mtime := time.Unix(int64(out.Mtime), int64(out.Mtimensec)); !t.After(mtime) {
+			// The mtime is ahead of this clock: each vacated name moves it
+			// a nanosecond instead, so it still changes.
+			t = mtime.Add(time.Duration(v.count))
+		}
+		out.Mtime, out.Mtimensec = uint64(t.Unix()), uint32(t.Nanosecond())
+		out.Ctime, out.Ctimensec = out.Mtime, out.Mtimensec
+	}
 	wfs.dirMtimeMu.Unlock()
+}
+
+// vacatedDir is what noteNameVacated keeps of a directory: when a name last
+// left it and how many have. It lives as long as the inode, unbounded,
+// because losing it would bring back the mtime the client already holds.
+type vacatedDir struct {
+	at    time.Time
+	count int64
 }
 
 const atimeMapMaxSize = 8192
@@ -421,6 +436,7 @@ func (wfs *WFS) forgetInMemoryTimes(inode uint64) {
 
 	wfs.dirMtimeMu.Lock()
 	delete(wfs.dirMtimeMap, inode)
+	delete(wfs.vacatedDirs, inode)
 	wfs.dirMtimeMu.Unlock()
 
 	wfs.removedDirMu.Lock()

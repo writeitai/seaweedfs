@@ -185,7 +185,8 @@ type WFS struct {
 	atimeMu           sync.Mutex
 	atimeMap          map[uint64]time.Time // inode -> atime, in-memory only, bounded
 	dirMtimeMu        sync.Mutex
-	dirMtimeMap       map[uint64]time.Time // inode -> mtime/ctime, in-memory overlay for dirs
+	dirMtimeMap       map[uint64]time.Time  // inode -> mtime/ctime, in-memory overlay for dirs
+	vacatedDirs       map[uint64]vacatedDir // inode -> names other clients took away, for a front end without kernel notifications; under dirMtimeMu
 	removedDirMu      sync.Mutex
 	removedDirs       map[uint64]*filer_pb.Entry // inode -> last-known entry of a directory removed while still referenced
 	entryValidSec     uint64                     // kernel FUSE entry cache TTL in seconds
@@ -1061,7 +1062,17 @@ func (wfs *WFS) noteNameVacated(path util.FullPath) {
 		return
 	}
 	dir, _ := path.DirAndName()
-	wfs.touchDirMtimeCtimeLocal(util.FullPath(dir))
+	inode, found := wfs.inodeToPath.GetInode(util.FullPath(dir))
+	if !found {
+		return
+	}
+	wfs.dirMtimeMu.Lock()
+	defer wfs.dirMtimeMu.Unlock()
+	if wfs.vacatedDirs == nil {
+		wfs.vacatedDirs = make(map[uint64]vacatedDir)
+	}
+	v := wfs.vacatedDirs[inode]
+	wfs.vacatedDirs[inode] = vacatedDir{at: time.Now(), count: v.count + 1}
 }
 
 // MountRoot is the filer path this mount is rooted at. Event paths are absolute
