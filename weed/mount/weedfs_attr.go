@@ -393,8 +393,8 @@ func (wfs *WFS) applyInMemoryDirMtime(out *fuse.Attr, inode uint64) {
 			// a nanosecond instead, so it still changes.
 			t = mtime.Add(time.Duration(v.count))
 		}
+		// Only the mtime: a guarded SETATTR compares the stored ctime.
 		out.Mtime, out.Mtimensec = uint64(t.Unix()), uint32(t.Nanosecond())
-		out.Ctime, out.Ctimensec = out.Mtime, out.Mtimensec
 	}
 	wfs.dirMtimeMu.Unlock()
 }

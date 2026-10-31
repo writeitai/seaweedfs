@@ -33,11 +33,17 @@ func newVacatedNameWFS(t *testing.T, age time.Duration) (*WFS, uint64, time.Time
 
 func dirMtime(t *testing.T, wfs *WFS, inode uint64) time.Time {
 	t.Helper()
+	mtime, _ := dirTimes(t, wfs, inode)
+	return mtime
+}
+
+func dirTimes(t *testing.T, wfs *WFS, inode uint64) (mtime, ctime time.Time) {
+	t.Helper()
 	var out fuse.AttrOut
 	if st := wfs.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{NodeId: inode}}, &out); st != fuse.OK {
 		t.Fatalf("GetAttr: %v", st)
 	}
-	return time.Unix(int64(out.Mtime), int64(out.Mtimensec))
+	return time.Unix(int64(out.Mtime), int64(out.Mtimensec)), time.Unix(int64(out.Ctime), int64(out.Ctimensec))
 }
 
 // A name deleted or moved away by another client moves its directory's
@@ -88,5 +94,30 @@ func TestVacatedNameMovesFutureDirectoryMtime(t *testing.T) {
 	wfs.onEntryInvalidation(meta_cache.EntryInvalidation{Path: "/d/kept", RenamedTo: "/d/renamed"})
 	if second := dirMtime(t, wfs, inode); !second.After(first) {
 		t.Errorf("directory mtime %v after a second name left it, want later than %v", second, first)
+	}
+}
+
+// Only the mtime moves: a client's guarded SETATTR sends back the ctime it
+// read, and the store's ctime is what the guard is checked against.
+func TestVacatedNameLeavesDirectoryCtime(t *testing.T) {
+	wfs, inode, _ := newVacatedNameWFS(t, -time.Hour)
+	_, before := dirTimes(t, wfs, inode)
+	wfs.onEntryInvalidation(meta_cache.EntryInvalidation{Path: "/d/gone", Deleted: true})
+	if _, after := dirTimes(t, wfs, inode); !after.Equal(before) {
+		t.Errorf("directory ctime %v after a name left it, want %v", after, before)
+	}
+}
+
+// A directory the mount has forgotten keeps nothing for a later event, so
+// the state lives no longer than the inode.
+func TestVacatedNameInForgottenDirectoryKeepsNothing(t *testing.T) {
+	wfs, inode, _ := newVacatedNameWFS(t, -time.Hour)
+	wfs.Forget(inode, 1)
+	if _, found := wfs.inodeToPath.GetInode("/d"); found {
+		t.Fatal("the directory is still in the table after its last Forget")
+	}
+	wfs.onEntryInvalidation(meta_cache.EntryInvalidation{Path: "/d/gone", Deleted: true})
+	if len(wfs.vacatedDirs) != 0 {
+		t.Errorf("kept %v for a forgotten directory", wfs.vacatedDirs)
 	}
 }

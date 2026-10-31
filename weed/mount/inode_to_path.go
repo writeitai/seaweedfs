@@ -393,6 +393,17 @@ func (i *InodeToPath) GetInode(path util.FullPath) (uint64, bool) {
 	return inode, found
 }
 
+// withInode calls fn with path's inode, if the table has one, holding the
+// table's lock: a Forget can neither release the inode nor drop what fn
+// records for it until fn returns.
+func (i *InodeToPath) withInode(path util.FullPath, fn func(inode uint64)) {
+	i.Lock()
+	defer i.Unlock()
+	if inode, found := i.path2inode[path]; found {
+		fn(inode)
+	}
+}
+
 func (i *InodeToPath) GetPath(inode uint64) (util.FullPath, fuse.Status) {
 	i.RLock()
 	defer i.RUnlock()

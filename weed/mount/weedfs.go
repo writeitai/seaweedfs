@@ -1062,17 +1062,15 @@ func (wfs *WFS) noteNameVacated(path util.FullPath) {
 		return
 	}
 	dir, _ := path.DirAndName()
-	inode, found := wfs.inodeToPath.GetInode(util.FullPath(dir))
-	if !found {
-		return
-	}
-	wfs.dirMtimeMu.Lock()
-	defer wfs.dirMtimeMu.Unlock()
-	if wfs.vacatedDirs == nil {
-		wfs.vacatedDirs = make(map[uint64]vacatedDir)
-	}
-	v := wfs.vacatedDirs[inode]
-	wfs.vacatedDirs[inode] = vacatedDir{at: time.Now(), count: v.count + 1}
+	wfs.inodeToPath.withInode(util.FullPath(dir), func(inode uint64) {
+		wfs.dirMtimeMu.Lock()
+		defer wfs.dirMtimeMu.Unlock()
+		if wfs.vacatedDirs == nil {
+			wfs.vacatedDirs = make(map[uint64]vacatedDir)
+		}
+		v := wfs.vacatedDirs[inode]
+		wfs.vacatedDirs[inode] = vacatedDir{at: time.Now(), count: v.count + 1}
+	})
 }
 
 // MountRoot is the filer path this mount is rooted at. Event paths are absolute
