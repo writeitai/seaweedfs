@@ -168,3 +168,44 @@ func TestStoredMtimeChangeSupersedesVacatedNames(t *testing.T) {
 		}
 	}
 }
+
+// A stored mtime that changes while a name is pending is reported as it is
+// when it differs from what was last reported, and moved past it when it
+// is the same, so the client always sees a change.
+func TestStoredMtimeChangeWithPendingNameStillMoves(t *testing.T) {
+	wfs, inode, old := newVacatedNameWFS(t, -time.Hour)
+	setStored := func(mtime time.Time) {
+		t.Helper()
+		if err := wfs.metaCache.UpdateEntry(context.Background(), &filer.Entry{
+			FullPath: "/d",
+			Attr:     filer.Attr{Mode: os.ModeDir | 0o755, Mtime: mtime, Crtime: old},
+		}); err != nil {
+			t.Fatalf("set the stored mtime: %v", err)
+		}
+	}
+	vacate := func() {
+		wfs.onEntryInvalidation(meta_cache.EntryInvalidation{Path: "/d/gone", Deleted: true})
+	}
+	vacate()
+	first := dirMtime(t, wfs, inode)
+	vacate()
+	second := dirMtime(t, wfs, inode)
+	if !first.After(old) || !second.After(first) {
+		t.Fatalf("directory mtimes %v, %v after names left, want each later than %v", first, second, old)
+	}
+
+	setStored(first) // another client sets it, to a value it reported before
+	vacate()
+	if got := dirMtime(t, wfs, inode); !got.Equal(first) {
+		t.Errorf("directory mtime %v after the store's became %v", got, first)
+	}
+
+	last := dirMtime(t, wfs, inode)
+	vacate()
+	reported := dirMtime(t, wfs, inode)
+	setStored(reported) // set to exactly what was last reported
+	vacate()
+	if got := dirMtime(t, wfs, inode); got.Equal(reported) || got.Equal(last) {
+		t.Errorf("directory mtime %v after a name left, want a change from %v", got, reported)
+	}
+}

@@ -389,8 +389,12 @@ func (wfs *WFS) applyInMemoryDirMtime(out *fuse.Attr, inode uint64) {
 	if v, ok := wfs.vacatedDirs[inode]; ok {
 		mtime := time.Unix(int64(out.Mtime), int64(out.Mtimensec))
 		if v.bump > 0 && !mtime.Equal(v.base) {
-			// The mtime changed since: that tells the client, and it is
-			// the mtime from now on.
+			// The mtime changed since: it is the mtime from now on, and
+			// unless it is the one last reported, the change itself tells
+			// the client of any name that left meanwhile.
+			if !mtime.Equal(v.base.Add(time.Duration(v.bump))) {
+				v.pending = false
+			}
 			v.bump = 0
 		}
 		if v.pending {
