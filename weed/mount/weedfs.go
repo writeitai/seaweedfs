@@ -185,8 +185,8 @@ type WFS struct {
 	atimeMu           sync.Mutex
 	atimeMap          map[uint64]time.Time // inode -> atime, in-memory only, bounded
 	dirMtimeMu        sync.Mutex
-	dirMtimeMap       map[uint64]time.Time  // inode -> mtime/ctime, in-memory overlay for dirs
-	vacatedDirs       map[uint64]vacatedDir // inode -> names other clients took away, for a front end without kernel notifications; under dirMtimeMu
+	dirMtimeMap       map[uint64]time.Time // inode -> mtime/ctime, in-memory overlay for dirs
+	dirReports        map[uint64]dirReport // inode -> the mtime reported for a directory, for a front end without kernel notifications; under dirMtimeMu
 	removedDirMu      sync.Mutex
 	removedDirs       map[uint64]*filer_pb.Entry // inode -> last-known entry of a directory removed while still referenced
 	entryValidSec     uint64                     // kernel FUSE entry cache TTL in seconds
@@ -1065,12 +1065,12 @@ func (wfs *WFS) noteNameVacated(path util.FullPath) {
 	wfs.inodeToPath.withInode(util.FullPath(dir), func(inode uint64) {
 		wfs.dirMtimeMu.Lock()
 		defer wfs.dirMtimeMu.Unlock()
-		if wfs.vacatedDirs == nil {
-			wfs.vacatedDirs = make(map[uint64]vacatedDir)
+		if wfs.dirReports == nil {
+			wfs.dirReports = make(map[uint64]dirReport)
 		}
-		v := wfs.vacatedDirs[inode]
-		v.pending = true
-		wfs.vacatedDirs[inode] = v
+		r := wfs.dirReports[inode]
+		r.pending = true
+		wfs.dirReports[inode] = r
 	})
 }
 

@@ -117,8 +117,8 @@ func TestVacatedNameInForgottenDirectoryKeepsNothing(t *testing.T) {
 		t.Fatal("the directory is still in the table after its last Forget")
 	}
 	wfs.onEntryInvalidation(meta_cache.EntryInvalidation{Path: "/d/gone", Deleted: true})
-	if len(wfs.vacatedDirs) != 0 {
-		t.Errorf("kept %v for a forgotten directory", wfs.vacatedDirs)
+	if len(wfs.dirReports) != 0 {
+		t.Errorf("kept %v for a forgotten directory", wfs.dirReports)
 	}
 }
 
@@ -163,9 +163,6 @@ func TestStoredMtimeChangeSupersedesVacatedNames(t *testing.T) {
 		if got := dirMtime(t, wfs, inode); !got.Equal(set) {
 			t.Errorf("directory mtime %v after the store's became %v", got, set)
 		}
-		if len(wfs.vacatedDirs) != 0 {
-			t.Errorf("still keeping %v", wfs.vacatedDirs)
-		}
 	}
 }
 
@@ -207,5 +204,22 @@ func TestStoredMtimeChangeWithPendingNameStillMoves(t *testing.T) {
 	vacate()
 	if got := dirMtime(t, wfs, inode); got.Equal(reported) || got.Equal(last) {
 		t.Errorf("directory mtime %v after a name left, want a change from %v", got, reported)
+	}
+}
+
+// The first name to leave moves the mtime past the one last reported even
+// when the store's changed to the value just below it meanwhile.
+func TestFirstVacatedNameMovesPastTheLastReportedMtime(t *testing.T) {
+	wfs, inode, old := newVacatedNameWFS(t, -time.Hour)
+	held := dirMtime(t, wfs, inode)
+	wfs.onEntryInvalidation(meta_cache.EntryInvalidation{Path: "/d/gone", Deleted: true})
+	if err := wfs.metaCache.UpdateEntry(context.Background(), &filer.Entry{
+		FullPath: "/d",
+		Attr:     filer.Attr{Mode: os.ModeDir | 0o755, Mtime: held.Add(-time.Nanosecond), Crtime: old},
+	}); err != nil {
+		t.Fatalf("set the stored mtime: %v", err)
+	}
+	if got := dirMtime(t, wfs, inode); got.Equal(held) {
+		t.Errorf("directory mtime %v after a name left, want a change from %v", got, held)
 	}
 }

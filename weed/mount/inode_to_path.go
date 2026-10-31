@@ -397,10 +397,20 @@ func (i *InodeToPath) GetInode(path util.FullPath) (uint64, bool) {
 // table's lock: a Forget can neither release the inode nor drop what fn
 // records for it until fn returns.
 func (i *InodeToPath) withInode(path util.FullPath, fn func(inode uint64)) {
-	i.Lock()
-	defer i.Unlock()
+	i.RLock()
+	defer i.RUnlock()
 	if inode, found := i.path2inode[path]; found {
 		fn(inode)
+	}
+}
+
+// withLiveInode calls fn if the table still has inode, holding its lock as
+// withInode does.
+func (i *InodeToPath) withLiveInode(inode uint64, fn func()) {
+	i.RLock()
+	defer i.RUnlock()
+	if _, found := i.inode2path[inode]; found {
+		fn()
 	}
 }
 

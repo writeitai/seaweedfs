@@ -386,46 +386,59 @@ func (wfs *WFS) applyInMemoryDirMtime(out *fuse.Attr, inode uint64) {
 			out.Ctimensec = nsec
 		}
 	}
-	if v, ok := wfs.vacatedDirs[inode]; ok {
-		mtime := time.Unix(int64(out.Mtime), int64(out.Mtimensec))
-		if v.bump > 0 && !mtime.Equal(v.base) {
-			// The mtime changed since: it is the mtime from now on, and
-			// unless it is the one last reported, the change itself tells
-			// the client of any name that left meanwhile.
-			if !mtime.Equal(v.base.Add(time.Duration(v.bump))) {
-				v.pending = false
-			}
-			v.bump = 0
-		}
-		if v.pending {
-			if v.bump == 0 {
-				v.base = mtime
-			}
-			v.bump++
-			v.pending = false
-		}
-		if v.bump == 0 {
-			delete(wfs.vacatedDirs, inode)
-		} else {
-			wfs.vacatedDirs[inode] = v
-			// Only the mtime: a guarded SETATTR compares the stored ctime.
-			t := v.base.Add(time.Duration(v.bump))
-			out.Mtime, out.Mtimensec = uint64(t.Unix()), uint32(t.Nanosecond())
-		}
-	}
 	wfs.dirMtimeMu.Unlock()
+	if wfs.fuseServer == nil {
+		wfs.inodeToPath.withLiveInode(inode, func() {
+			wfs.dirMtimeMu.Lock()
+			defer wfs.dirMtimeMu.Unlock()
+			wfs.reportDirMtime(out, inode)
+		})
+	}
 }
 
-// vacatedDir is what noteNameVacated keeps of a directory until its mtime
-// next changes: whether a name left since the mtime was last reported, and
-// how many nanoseconds the reported mtime is past base, the mtime it had
-// then. No clock is involved, so neither skew nor an mtime set ahead keeps
-// the reported one from moving. It is never evicted, since losing it would
-// bring back the mtime the client already holds.
-type vacatedDir struct {
-	pending bool
-	base    time.Time
-	bump    int64
+// dirReport is what a mount without kernel notifications keeps of the mtime
+// it reports for a directory: the one last reported, whether a name left
+// since (noteNameVacated), and how many nanoseconds past base, the mtime
+// the directory had then, the reported one is moved for the names that
+// left. It lives as long as the inode: losing it could bring back the
+// mtime the client already holds.
+type dirReport struct {
+	reported time.Time
+	pending  bool
+	base     time.Time
+	bump     int64
+}
+
+// reportDirMtime moves out's mtime, the one the directory at inode would
+// otherwise report, so that a client holding the last one sees a change
+// once a name left. It changes nothing else: a guarded SETATTR compares
+// the stored ctime. No clock is involved, so neither skew nor an mtime set
+// ahead stops the move, and once the directory's own mtime changes, that is
+// the one reported. Callers hold the inode table's lock, so a final
+// Forget cannot leave the record behind, and dirMtimeMu.
+func (wfs *WFS) reportDirMtime(out *fuse.Attr, inode uint64) {
+	if wfs.dirReports == nil {
+		wfs.dirReports = make(map[uint64]dirReport)
+	}
+	r := wfs.dirReports[inode]
+	mtime := time.Unix(int64(out.Mtime), int64(out.Mtimensec))
+	if r.bump > 0 && !mtime.Equal(r.base) {
+		r.bump = 0 // the directory's mtime changed since
+	}
+	t := r.base.Add(time.Duration(r.bump))
+	if r.bump == 0 {
+		t = mtime
+	}
+	if r.pending && (r.reported.IsZero() || t.Equal(r.reported)) {
+		if r.bump == 0 {
+			r.base = mtime
+		}
+		r.bump++
+		t = r.base.Add(time.Duration(r.bump))
+	}
+	r.pending, r.reported = false, t
+	wfs.dirReports[inode] = r
+	out.Mtime, out.Mtimensec = uint64(t.Unix()), uint32(t.Nanosecond())
 }
 
 const atimeMapMaxSize = 8192
@@ -457,7 +470,7 @@ func (wfs *WFS) forgetInMemoryTimes(inode uint64) {
 
 	wfs.dirMtimeMu.Lock()
 	delete(wfs.dirMtimeMap, inode)
-	delete(wfs.vacatedDirs, inode)
+	delete(wfs.dirReports, inode)
 	wfs.dirMtimeMu.Unlock()
 
 	wfs.removedDirMu.Lock()
