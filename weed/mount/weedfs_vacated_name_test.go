@@ -121,3 +121,26 @@ func TestVacatedNameInForgottenDirectoryKeepsNothing(t *testing.T) {
 		t.Errorf("kept %v for a forgotten directory", wfs.vacatedDirs)
 	}
 }
+
+// An mtime set explicitly after names left is the one reported, past or
+// future: what was kept for the vacated names gives way to it.
+func TestSetMtimeSupersedesVacatedNames(t *testing.T) {
+	for _, set := range []time.Time{time.Unix(1000, 7), time.Now().Add(time.Hour).Truncate(time.Second)} {
+		f := newStoreFiler()
+		wfs := newLinkTestWFS(t, f)
+		f.put(&filer_pb.Entry{Name: "d", IsDirectory: true, Attributes: &filer_pb.FuseAttributes{
+			FileMode: uint32(os.ModeDir | 0o755), Mtime: 2000, Uid: 99, Gid: 100,
+		}})
+		inode := wfs.inodeToPath.LookupLinked("/d", 1, os.ModeDir, "", 0, true)
+		wfs.onEntryInvalidation(meta_cache.EntryInvalidation{Path: "/d/gone", Deleted: true})
+		if got := dirMtime(t, wfs, inode); !got.After(time.Unix(2000, 0)) {
+			t.Fatalf("directory mtime %v after a name left it, want later than the stored one", got)
+		}
+		if st := wfs.NFSSetAttr(step(t), inode, NFSAttrs{Mtime: &set}, nil, false); st != fuse.OK {
+			t.Fatalf("NFSSetAttr: %v", st)
+		}
+		if got := dirMtime(t, wfs, inode); !got.Equal(set) {
+			t.Errorf("directory mtime %v after setting it to %v", got, set)
+		}
+	}
+}

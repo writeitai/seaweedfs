@@ -537,6 +537,7 @@ func (wfs *WFS) NFSLink(step NFSStep, source, dir uint64, name string, uid, gid 
 // meanwhile is never undone. clearVerifier also stores real access and
 // modification times, the first SETATTR after an EXCLUSIVE create.
 func (wfs *WFS) NFSSetAttr(step NFSStep, inode uint64, attrs NFSAttrs, guard *time.Time, clearVerifier bool) fuse.Status {
+	vacated := wfs.vacatedCount(inode)
 	path, code := wfs.inodeToPath.GetPath(inode)
 	if code != fuse.OK {
 		return code
@@ -612,6 +613,9 @@ func (wfs *WFS) NFSSetAttr(step NFSStep, inode uint64, attrs NFSAttrs, guard *ti
 	}
 	if attrs.Size != nil {
 		wfs.invalidateOpenMtimeCache(inode)
+	}
+	if attrs.Mtime != nil {
+		wfs.supersedeVacated(inode, vacated)
 	}
 	return fuse.OK
 }

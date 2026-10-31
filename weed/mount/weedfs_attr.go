@@ -65,6 +65,7 @@ func (wfs *WFS) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *fuse
 		return fuse.Status(syscall.ENOSPC)
 	}
 
+	vacated := wfs.vacatedCount(input.NodeId)
 	path, fh, entry, status := wfs.maybeReadEntry(input.NodeId)
 	if status != fuse.OK || entry == nil {
 		return status
@@ -205,10 +206,14 @@ func (wfs *WFS) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *fuse
 	}
 
 	if truncated {
-		return wfs.saveEntry(path, entry)
+		code = wfs.saveEntry(path, entry)
+	} else {
+		code = wfs.saveAttributes(path, entry)
 	}
-	return wfs.saveAttributes(path, entry)
-
+	if _, ok := input.GetMTime(); ok && code == fuse.OK {
+		wfs.supersedeVacated(input.NodeId, vacated)
+	}
+	return code
 }
 
 // rootAttrs is the root's mode and owner, read together.
@@ -401,10 +406,31 @@ func (wfs *WFS) applyInMemoryDirMtime(out *fuse.Attr, inode uint64) {
 
 // vacatedDir is what noteNameVacated keeps of a directory: when a name last
 // left it and how many have. It lives as long as the inode, unbounded,
-// because losing it would bring back the mtime the client already holds.
+// because losing it would bring back the mtime the client already holds,
+// or until the mtime is set explicitly.
 type vacatedDir struct {
 	at    time.Time
 	count int64
+}
+
+// vacatedCount is how many names noteNameVacated has seen leave the
+// directory at inode, for a later supersedeVacated.
+func (wfs *WFS) vacatedCount(inode uint64) int64 {
+	wfs.dirMtimeMu.Lock()
+	defer wfs.dirMtimeMu.Unlock()
+	return wfs.vacatedDirs[inode].count
+}
+
+// supersedeVacated drops what noteNameVacated keeps of the directory at
+// inode once its mtime was set explicitly, so the set mtime is what is
+// reported. A name that left after count was read is kept: the set mtime
+// need not differ from what the client already holds.
+func (wfs *WFS) supersedeVacated(inode uint64, count int64) {
+	wfs.dirMtimeMu.Lock()
+	defer wfs.dirMtimeMu.Unlock()
+	if v, ok := wfs.vacatedDirs[inode]; ok && v.count == count {
+		delete(wfs.vacatedDirs, inode)
+	}
 }
 
 const atimeMapMaxSize = 8192
