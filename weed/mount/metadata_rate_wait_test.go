@@ -11,6 +11,7 @@ import (
 
 	"github.com/seaweedfs/go-fuse/v2/fuse"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -457,7 +458,7 @@ func TestUnlinkWaitingAtMetadataRateKeepsWrites(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 	time.Sleep(50 * time.Millisecond) // refused once, waiting
-	if fh.isDeleted {
+	if handleMarkedDeleted(wfs, fh) {
 		t.Fatal("the handle is marked deleted while the unlink waits")
 	}
 	fh.dirtyMetadata = true
@@ -549,14 +550,21 @@ func TestRenameWaitingAtMetadataRateKeepsDestination(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 	time.Sleep(50 * time.Millisecond) // refused once, waiting
-	if fh.isDeleted {
+	if handleMarkedDeleted(wfs, fh) {
 		t.Fatal("the destination's handle is marked deleted while the rename waits")
 	}
 	close(interrupt)
 	if st := <-renamed; st != fuse.EINTR {
 		t.Fatalf("interrupted Rename: %v, want EINTR", st)
 	}
-	if fh.isDeleted || store.lookup("/src") == nil || store.lookup("/dst") == nil {
+	if handleMarkedDeleted(wfs, fh) || store.lookup("/src") == nil || store.lookup("/dst") == nil {
 		t.Fatal("the interrupted rename changed the source, the destination or its handle")
 	}
+}
+
+// handleMarkedDeleted reads fh's delete mark under its lock.
+func handleMarkedDeleted(wfs *WFS, fh *FileHandle) bool {
+	lock := wfs.fhLockTable.AcquireLock("test", fh.fh, util.SharedLock)
+	defer wfs.fhLockTable.ReleaseLock(fh.fh, lock)
+	return fh.isDeleted
 }
