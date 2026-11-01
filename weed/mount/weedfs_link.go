@@ -289,6 +289,9 @@ func (wfs *WFS) linkHeld(in *fuse.LinkIn, sourceInode uint64, oldEntryPath, newP
 		})
 		if rollbackErr != nil {
 			glog.Warningf("link rollback %s: %v", oldEntryPath, rollbackErr)
+			if errors.Is(rollbackErr, errMetadataRateInterrupted) {
+				return fuse.EINTR, nil // the extra reference stays (Mountable)
+			}
 			return fuse.Status(syscall.EEXIST), nil
 		}
 		// The mount takes the rolled-back source, as acknowledged, before

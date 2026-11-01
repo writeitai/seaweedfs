@@ -415,6 +415,11 @@ func (wfs *WFS) Rename(cancel <-chan struct{}, in *fuse.RenameIn, oldName string
 	// makes it. Windows is where this bites: the close carrying the flush runs
 	// after the application's CloseHandle returned, so the flush can land on
 	// top of what the rename just put there.
+	//
+	// Mountable: the mark is held only while the rename is sent. A rename
+	// refused at the metadata rate replaced nothing, so the destination's
+	// handle saves its writes while the rename waits.
+	markTarget, unmarkTarget := func() {}, func() {}
 	if in.Flags == RenameEmptyFlag {
 		targetInode, targetMapped := wfs.inodeToPath.GetInode(newPath)
 		if !targetMapped && newEntry != nil && newEntry.Attributes != nil {
@@ -428,12 +433,14 @@ func (wfs *WFS) Rename(cancel <-chan struct{}, in *fuse.RenameIn, oldName string
 			// marked is skipped and takes its handle with it, past the reach
 			// of the restore below.
 			wfs.waitForPendingAsyncFlush(context.Background(), targetInode)
-			epoch := wfs.markHandleDeleted(targetInode)
+			var epoch uint64
+			markTarget = func() { epoch = wfs.markHandleDeleted(targetInode) }
 			// A rename that does not happen leaves the destination where it
 			// was, so its handle has to go back to writing that name.
+			unmarkTarget = func() { wfs.clearHandleDeleted(targetInode, epoch) }
 			defer func() {
 				if code != fuse.OK {
-					wfs.clearHandleDeleted(targetInode, epoch)
+					unmarkTarget()
 				}
 			}()
 		}
@@ -450,7 +457,12 @@ func (wfs *WFS) Rename(cancel <-chan struct{}, in *fuse.RenameIn, oldName string
 
 	mutate := waitingAtMetadataRate(context.Background(), cancel)
 	err := atMetadataRate(mutate, "rename "+string(oldPath), func() error {
-		return wfs.doRename(mutate, request, oldPath, newPath, &newPathLock)
+		markTarget()
+		err := wfs.doRename(mutate, request, oldPath, newPath, &newPathLock)
+		if metadataRateRefused(err) {
+			unmarkTarget()
+		}
+		return err
 	})
 	if err != nil {
 		glog.V(0).Infof("Rename %s => %s: %v", oldPath, newPath, err)

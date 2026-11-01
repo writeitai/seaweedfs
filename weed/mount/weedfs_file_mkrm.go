@@ -433,14 +433,15 @@ func (wfs *WFS) Unlink(cancel <-chan struct{}, header *fuse.InHeader, name strin
 	// before Unlink sets the flag).  By waiting here, any in-flight flush
 	// finishes first; even if it recreated the entry, the filer delete below
 	// will remove it again.
+	//
+	// Mountable: the mark is held only while a delete is sent. A delete
+	// refused at the metadata rate deleted nothing, so the handle saves its
+	// writes while the unlink waits, and is marked again for the next send.
 	var markedInode, markEpoch uint64
 	if inode, found := wfs.inodeToPath.GetInode(entryFullPath); found {
-		markedInode, markEpoch = inode, wfs.markHandleDeleted(inode)
-		wfs.waitForPendingAsyncFlush(context.Background(), inode)
+		markedInode = inode
 	} else if entry != nil && entry.Attributes != nil && entry.Attributes.Inode != 0 {
-		inodeFromEntry := entry.Attributes.Inode
-		markedInode, markEpoch = inodeFromEntry, wfs.markHandleDeleted(inodeFromEntry)
-		wfs.waitForPendingAsyncFlush(context.Background(), inodeFromEntry)
+		markedInode = entry.Attributes.Inode
 	}
 
 	// first, ensure the filer store can correctly delete
@@ -457,15 +458,19 @@ func (wfs *WFS) Unlink(cancel <-chan struct{}, header *fuse.InHeader, name strin
 	mutate := waitingAtMetadataRate(context.Background(), cancel)
 	var resp *filer_pb.DeleteEntryResponse
 	err := atMetadataRate(mutate, "unlink "+string(entryFullPath), func() (err error) {
+		if markedInode != 0 {
+			markEpoch = wfs.markHandleDeleted(markedInode)
+			wfs.waitForPendingAsyncFlush(context.Background(), markedInode)
+		}
 		resp, err = wfs.streamDeleteEntry(mutate, deleteReq)
+		if metadataRateRefused(err) {
+			wfs.clearHandleDeleted(markedInode, markEpoch)
+		}
 		return err
 	})
 	if err != nil {
 		glog.V(0).Infof("remove %s: %v", entryFullPath, err)
 		if errors.Is(err, errMetadataRateInterrupted) {
-			// Nothing was deleted: an open handle keeps saving its writes
-			// (Mountable).
-			wfs.clearHandleDeleted(markedInode, markEpoch)
 			return fuse.EINTR
 		}
 		return fuse.OK

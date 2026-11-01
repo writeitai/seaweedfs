@@ -255,14 +255,16 @@ func TestFlushSpendingCapIsNotWaitedOut(t *testing.T) {
 }
 
 // rateStore is the store filer behind a gateway at its metadata rate: the
-// next refuse creates, updates, deletes or renames (only: of that kind)
-// are turned away, changing nothing.
+// next refuse creates, updates, deletes or renames (only: of that kind,
+// after pass of them) are turned away, changing nothing.
 type rateStore struct {
 	*storeFiler
 	mu     sync.Mutex
 	only   string
+	pass   int
 	refuse int
 	sent   int
+	taken  int // creates taken
 }
 
 func (f *rateStore) refused(kind string) bool {
@@ -272,6 +274,10 @@ func (f *rateStore) refused(kind string) bool {
 		return false
 	}
 	f.sent++
+	if f.pass > 0 {
+		f.pass--
+		return false
+	}
 	if f.refuse > 0 {
 		f.refuse--
 		return true
@@ -282,20 +288,29 @@ func (f *rateStore) refused(kind string) bool {
 func (f *rateStore) next(n int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.refuse, f.sent, f.only = n, 0, ""
+	f.refuse, f.sent, f.only, f.pass = n, 0, "", 0
 }
 
-func (f *rateStore) nextOnly(kind string, n int) {
+func (f *rateStore) nextOnly(kind string, pass, n int) {
 	f.next(n)
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.only = kind
+	f.only, f.pass = kind, pass
+}
+
+func (f *rateStore) sends() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.sent
 }
 
 func (f *rateStore) CreateEntry(ctx context.Context, r *filer_pb.CreateEntryRequest) (*filer_pb.CreateEntryResponse, error) {
 	if f.refused("create") {
 		return nil, errRate
 	}
+	f.mu.Lock()
+	f.taken++
+	f.mu.Unlock()
 	return f.storeFiler.CreateEntry(ctx, r)
 }
 
@@ -406,7 +421,7 @@ func TestDirtySourceWaitsAtMetadataRate(t *testing.T) {
 	fh := wfs.GetHandle(FileHandleId(created.Fh))
 
 	fh.dirtyMetadata = true
-	f.nextOnly("create", 5)
+	f.nextOnly("create", 0, 5)
 	if st := wfs.Rename(nil, &fuse.RenameIn{InHeader: h, Newdir: 1}, "file", "renamed"); st != fuse.OK || store.lookup("/renamed") == nil {
 		t.Fatalf("Rename of a dirty file at the metadata rate: %v", st)
 	}
@@ -415,33 +430,50 @@ func TestDirtySourceWaitsAtMetadataRate(t *testing.T) {
 	}
 
 	fh.dirtyMetadata = true
-	f.nextOnly("create", 5)
+	f.nextOnly("create", 0, 5)
 	if st := wfs.Link(nil, &fuse.LinkIn{InHeader: h, Oldnodeid: created.NodeId}, "hard", &fuse.EntryOut{}); st != fuse.OK || store.lookup("/hard") == nil {
 		t.Fatalf("Link of a dirty file at the metadata rate: %v", st)
 	}
 }
 
-// An interrupted Unlink deleted nothing: the open file's writes are still
-// saved.
-func TestUnlinkInterruptedAtMetadataRateKeepsWrites(t *testing.T) {
+// An Unlink waiting at the metadata rate has deleted nothing: a file
+// closed meanwhile is saved, and an interrupt leaves it, with its writes.
+func TestUnlinkWaitingAtMetadataRateKeepsWrites(t *testing.T) {
 	fastMetadataRate(t)
+	metadataRateFirstWait, metadataRateMaxWait = 300*time.Millisecond, 300*time.Millisecond
 	wfs, store, f := rateStoreWFS(t)
 	h := fuse.InHeader{NodeId: 1, Caller: fuse.Caller{Owner: fuse.Owner{Uid: 99, Gid: 100}}}
 	var created fuse.CreateOut
 	if st := wfs.Create(nil, &fuse.CreateIn{InHeader: h, Flags: syscall.O_WRONLY | syscall.O_CREAT, Mode: 0o644}, "file", &created); st != fuse.OK {
 		t.Fatalf("Create: %v", st)
 	}
-	defer wfs.ReleaseHandle(FileHandleId(created.Fh))
+	fh := wfs.GetHandle(FileHandleId(created.Fh))
 
-	f.nextOnly("delete", 1<<30)
-	if st := wfs.Unlink(interruptSoon(), &h, "file"); st != fuse.EINTR {
+	f.nextOnly("delete", 0, 1<<30)
+	interrupt := make(chan struct{})
+	unlinked := make(chan fuse.Status)
+	go func() { unlinked <- wfs.Unlink(interrupt, &h, "file") }()
+	for f.sends() == 0 {
+		time.Sleep(time.Millisecond)
+	}
+	time.Sleep(50 * time.Millisecond) // refused once, waiting
+	if fh.isDeleted {
+		t.Fatal("the handle is marked deleted while the unlink waits")
+	}
+	fh.dirtyMetadata = true
+	f.mu.Lock()
+	taken := f.taken
+	f.mu.Unlock()
+	wfs.Release(nil, &fuse.ReleaseIn{InHeader: fuse.InHeader{NodeId: created.NodeId}, Fh: created.Fh})
+	f.mu.Lock()
+	saved := f.taken - taken
+	f.mu.Unlock()
+	close(interrupt)
+	if st := <-unlinked; st != fuse.EINTR {
 		t.Fatalf("interrupted Unlink: %v, want EINTR", st)
 	}
-	if store.lookup("/file") == nil {
-		t.Fatal("the interrupted unlink deleted the file")
-	}
-	if fh := wfs.GetHandle(FileHandleId(created.Fh)); fh.isDeleted {
-		t.Fatal("the interrupted unlink left the open handle marked deleted")
+	if saved != 1 || store.lookup("/file") == nil {
+		t.Fatalf("closing the file during the unlink's wait wrote it %d times, file %v; want it written once and kept", saved, store.lookup("/file"))
 	}
 }
 
@@ -457,11 +489,74 @@ func TestLinkInterruptedAtMetadataRate(t *testing.T) {
 	}
 	wfs.ReleaseHandle(FileHandleId(created.Fh))
 
-	f.nextOnly("create", 1<<30)
+	f.nextOnly("create", 0, 1<<30)
 	if st := wfs.Link(interruptSoon(), &fuse.LinkIn{InHeader: h, Oldnodeid: created.NodeId}, "hard", &fuse.EntryOut{}); st != fuse.EINTR {
 		t.Fatalf("interrupted Link: %v, want EINTR", st)
 	}
 	if store.lookup("/hard") != nil {
 		t.Fatal("the interrupted link created the name")
+	}
+}
+
+// An interrupt ends a link's wait to roll back after the new name turned
+// out to exist: EINTR.
+func TestLinkRollbackInterruptedAtMetadataRate(t *testing.T) {
+	fastMetadataRate(t)
+	wfs, store, f := rateStoreWFS(t)
+	h := fuse.InHeader{NodeId: 1, Caller: fuse.Caller{Owner: fuse.Owner{Uid: 99, Gid: 100}}}
+	var created fuse.CreateOut
+	if st := wfs.Create(nil, &fuse.CreateIn{InHeader: h, Flags: syscall.O_WRONLY | syscall.O_CREAT, Mode: 0o644}, "file", &created); st != fuse.OK {
+		t.Fatalf("Create: %v", st)
+	}
+	wfs.ReleaseHandle(FileHandleId(created.Fh))
+	// Another mount's name, not in this mount's cache.
+	store.mu.Lock()
+	store.store("/hard", &filer_pb.Entry{Name: "hard", Attributes: &filer_pb.FuseAttributes{FileMode: 0o644, Inode: 777}})
+	store.mu.Unlock()
+
+	f.nextOnly("update", 1, 1<<30) // the promotion is taken, the rollback refused
+	if st := wfs.Link(interruptSoon(), &fuse.LinkIn{InHeader: h, Oldnodeid: created.NodeId}, "hard", &fuse.EntryOut{}); st != fuse.EINTR {
+		t.Fatalf("Link with its rollback interrupted: %v, want EINTR", st)
+	}
+	if f.sends() < 3 {
+		t.Fatalf("%d updates sent, want the promotion and refused rollbacks", f.sends())
+	}
+}
+
+// A Rename waiting at the metadata rate has replaced nothing: the open
+// destination's handle keeps saving its writes meanwhile and after an
+// interrupt.
+func TestRenameWaitingAtMetadataRateKeepsDestination(t *testing.T) {
+	fastMetadataRate(t)
+	metadataRateFirstWait, metadataRateMaxWait = 300*time.Millisecond, 300*time.Millisecond
+	wfs, store, f := rateStoreWFS(t)
+	h := fuse.InHeader{NodeId: 1, Caller: fuse.Caller{Owner: fuse.Owner{Uid: 99, Gid: 100}}}
+	var src, dst fuse.CreateOut
+	for name, out := range map[string]*fuse.CreateOut{"src": &src, "dst": &dst} {
+		if st := wfs.Create(nil, &fuse.CreateIn{InHeader: h, Flags: syscall.O_WRONLY | syscall.O_CREAT, Mode: 0o644}, name, out); st != fuse.OK {
+			t.Fatalf("Create %s: %v", name, st)
+		}
+	}
+	wfs.ReleaseHandle(FileHandleId(src.Fh))
+	defer wfs.ReleaseHandle(FileHandleId(dst.Fh))
+	fh := wfs.GetHandle(FileHandleId(dst.Fh))
+
+	f.nextOnly("rename", 0, 1<<30)
+	interrupt := make(chan struct{})
+	renamed := make(chan fuse.Status)
+	go func() { renamed <- wfs.Rename(interrupt, &fuse.RenameIn{InHeader: h, Newdir: 1}, "src", "dst") }()
+	for f.sends() == 0 {
+		time.Sleep(time.Millisecond)
+	}
+	time.Sleep(50 * time.Millisecond) // refused once, waiting
+	if fh.isDeleted {
+		t.Fatal("the destination's handle is marked deleted while the rename waits")
+	}
+	close(interrupt)
+	if st := <-renamed; st != fuse.EINTR {
+		t.Fatalf("interrupted Rename: %v, want EINTR", st)
+	}
+	if fh.isDeleted || store.lookup("/src") == nil || store.lookup("/dst") == nil {
+		t.Fatal("the interrupted rename changed the source, the destination or its handle")
 	}
 }
