@@ -38,6 +38,11 @@ func (wfs *WFS) streamUpdateEntry(ctx context.Context, req *filer_pb.UpdateEntry
 		}
 		glog.V(1).Infof("streamUpdateEntry %s/%s: stream failed, falling back to unary: %v", req.Directory, req.Entry.Name, err)
 	}
+	return wfs.unaryUpdateEntry(ctx, req)
+}
+
+// unaryUpdateEntry sends an UpdateEntryRequest as a unary gRPC call.
+func (wfs *WFS) unaryUpdateEntry(ctx context.Context, req *filer_pb.UpdateEntryRequest) (*filer_pb.UpdateEntryResponse, error) {
 	var resp *filer_pb.UpdateEntryResponse
 	err := wfs.withFilerClient(ctx, false, wfs.filerRPCWait(), func(ctx context.Context, client filer_pb.SeaweedFilerClient) error {
 		var err error

@@ -156,29 +156,33 @@ type WFS struct {
 	IsOverQuota           bool
 	fhLockTable           *util.LockTable[FileHandleId]
 	hardLinkLockTable     *util.LockTable[string]
-	posixLocks            *PosixLockTable
-	posixSid              uint64             // this mount's session id, for routed-lock owner identity
-	posixHint             *posixLockHint     // local fcntl-lock hint for routed mode
-	posixOwn              *posixlock.Manager // mirror of locks this mount holds, re-asserted via keepalive
-	peerRegistrar         *PeerRegistrar
-	peerDirectory         *PeerDirectory
-	peerGrpcServer        *PeerGrpcServer
-	peerAnnouncer         *PeerAnnouncer
-	peerConnPool          *PeerConnPool
-	peerDirectoryStop     chan struct{} // closed on unmount to stop the sweeper goroutine
-	FilerConf             *filer.FilerConf
-	filerClient           *wdclient.FilerClient // Cached volume location client
-	refreshMu             sync.Mutex
-	refreshingDirs        map[util.FullPath]struct{}
-	atimeMu               sync.Mutex
-	atimeMap              map[uint64]time.Time // inode -> atime, in-memory only, bounded
-	dirMtimeMu            sync.Mutex
-	dirMtimeMap           map[uint64]time.Time // inode -> mtime/ctime, in-memory overlay for dirs
-	removedDirMu          sync.Mutex
-	removedDirs           map[uint64]*filer_pb.Entry // inode -> last-known entry of a directory removed while still referenced
-	entryValidSec         uint64                     // kernel FUSE entry cache TTL in seconds
-	attrValidSec          uint64                     // kernel FUSE attr cache TTL in seconds
-	dirIdleEvict          time.Duration
+	// inodeLockTable serialises Link against opens of its source inode
+	// (Mountable: see inodeLocks).
+	inodeLockOnce     sync.Once
+	inodeLockTable    *util.LockTable[uint64]
+	posixLocks        *PosixLockTable
+	posixSid          uint64             // this mount's session id, for routed-lock owner identity
+	posixHint         *posixLockHint     // local fcntl-lock hint for routed mode
+	posixOwn          *posixlock.Manager // mirror of locks this mount holds, re-asserted via keepalive
+	peerRegistrar     *PeerRegistrar
+	peerDirectory     *PeerDirectory
+	peerGrpcServer    *PeerGrpcServer
+	peerAnnouncer     *PeerAnnouncer
+	peerConnPool      *PeerConnPool
+	peerDirectoryStop chan struct{} // closed on unmount to stop the sweeper goroutine
+	FilerConf         *filer.FilerConf
+	filerClient       *wdclient.FilerClient // Cached volume location client
+	refreshMu         sync.Mutex
+	refreshingDirs    map[util.FullPath]struct{}
+	atimeMu           sync.Mutex
+	atimeMap          map[uint64]time.Time // inode -> atime, in-memory only, bounded
+	dirMtimeMu        sync.Mutex
+	dirMtimeMap       map[uint64]time.Time // inode -> mtime/ctime, in-memory overlay for dirs
+	removedDirMu      sync.Mutex
+	removedDirs       map[uint64]*filer_pb.Entry // inode -> last-known entry of a directory removed while still referenced
+	entryValidSec     uint64                     // kernel FUSE entry cache TTL in seconds
+	attrValidSec      uint64                     // kernel FUSE attr cache TTL in seconds
+	dirIdleEvict      time.Duration
 
 	// openMtimeCache maps inode -> [mtime_sec, mtime_ns] from the last Open.
 	// Used to decide whether to set FOPEN_KEEP_CACHE on subsequent opens.
@@ -529,12 +533,19 @@ func (wfs *WFS) maybeReadEntry(ctx context.Context, inode uint64) (path util.Ful
 	var found bool
 	if fh, found = wfs.fhMap.FindFileHandle(inode); found {
 		path, _ = wfs.inodeToPath.GetPath(inode)
+		// The handle's entry answers only while it is the inode's object
+		// (Mountable: see InodeToPath.Holds); otherwise the namespace does.
+		holds := false
 		entry = fh.UpdateEntry(func(entry *filer_pb.Entry) {
 			if entry != nil && fh.entry.Attributes == nil {
 				entry.Attributes = &filer_pb.FuseAttributes{}
 			}
+			holds = entry != nil && wfs.inodeToPath.HoldsEntry(inode, entry)
 		})
-		return path, fh, entry, fuse.OK
+		if holds {
+			return path, fh, entry, fuse.OK
+		}
+		fh, entry = nil, nil
 	}
 	path, status = wfs.inodeToPath.GetPath(inode)
 	if status != fuse.OK {
@@ -543,8 +554,138 @@ func (wfs *WFS) maybeReadEntry(ctx context.Context, inode uint64) (path util.Ful
 		}
 		return
 	}
-	entry, _, status = wfs.maybeLoadEntry(ctx, path)
+	path, entry, _, status = wfs.loadInodeEntry(ctx, inode, path)
 	return
+}
+
+// loadInodeEntry loads the entry at path, the inode's primary path. When
+// that path no longer holds the inode's object (gone, or overwritten by
+// another, as its stored inode shows) and the inode is a hard link known
+// by other names, a surviving alias still holding the object answers
+// instead and becomes the primary path. Concurrent callers converge on the
+// same survivor: one that finds the primary already moved looks again.
+// With no survivor the answer is ENOENT, never the object now at the path,
+// and the path is detached from the inode.
+//
+// Mountable (writeitai/seaweedfs, branch mountable): added for the macOS
+// NFS mount, whose file handles name inodes and must keep working through
+// a surviving hard link. See design/designs/macos-mount.md §4 in
+// writeitai/fsit.
+func (wfs *WFS) loadInodeEntry(ctx context.Context, inode uint64, path util.FullPath) (util.FullPath, *filer_pb.Entry, entryVersion, fuse.Status) {
+	// gone: missing, or another object by the identity rule. An error
+	// proves nothing either way.
+	gone := func(entry *filer_pb.Entry, status fuse.Status) bool {
+		return status == fuse.ENOENT || status == fuse.OK && !wfs.inodeToPath.HoldsEntry(inode, entry)
+	}
+	// Each path is watched from before it is loaded, so that once the
+	// object proves gone everywhere, a path is detached only if no lookup
+	// bound it again meanwhile.
+	watched := map[util.FullPath]uint64{}
+	invalid := map[util.FullPath]bool{} // conclusively not the object
+	detach := false
+	defer func() {
+		for p, generation := range watched {
+			wfs.inodeToPath.Unwatch(p, inode, generation, detach && invalid[p])
+		}
+	}()
+	load := func(p util.FullPath) (*filer_pb.Entry, entryVersion, fuse.Status) {
+		if _, ok := watched[p]; !ok {
+			_, _, watched[p] = wfs.inodeToPath.Watch(p)
+		}
+		// The namespace's: never an open handle's entry.
+		return wfs.maybeLoadNamespaceEntry(ctx, p)
+	}
+	// rebound reports whether a lookup bound p again since it was watched:
+	// what was found there then no longer stands (Mountable).
+	rebound := func(p util.FullPath) bool {
+		return wfs.inodeToPath.Generation(p) != watched[p] && wfs.inodeToPath.Bound(p, inode)
+	}
+	entry, version, status := load(path)
+	for range 4 {
+		if !gone(entry, status) {
+			return path, entry, version, status
+		}
+		invalid[path] = true
+		aliases := wfs.inodeToPath.GetAllPaths(inode)
+		unknown := fuse.OK // an alias that could not be checked
+		for _, alias := range aliases {
+			if alias == path || invalid[alias] {
+				continue
+			}
+			aliasEntry, aliasVersion, aliasStatus := load(alias)
+			switch {
+			case !gone(aliasEntry, aliasStatus) && aliasStatus == fuse.OK:
+				// Only a verified survivor stands in for the object, and
+				// only for a path no lookup bound again meanwhile.
+				if wfs.inodeToPath.PromotePathIf(inode, path, alias, watched[path]) {
+					return alias, aliasEntry, aliasVersion, aliasStatus
+				}
+			case aliasStatus != fuse.OK && aliasStatus != fuse.ENOENT:
+				unknown = aliasStatus
+			default:
+				invalid[alias] = true
+			}
+		}
+		// A lookup bound the path again meanwhile, perhaps to the object
+		// linked back there: what was found there no longer stands, so it
+		// is read again.
+		if rebound(path) {
+			delete(invalid, path)
+			watched[path] = wfs.inodeToPath.Generation(path)
+			entry, version, status = wfs.maybeLoadNamespaceEntry(ctx, path)
+			continue
+		}
+		// No survivor, or another caller moved the primary meanwhile: in
+		// that case, start over from where it is now.
+		current, currentStatus := wfs.inodeToPath.GetPath(inode)
+		if currentStatus != fuse.OK || invalid[current] || current == path {
+			if unknown != fuse.OK {
+				// A survivor may be there: an error, not a missing file.
+				return path, nil, entryVersion{}, unknown
+			}
+			// The object is gone from path and from every alias: whatever
+			// is there now is another object, never answered for this inode,
+			// and none of those paths leads to the inode any more.
+			detach = true
+			return path, nil, entryVersion{}, fuse.ENOENT
+		}
+		path = current
+		entry, version, status = load(path)
+	}
+	return path, nil, entryVersion{}, fuse.ENOENT
+}
+
+// localEntry is an open handle's entry, cloned, when it may stand in for an
+// entry the filer does not have yet: unflushed, neither unlinked nor
+// refused, and its inode's object (Mountable). Read under the handle's
+// locks: async upload workers append chunks under the entry's own.
+func (wfs *WFS) localEntry(fh *FileHandle) *filer_pb.Entry {
+	fhActiveLock := wfs.fhLockTable.AcquireLock("localEntry", fh.fh, util.SharedLock)
+	defer wfs.fhLockTable.ReleaseLock(fh.fh, fhActiveLock)
+	fh.entry.RLock()
+	defer fh.entry.RUnlock()
+	entry := fh.entry.Entry
+	if !fh.dirtyMetadata || fh.isDeleted || fh.persistErr != 0 || entry == nil || !wfs.inodeToPath.HoldsEntry(fh.inode, entry) {
+		return nil
+	}
+	return proto.Clone(entry).(*filer_pb.Entry)
+}
+
+// NamespaceEntry is the inode's entry as the namespace has it now: through
+// its path, or a surviving hard link, ignoring what any open handle holds.
+// GetAttr prefers an open handle's entry, which outlives a deletion; a
+// front end that must tell whether the object still exists asks this.
+//
+// Mountable (writeitai/seaweedfs, branch mountable): added for the macOS
+// NFS mount, which retires a file handle once its object is gone; see
+// design/designs/macos-mount.md §4 in writeitai/fsit.
+func (wfs *WFS) NamespaceEntry(inode uint64) (*filer_pb.Entry, fuse.Status) {
+	path, status := wfs.inodeToPath.GetPath(inode)
+	if status != fuse.OK {
+		return nil, status
+	}
+	_, entry, _, status := wfs.loadInodeEntry(context.Background(), inode, path)
+	return entry, status
 }
 
 // isLocalOnlyEntry reports whether entry holds local-only state not yet on the
@@ -598,6 +739,25 @@ func (wfs *WFS) maybeLoadEntry(ctx context.Context, fullpath util.FullPath) (*fi
 	return entry.ToProtoEntry(), version, fuse.OK
 }
 
+// maybeLoadNamespaceEntry is maybeLoadEntry without local stand-ins: what
+// the namespace has at fullpath (Mountable).
+func (wfs *WFS) maybeLoadNamespaceEntry(ctx context.Context, fullpath util.FullPath) (*filer_pb.Entry, entryVersion, fuse.Status) {
+	if string(fullpath) == wfs.option.FilerMountRootPath {
+		return wfs.maybeLoadEntry(ctx, fullpath)
+	}
+	return wfs.loadNamespaceEntry(ctx, fullpath, true)
+}
+
+// loadNamespaceEntry is maybeLoadNamespaceEntry, which waits for a
+// pending async flush of the entry only with drain.
+func (wfs *WFS) loadNamespaceEntry(ctx context.Context, fullpath util.FullPath, drain bool) (*filer_pb.Entry, entryVersion, fuse.Status) {
+	entry, version, status := wfs.lookupEntryFrom(ctx, fullpath, false, drain)
+	if status != fuse.OK {
+		return nil, entryVersion{}, status
+	}
+	return entry.ToProtoEntry(), version, fuse.OK
+}
+
 // expiredDirRebuildCooldown limits how often a lookup re-attempts a failed
 // rebuild of an expired directory, so a transient listing failure does not
 // trigger a full rebuild (with backoff retries) on every later lookup while
@@ -611,6 +771,19 @@ const expiredDirRebuildCooldown = 30 * time.Second
 // It also returns the log position the entry reflects: the entry's stored
 // version, the lookup response's, or zero if unknown.
 func (wfs *WFS) lookupEntry(ctx context.Context, fullpath util.FullPath) (*filer.Entry, entryVersion, fuse.Status) {
+	return wfs.lookupEntryFrom(ctx, fullpath, true, true)
+}
+
+// lookupEntryFrom is lookupEntry; withLocal tells whether an entry the
+// filer does not have yet, a deferred create's, may answer from this
+// mount. Mountable: the namespace never takes it (see NamespaceEntry), and
+// an open handle answers only while it holds its own object, unflushed,
+// neither unlinked nor refused (localEntry).
+//
+// drain tells whether it waits for a pending async flush of the entry
+// before trusting the filer; a caller holding the entry's handle lock must
+// not, as the flush needs that lock to finish.
+func (wfs *WFS) lookupEntryFrom(ctx context.Context, fullpath util.FullPath, withLocal, drain bool) (*filer.Entry, entryVersion, fuse.Status) {
 	dir, _ := fullpath.DirAndName()
 	dirPath := util.FullPath(dir)
 
@@ -622,7 +795,7 @@ func (wfs *WFS) lookupEntry(ctx context.Context, fullpath util.FullPath) (*filer
 		// The rebuild lists the parent from the filer; let any pending async
 		// flush of the target entry land first so the rebuilt cache does not
 		// capture pre-flush metadata and bypass the wait below.
-		if inode, found := wfs.inodeToPath.GetInode(fullpath); found {
+		if inode, found := wfs.inodeToPath.GetInode(fullpath); found && drain {
 			if !wfs.waitForPendingAsyncFlush(ctx, inode) {
 				return nil, entryVersion{}, fuse.EINTR
 			}
@@ -669,7 +842,7 @@ func (wfs *WFS) lookupEntry(ctx context.Context, fullpath util.FullPath) (*filer
 	// handle land: it would otherwise answer with pre-close metadata, a
 	// truncate's old size or a write's old chunks. The cache paths above are
 	// already consistent and must not pay this wait.
-	if inode, found := wfs.inodeToPath.GetInode(fullpath); found {
+	if inode, found := wfs.inodeToPath.GetInode(fullpath); found && drain {
 		if !wfs.waitForPendingAsyncFlush(ctx, inode) {
 			return nil, entryVersion{}, fuse.EINTR
 		}
@@ -705,9 +878,12 @@ func (wfs *WFS) lookupEntry(ctx context.Context, fullpath util.FullPath) (*filer
 			inode, inodeFound := wfs.inodeToPath.GetInode(fullpath)
 			hasDirtyHandle := false
 			hasPendingFlush := false
-			if inodeFound {
-				if fh, fhFound := wfs.fhMap.FindFileHandle(inode); fhFound && fh.dirtyMetadata {
-					hasDirtyHandle = true
+			if inodeFound && withLocal {
+				fh, fhFound := wfs.fhMap.FindFileHandle(inode)
+				var handleEntry *filer_pb.Entry
+				if fhFound {
+					handleEntry = wfs.localEntry(fh)
+					hasDirtyHandle = handleEntry != nil
 				}
 				wfs.pendingAsyncFlushMu.Lock()
 				_, hasPendingFlush = wfs.pendingAsyncFlush[inode]
@@ -723,21 +899,9 @@ func (wfs *WFS) lookupEntry(ctx context.Context, fullpath util.FullPath) (*filer
 					// still holding the unflushed entry is authoritative for
 					// it, so read it from there rather than reporting a file
 					// that plainly exists as missing.
-					if fh, fhFound := wfs.fhMap.FindFileHandle(inode); fhFound {
-						// Async upload workers append chunks under this lock;
-						// hold it for reading so FromPbEntry does not walk the
-						// chunk slice mid-reallocation.
-						fh.entryLock.RLock()
-						pbEntry := fh.GetEntry().GetEntry()
-						var localEntry *filer.Entry
-						if pbEntry != nil {
-							localEntry = filer.FromPbEntry(dir, pbEntry)
-						}
-						fh.entryLock.RUnlock()
-						if localEntry != nil {
-							glog.V(4).Infof("lookupEntry found deferred entry on its open handle %s", fullpath)
-							return localEntry, entryVersion{}, fuse.OK
-						}
+					if handleEntry != nil {
+						glog.V(4).Infof("lookupEntry found deferred entry on its open handle %s", fullpath)
+						return filer.FromPbEntry(dir, handleEntry), entryVersion{}, fuse.OK
 					}
 				}
 			}
@@ -987,6 +1151,17 @@ func (wfs *WFS) invalidateOpenFileHandle(invalidation meta_cache.EntryInvalidati
 			fh.dirtyPages.Destroy()
 			fh.dirtyPages = newPageWriter(fh, wfs.option.ChunkSizeLimit)
 		}
+		fh.advanceEntryVersion(eventTsNs, 0)
+		return
+	}
+	if !wfs.inodeToPath.HoldsEntry(inode, candidate) {
+		// Another object took the path, or this one changed identity, as
+		// when another mount made it a hard link (Mountable: see
+		// InodeToPath.Holds). The handle keeps its own object, and the
+		// path no longer leads to the inode, so the handle's next flush
+		// refuses to write over whatever is there and reports it; it is not
+		// taken for an unlink, whose flush silently succeeds.
+		wfs.inodeToPath.DetachPath(inode, filePath)
 		fh.advanceEntryVersion(eventTsNs, 0)
 		return
 	}

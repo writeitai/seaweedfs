@@ -1,11 +1,15 @@
 package mount
 
 import (
+	"math/rand/v2"
+	"os"
+	"slices"
 	"sync"
 	"time"
 
 	"github.com/seaweedfs/go-fuse/v2/fuse"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
@@ -21,6 +25,34 @@ type InodeToPath struct {
 	// dirPaths indexes the same states by path, so a directory lookup never
 	// goes through the map that holds one full path per inode.
 	dirPaths map[util.FullPath]*dirState
+	// stored relates an inode Lookup's collision probe moved away from the
+	// entry's persisted inode to that persisted one, and probed every such
+	// inode to it. Sparse: only probed inodes are in them. Mountable
+	// (writeitai/seaweedfs, branch mountable), so identity checks compare
+	// persisted with persisted; see PersistedInode.
+	stored map[uint64]uint64
+	probed map[uint64][]uint64
+	// linkIDs holds the hard-link identity (HardLinkId) of each inode known
+	// to be a hard link, unknownLink when that is not known. A link joins
+	// only an inode of its own hard-link group. Mountable, sparse as above.
+	linkIDs map[uint64]string
+	// kinds holds the file type (os.FileMode type bits) of each inode that
+	// is neither a regular file nor a directory, which dirStates tells.
+	// Mountable, sparse as above.
+	kinds map[uint64]os.FileMode
+	// linking holds the group a Link here is turning a standalone file into
+	// a hard link of, while it does. Mountable, sparse as above.
+	linking map[uint64]string
+	// watches counts, per path a caller is watching (Watch), the bindings
+	// made since. Mountable, holding only paths being watched.
+	watches map[util.FullPath]*pathWatch
+}
+
+// pathWatch is a watched path's binding generation, and how many callers
+// are watching it.
+type pathWatch struct {
+	watchers   int
+	generation uint64
 }
 
 // InodeEntry exists per inode the kernel references. Directory cache state is
@@ -42,9 +74,13 @@ type dirState struct {
 	lastRefresh        time.Time
 	lastRebuildAttempt time.Time
 	subdirCount        int32 // tracked in-memory for POSIX directory nlink
+	// generation counts the cache's resets and rebuilds (Mountable, for
+	// ChildrenCacheGeneration).
+	generation uint64
 }
 
 func (d *dirState) resetCacheState() {
+	d.generation++
 	d.isChildrenCached = false
 	d.readDirDirect = false
 	d.cachedExpiresTime = time.Time{}
@@ -61,6 +97,13 @@ func (ie *InodeEntry) appendPaths(dst []util.FullPath) []util.FullPath {
 		dst = append(dst, *ie.extraPaths...)
 	}
 	return dst
+}
+
+func (ie *InodeEntry) hasPath(p util.FullPath) bool {
+	if ie.path == p {
+		return true
+	}
+	return ie.extraPaths != nil && slices.Contains(*ie.extraPaths, p)
 }
 
 func (ie *InodeEntry) addPath(p util.FullPath) {
@@ -158,27 +201,103 @@ func (i *InodeToPath) EnsurePath(path util.FullPath, isDirectory bool) bool {
 	return false
 }
 
+// unknownLink stands for a hard link whose HardLinkId is not known (a
+// caller of Lookup, or a link made here through AddPath before SetLinkID).
+const unknownLink = "\x00"
+
 func (i *InodeToPath) Lookup(path util.FullPath, unixTime int64, isDirectory bool, isHardlink bool, possibleInode uint64, isLookup bool) uint64 {
+	linkID := ""
+	if isHardlink {
+		linkID = unknownLink
+	}
+	kind := os.FileMode(0)
+	if isDirectory {
+		kind = os.ModeDir
+	}
+	return i.LookupLinked(path, unixTime, kind, linkID, possibleInode, isLookup)
+}
+
+// EntryKind is an entry's file type as os.FileMode type bits, 0 for a
+// regular file: what LookupLinked and Holds take.
+func EntryKind(isDirectory bool, mode os.FileMode) os.FileMode {
+	if isDirectory {
+		return os.ModeDir
+	}
+	return mode & os.ModeType &^ os.ModeDir
+}
+
+// PbEntryKind is EntryKind for a filer entry.
+func PbEntryKind(entry *filer_pb.Entry) os.FileMode {
+	return EntryKind(entry.GetIsDirectory(), os.FileMode(entry.GetAttributes().GetFileMode()))
+}
+
+// LookupLinked is Lookup for an entry whose file type (EntryKind) and
+// hard-link identity are known: linkID is its HardLinkId, "" for an entry
+// that is no hard link.
+//
+// Mountable (writeitai/seaweedfs, branch mountable): a path is detached
+// from its inode once it proves to hold another object, and a hard link
+// joins only an inode of its own group, never one whose last path is gone.
+// For the macOS NFS mount: design/designs/macos-mount.md §4 in
+// writeitai/fsit.
+func (i *InodeToPath) LookupLinked(path util.FullPath, unixTime int64, kind os.FileMode, linkID string, possibleInode uint64, isLookup bool) uint64 {
 	i.Lock()
 	defer i.Unlock()
+	isDirectory := kind == os.ModeDir
+	isHardlink := linkID != ""
 	inode, found := i.path2inode[path]
+	if found && i.replacedLocked(inode, kind, linkID, possibleInode) {
+		// Detach it: the newcomer gets its own inode, and the old one keeps
+		// only its other links, or none.
+		if ie := i.inode2path[inode]; ie != nil && ie.hasPath(path) {
+			ie.removeOnePath(path)
+			i.dropDirPath(inode)
+		}
+		delete(i.path2inode, path)
+		found = false
+	}
 	if !found {
 		if possibleInode == 0 {
 			inode = path.AsInode(unixTime)
 		} else {
 			inode = possibleInode
 		}
-		if !isHardlink {
+		joined := false
+		if isHardlink && possibleInode != 0 {
+			inode, joined = i.linkGroupLocked(possibleInode, kind, linkID)
+		}
+		if !joined {
 			for _, found := i.inode2path[inode]; found; inode++ {
 				_, found = i.inode2path[inode+1]
 			}
 		}
+		if possibleInode != 0 && inode != possibleInode {
+			if i.stored == nil {
+				i.stored, i.probed = map[uint64]uint64{}, map[uint64][]uint64{}
+			}
+			if _, recorded := i.stored[inode]; !recorded {
+				i.stored[inode] = possibleInode
+				i.probed[possibleInode] = append(i.probed[possibleInode], inode)
+			}
+		}
 	}
 	i.path2inode[path] = inode
+	i.boundLocked(path)
 
-	if _, found := i.inode2path[inode]; found {
+	if isHardlink {
+		i.noteLinkLocked(inode, linkID)
+	}
+	if ie, found := i.inode2path[inode]; found {
+		// Hard links share one inode: remember every alias looked up, so
+		// the inode can still be reached through a survivor once the path
+		// it was first seen at is gone (see PromotePath). Mountable
+		// (writeitai/seaweedfs, branch mountable), for the macOS NFS mount:
+		// design/designs/macos-mount.md §4 in writeitai/fsit.
+		if isHardlink && !ie.hasPath(path) {
+			ie.addPath(path)
+		}
 		if isLookup {
-			i.inode2path[inode].nlookup++
+			ie.nlookup++
 		}
 	} else {
 		nlookup := uint64(0)
@@ -191,6 +310,11 @@ func (i *InodeToPath) Lookup(path util.FullPath, unixTime int64, isDirectory boo
 		}
 		if isDirectory {
 			i.setDirState(inode, &dirState{path: path})
+		} else if kind != 0 {
+			if i.kinds == nil {
+				i.kinds = map[uint64]os.FileMode{}
+			}
+			i.kinds[inode] = kind
 		}
 	}
 
@@ -226,18 +350,33 @@ func (i *InodeToPath) InodeForListing(path util.FullPath, unixTime int64, possib
 	return path.AsInode(unixTime)
 }
 
+// AllocateInode returns the inode for an object being created at path: a
+// random 63-bit number, never 0 or 1 (the mount root), and none the table
+// holds. unixTime is unused.
+//
+// Mountable (writeitai/seaweedfs, branch mountable): stored inodes are
+// unique per creation, so a file recreated at the same path within one
+// second is another object to every identity check, where
+// hash(path) + 37 × seconds made it the same. Every candidate is checked;
+// upstream's probe returned the one after the last occupied candidate
+// unchecked. See D43 and architecture §4 obligation 13 in writeitai/fsit.
 func (i *InodeToPath) AllocateInode(path util.FullPath, unixTime int64) uint64 {
 	if path == "/" {
 		return 1
 	}
 	i.Lock()
 	defer i.Unlock()
-	inode := path.AsInode(unixTime)
-	for _, found := i.inode2path[inode]; found; inode++ {
-		_, found = i.inode2path[inode]
+	for {
+		inode := randomInode()
+		if _, taken := i.inode2path[inode]; inode > 1 && !taken {
+			return inode
+		}
 	}
-	return inode
 }
+
+// randomInode draws a 63-bit number; a variable so tests can force
+// collisions.
+var randomInode = func() uint64 { return rand.Uint64() >> 1 }
 
 func (i *InodeToPath) GetInode(path util.FullPath) (uint64, bool) {
 	if path == "/" {
@@ -313,6 +452,7 @@ func (i *InodeToPath) MarkChildrenCached(fullpath util.FullPath) {
 		return
 	}
 	d.isChildrenCached = true
+	d.generation++
 	d.readDirDirect = false
 	now := time.Now()
 	d.lastAccess = now
@@ -500,7 +640,10 @@ func (i *InodeToPath) CollectEvictableDirs(now time.Time, idle time.Duration) []
 func (i *InodeToPath) AddPath(inode uint64, path util.FullPath) {
 	i.Lock()
 	defer i.Unlock()
+	// A second path makes a hard link (Mountable: see linkIDs).
+	i.noteLinkLocked(inode, unknownLink)
 	i.path2inode[path] = inode
+	i.boundLocked(path)
 
 	ie, found := i.inode2path[inode]
 	if found {
@@ -511,6 +654,335 @@ func (i *InodeToPath) AddPath(inode uint64, path util.FullPath) {
 			path:    path,
 			nlookup: 1,
 		}
+	}
+}
+
+// PromotePath makes alias the inode's primary path in place of gone, which
+// the caller found no longer holding the object (removed, or overwritten
+// by another), and drops gone. It is idempotent: when a concurrent caller
+// already made alias primary, it only drops gone if still there. It fails,
+// and the caller should look again, when the primary is neither gone nor
+// alias, or alias is not one of the inode's paths.
+//
+// Mountable (writeitai/seaweedfs, branch mountable): added for the macOS
+// NFS mount, whose file handles name inodes and must keep working through
+// a surviving hard link. See design/designs/macos-mount.md §4 in
+// writeitai/fsit.
+func (i *InodeToPath) PromotePath(inode uint64, gone, alias util.FullPath) bool {
+	i.Lock()
+	defer i.Unlock()
+	return i.promotePathLocked(inode, gone, alias)
+}
+
+func (i *InodeToPath) promotePathLocked(inode uint64, gone, alias util.FullPath) bool {
+	ie, found := i.inode2path[inode]
+	// A primary other than gone and alias refuses only while gone is still
+	// one of the inode's paths: detached meanwhile, it left whichever path
+	// came next as the primary, which says nothing about alias (Mountable).
+	if !found || gone == alias || !ie.hasPath(alias) || ie.path != gone && ie.path != alias && ie.hasPath(gone) {
+		return false
+	}
+	paths := []util.FullPath{alias}
+	for _, p := range ie.appendPaths(nil) {
+		if p != alias && p != gone {
+			paths = append(paths, p)
+		}
+	}
+	ie.path = alias
+	ie.setExtraPaths(paths[1:])
+	if i.path2inode[gone] == inode {
+		delete(i.path2inode, gone)
+	}
+	return true
+}
+
+// PromotePathIf is PromotePath for a caller that watched gone (Watch): it
+// promotes nothing if a lookup bound gone again since, at generation, to
+// this inode; bound to another, gone is no longer the inode's anyway.
+//
+// Mountable (writeitai/seaweedfs, branch mountable).
+func (i *InodeToPath) PromotePathIf(inode uint64, gone, alias util.FullPath, generation uint64) bool {
+	i.Lock()
+	defer i.Unlock()
+	rebound := i.generationLocked(gone) != generation && i.path2inode[gone] == inode
+	return !rebound && i.promotePathLocked(inode, gone, alias)
+}
+
+// Generation is the binding generation of a watched path (see Watch), 0
+// for one not watched.
+func (i *InodeToPath) Generation(path util.FullPath) uint64 {
+	i.RLock()
+	defer i.RUnlock()
+	return i.generationLocked(path)
+}
+
+func (i *InodeToPath) generationLocked(path util.FullPath) uint64 {
+	if w := i.watches[path]; w != nil {
+		return w.generation
+	}
+	return 0
+}
+
+// PersistedInode is the inode the store keeps for the object at inode:
+// inode itself, unless Lookup's collision probe moved the two apart.
+//
+// Mountable (writeitai/seaweedfs, branch mountable): added for hard-link
+// recovery, which verifies a surviving alias by its persisted identity.
+func (i *InodeToPath) PersistedInode(inode uint64) uint64 {
+	i.RLock()
+	defer i.RUnlock()
+	return i.persistedLocked(inode)
+}
+
+// replacedLocked reports whether an entry of that file type (EntryKind),
+// hard-link group (HardLinkId, "" for none) and persisted inode (0 for
+// none) is another object than inode's. Each must match: the persisted
+// inode, the file type, and the hard-link group exactly, so a standalone
+// file where a hard link was (SeaweedFS never clears an entry's
+// HardLinkId) is another object, and so is a hard link where a standalone
+// file was. Only a Link made here turns a file into a hard link in place
+// (BeginLink and EndLink); a conversion made by another mount looks like a
+// replacement, which fails safe.
+func (i *InodeToPath) replacedLocked(inode uint64, kind os.FileMode, linkID string, possibleInode uint64) bool {
+	if inode == 1 {
+		return false
+	}
+	if possibleInode != 0 && possibleInode != i.persistedLocked(inode) {
+		return true
+	}
+	if i.kindLocked(inode) != kind {
+		return true
+	}
+	if group, ok := i.linking[inode]; ok && (linkID == "" || linkID == group) {
+		return false // the file this mount's own Link is turning into a hard link
+	}
+	known, link := i.linkIDs[inode]
+	switch {
+	case linkID == "" || !link:
+		return (linkID == "") != !link
+	case linkID == unknownLink || known == unknownLink:
+		return false // a group not known on one side
+	}
+	return known != linkID
+}
+
+func (i *InodeToPath) kindLocked(inode uint64) os.FileMode {
+	if _, isDir := i.dirStates[inode]; isDir {
+		return os.ModeDir
+	}
+	return i.kinds[inode]
+}
+
+// Holds reports whether an entry of that file type, hard-link group and
+// persisted inode is the object at inode. It is the one identity rule:
+// LookupLinked detaches a path whose entry fails it, and resolving an
+// inode, reading it, and lending an open handle's entry all go by it.
+//
+// Mountable (writeitai/seaweedfs, branch mountable): see
+// design/designs/macos-mount.md §4 in writeitai/fsit.
+func (i *InodeToPath) Holds(inode uint64, kind os.FileMode, linkID string, persisted uint64) bool {
+	i.RLock()
+	defer i.RUnlock()
+	return !i.replacedLocked(inode, kind, linkID, persisted)
+}
+
+// HoldsEntry is Holds for a filer entry.
+func (i *InodeToPath) HoldsEntry(inode uint64, entry *filer_pb.Entry) bool {
+	return i.Holds(inode, PbEntryKind(entry), string(entry.GetHardLinkId()), entry.GetAttributes().GetInode())
+}
+
+// Watch starts watching path's binding, returning the inode it leads to
+// and the binding generation, which every lookup binding the path moves
+// on. A caller about to act on what it finds at the path ends the watch
+// with Unwatch, which detaches the path only if no lookup bound it since:
+// a slow caller never undoes a newer lookup. Lookup counts cannot tell
+// that, as a newer lookup's reference may be returned meanwhile.
+//
+// Mountable (writeitai/seaweedfs, branch mountable).
+func (i *InodeToPath) Watch(path util.FullPath) (inode uint64, found bool, generation uint64) {
+	i.Lock()
+	defer i.Unlock()
+	if i.watches == nil {
+		i.watches = map[util.FullPath]*pathWatch{}
+	}
+	w := i.watches[path]
+	if w == nil {
+		w = &pathWatch{}
+		i.watches[path] = w
+	}
+	w.watchers++
+	inode, found = i.path2inode[path]
+	return inode, found, w.generation
+}
+
+// boundLocked moves a watched path's generation on: something bound it.
+func (i *InodeToPath) boundLocked(path util.FullPath) {
+	if w := i.watches[path]; w != nil {
+		w.generation++
+	}
+}
+
+// Bound reports whether path still leads to inode: a handle persists
+// through its path only while it does (Mountable).
+func (i *InodeToPath) Bound(path util.FullPath, inode uint64) bool {
+	i.RLock()
+	defer i.RUnlock()
+	return i.path2inode[path] == inode
+}
+
+// Unwatch ends a Watch of path. With detach, it detaches path from inode
+// (as DetachPath), unless a lookup bound the path since the Watch.
+func (i *InodeToPath) Unwatch(path util.FullPath, inode, generation uint64, detach bool) bool {
+	i.Lock()
+	defer i.Unlock()
+	w := i.watches[path]
+	if w == nil {
+		return false
+	}
+	unchanged := w.generation == generation
+	if w.watchers--; w.watchers == 0 {
+		delete(i.watches, path)
+	}
+	if !detach || !unchanged || inode == 1 {
+		return false
+	}
+	i.detachPathLocked(inode, path)
+	return true
+}
+
+// linkGroupLocked finds the inode a hard link with that persisted number
+// joins: one whose group is the link's (by HardLinkId; a group of unknown
+// identity joins only when it is the only one), and that still has a path.
+// joined is false when there is none, and the link takes an inode of its
+// own: a link that cannot tell its group apart joins nothing.
+func (i *InodeToPath) linkGroupLocked(persisted uint64, kind os.FileMode, linkID string) (inode uint64, joined bool) {
+	var candidates []uint64
+	if ie, ok := i.inode2path[persisted]; ok && i.persistedLocked(persisted) == persisted && ie.path != "" && i.kindLocked(persisted) == kind {
+		candidates = append(candidates, persisted)
+	}
+	for _, c := range i.probed[persisted] {
+		if ie, ok := i.inode2path[c]; ok && ie.path != "" && i.kindLocked(c) == kind {
+			candidates = append(candidates, c)
+		}
+	}
+	var exact, unknown []uint64
+	for _, c := range candidates {
+		switch known, link := i.linkIDs[c]; {
+		case link && known == linkID && linkID != unknownLink:
+			exact = append(exact, c)
+		case link && (known == unknownLink || linkID == unknownLink):
+			unknown = append(unknown, c)
+		}
+	}
+	switch {
+	case len(exact) == 1:
+		return exact[0], true
+	case len(exact) == 0 && len(unknown) == 1:
+		return unknown[0], true
+	}
+	return persisted, false
+}
+
+// noteLinkLocked records that inode is a hard link, of group linkID when
+// that is known.
+func (i *InodeToPath) noteLinkLocked(inode uint64, linkID string) {
+	if i.linkIDs == nil {
+		i.linkIDs = map[uint64]string{}
+	}
+	if known, ok := i.linkIDs[inode]; !ok || known == unknownLink {
+		i.linkIDs[inode] = linkID
+	}
+}
+
+// BeginLink records that a Link here is turning the standalone file at
+// inode into a hard link of group linkID: until EndLink, an entry of the
+// file either way is the file.
+//
+// Mountable (writeitai/seaweedfs, branch mountable): see LookupLinked.
+func (i *InodeToPath) BeginLink(inode uint64, linkID []byte) {
+	i.Lock()
+	defer i.Unlock()
+	if i.linking == nil {
+		i.linking = map[uint64]string{}
+	}
+	i.linking[inode] = string(linkID)
+}
+
+// EndLink ends a BeginLink; linked tells whether the file is a hard link
+// of that group now.
+func (i *InodeToPath) EndLink(inode uint64, linkID []byte, linked bool) {
+	i.Lock()
+	defer i.Unlock()
+	delete(i.linking, inode)
+	if linked {
+		i.noteLinkLocked(inode, string(linkID))
+	} else {
+		// Standalone again, as before BeginLink, whatever a lookup in
+		// between recorded.
+		delete(i.linkIDs, inode)
+	}
+}
+
+// SetLinkID records the hard-link identity of inode, made a hard link here.
+//
+// Mountable (writeitai/seaweedfs, branch mountable): see LookupLinked.
+func (i *InodeToPath) SetLinkID(inode uint64, linkID []byte) {
+	if len(linkID) == 0 {
+		return
+	}
+	i.Lock()
+	defer i.Unlock()
+	i.noteLinkLocked(inode, string(linkID))
+}
+
+func (i *InodeToPath) persistedLocked(inode uint64) uint64 {
+	if stored, ok := i.stored[inode]; ok {
+		return stored
+	}
+	return inode
+}
+
+// ChildrenCacheGeneration reports whether a directory's children are
+// cached, and a generation that changes whenever that cache is reset or
+// rebuilt, so a reader can tell a cache it paged through stayed the same.
+//
+// Mountable (writeitai/seaweedfs, branch mountable): added for
+// ReadDirectoryAfter; see weedfs_dir_after.go.
+func (i *InodeToPath) ChildrenCacheGeneration(fullpath util.FullPath) (generation uint64, cached bool) {
+	i.RLock()
+	defer i.RUnlock()
+	d := i.dirStateOf(fullpath)
+	if d == nil {
+		return 0, false
+	}
+	cached = d.isChildrenCached && (d.cachedExpiresTime.IsZero() || time.Now().Before(d.cachedExpiresTime))
+	return d.generation, cached
+}
+
+// DetachPath drops path from inode, which the caller found no longer at
+// path: the inode stays, for whatever still references it, without that
+// path. A path meanwhile mapped to another inode keeps that mapping.
+//
+// Mountable (writeitai/seaweedfs, branch mountable): a newcomer at the path
+// then gets its own inode instead of the deleted file's, with its open
+// handle; for the macOS NFS mount, design/designs/macos-mount.md §4 in
+// writeitai/fsit.
+func (i *InodeToPath) DetachPath(inode uint64, path util.FullPath) {
+	i.Lock()
+	defer i.Unlock()
+	if inode == 1 {
+		return
+	}
+	i.detachPathLocked(inode, path)
+}
+
+func (i *InodeToPath) detachPathLocked(inode uint64, path util.FullPath) {
+	if i.path2inode[path] == inode {
+		delete(i.path2inode, path)
+	}
+	if ie := i.inode2path[inode]; ie != nil && ie.hasPath(path) {
+		ie.removeOnePath(path)
+		i.dropDirPath(inode)
 	}
 }
 
@@ -547,6 +1019,11 @@ func (i *InodeToPath) MovePath(sourcePath, targetPath util.FullPath) (sourceInod
 	i.Lock()
 	defer i.Unlock()
 	sourceInode, sourceFound := i.path2inode[sourcePath]
+	if sourceFound {
+		// Both bindings change (Mountable: see Watch).
+		i.boundLocked(sourcePath)
+		i.boundLocked(targetPath)
+	}
 	if !sourceFound {
 		// Nothing of ours to move: the source was never visited here, or a
 		// redelivery already moved it. Whatever sits at the target is not ours
@@ -609,6 +1086,16 @@ func (i *InodeToPath) Forget(inode, nlookup uint64, onRelease func(inode uint64)
 				}
 			}
 			delete(i.inode2path, inode)
+			delete(i.linkIDs, inode)
+			delete(i.kinds, inode)
+			delete(i.linking, inode)
+			if stored, ok := i.stored[inode]; ok {
+				delete(i.stored, inode)
+				i.probed[stored] = slices.DeleteFunc(i.probed[stored], func(c uint64) bool { return c == inode })
+				if len(i.probed[stored]) == 0 {
+					delete(i.probed, stored)
+				}
+			}
 			i.dropDirPath(inode)
 			delete(i.dirStates, inode)
 		} else {

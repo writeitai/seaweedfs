@@ -15,6 +15,19 @@ import (
 )
 
 func (wfs *WFS) saveEntry(path util.FullPath, entry *filer_pb.Entry) (code fuse.Status) {
+	return wfs.saveEntryVia(path, entry, wfs.streamUpdateEntry)
+}
+
+// saveAttributes is saveEntry for a change of attributes only, the entry's
+// chunks and inline content as stored: it is sent as a unary call, which a
+// filer front end can check against the stored entry on its own, where the
+// stream's requests run in parallel (Mountable: a gateway's metadata rate
+// leaves such updates free).
+func (wfs *WFS) saveAttributes(path util.FullPath, entry *filer_pb.Entry) (code fuse.Status) {
+	return wfs.saveEntryVia(path, entry, wfs.unaryUpdateEntry)
+}
+
+func (wfs *WFS) saveEntryVia(path util.FullPath, entry *filer_pb.Entry, update func(context.Context, *filer_pb.UpdateEntryRequest) (*filer_pb.UpdateEntryResponse, error)) (code fuse.Status) {
 
 	parentDir, _ := path.DirAndName()
 
@@ -32,7 +45,7 @@ func (wfs *WFS) saveEntry(path util.FullPath, entry *filer_pb.Entry) (code fuse.
 	var resp *filer_pb.UpdateEntryResponse
 	err := retryMetadataFlushIf(context.Background(), func() error {
 		var callErr error
-		resp, callErr = wfs.streamUpdateEntry(context.Background(), request)
+		resp, callErr = update(context.Background(), request)
 		return callErr
 	}, isRetryableFilerError, func(nextAttempt, totalAttempts int, backoff time.Duration, err error) {
 		glog.Warningf("saveEntry %s: retrying UpdateEntry (attempt %d/%d) after %v: %v",

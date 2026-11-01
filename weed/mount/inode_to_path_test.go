@@ -1,6 +1,7 @@
 package mount
 
 import (
+	"slices"
 	"testing"
 	"time"
 	"unsafe"
@@ -206,5 +207,275 @@ func TestMovePathWithNoSourceLeavesTheTarget(t *testing.T) {
 	}
 	if got, found := itp.GetInode("/a/g.txt"); !found || got != inode {
 		t.Errorf("/a/g.txt resolves to %d (found %v), want %d", got, found, inode)
+	}
+}
+
+// Every alias of a hard link looked up is kept, and a survivor can take
+// over as the primary path once the first-seen one is gone; promotion is
+// idempotent and refuses a primary that moved elsewhere.
+func TestHardLinkAliasesArePromoted(t *testing.T) {
+	m := NewInodeToPath(util.FullPath("/"), 0)
+	inode := m.Lookup("/a", 1, false, true, 77, true)
+	if other := m.Lookup("/b", 1, false, true, 77, true); other != inode {
+		t.Fatalf("aliases got inodes %d and %d", inode, other)
+	}
+	m.Lookup("/c", 1, false, true, 77, true)
+	m.Lookup("/b", 1, false, true, 77, true) // known already: not added twice
+	if paths := m.GetAllPaths(inode); !slices.Equal(paths, []util.FullPath{"/a", "/b", "/c"}) {
+		t.Fatalf("paths %v", paths)
+	}
+	if m.PromotePath(inode, "/a", "/x") || m.PromotePath(inode, "/a", "/a") {
+		t.Fatal("promoted a path that is not an alias")
+	}
+	if !m.PromotePath(inode, "/a", "/b") || !m.PromotePath(inode, "/a", "/b") {
+		t.Fatal("the alias was not promoted, or not idempotently")
+	}
+	// A caller that saw /a gone and picked /c, verified, finds /a no longer
+	// the inode's, the primary moved on: /c is promoted, and /b, whatever
+	// it holds, stays an alias for the next recovery to judge (Mountable).
+	if !m.PromotePath(inode, "/a", "/c") {
+		t.Fatal("refused a verified alias once the gone path was no longer the inode's")
+	}
+	if paths := m.GetAllPaths(inode); !slices.Equal(paths, []util.FullPath{"/c", "/b"}) || m.HasPath("/a") {
+		t.Fatalf("paths %v", paths)
+	}
+	// While the gone path is still the inode's but not its primary, the
+	// primary moved under the caller: refused, so it looks again.
+	m.AddPath(inode, "/d")
+	if m.PromotePath(inode, "/d", "/b") {
+		t.Fatal("promoted over a primary that had moved")
+	}
+	// Not a hard link: a second path never shares the inode.
+	if x, y := m.Lookup("/x", 1, false, false, 90, true), m.Lookup("/y", 1, false, false, 90, true); x == y {
+		t.Fatal("two plain files share an inode")
+	}
+}
+
+// A hard link's alias overwritten by another object leaves the link: the
+// newcomer gets its own inode, the survivor keeps the old one.
+func TestOverwrittenAliasLeavesTheLink(t *testing.T) {
+	m := NewInodeToPath(util.FullPath("/"), 0)
+	inode := m.Lookup("/one", 1, false, true, 77, true)
+	m.Lookup("/two", 1, false, true, 77, true)
+	newcomer := m.Lookup("/one", 2, false, false, 99, true)
+	if newcomer == inode {
+		t.Fatal("the newcomer took the hard link's inode")
+	}
+	if paths := m.GetAllPaths(inode); !slices.Equal(paths, []util.FullPath{"/two"}) {
+		t.Fatalf("the link's paths %v", paths)
+	}
+}
+
+// A file whose persisted inode the collision probe moved (77 taken, so 78)
+// becomes a hard link: its links, which persist 77, all stay on 78 and are
+// never merged into the unrelated 77.
+func TestProbedInodeThroughLinks(t *testing.T) {
+	m := NewInodeToPath(util.FullPath("/"), 0)
+	other := m.Lookup("/x", 1, false, false, 77, true)
+	file := m.Lookup("/f", 1, false, false, 77, true)
+	if other != 77 || file == 77 || m.PersistedInode(file) != 77 || m.PersistedInode(other) != 77 {
+		t.Fatalf("inodes %d %d, persisted %d", other, file, m.PersistedInode(file))
+	}
+	m.AddPath(file, "/g") // LINK
+	for _, p := range []util.FullPath{"/f", "/g", "/h"} {
+		if got := m.Lookup(p, 1, false, true, 77, true); got != file {
+			t.Fatalf("%s: inode %d, want %d", p, got, file)
+		}
+	}
+	if paths := m.GetAllPaths(other); !slices.Equal(paths, []util.FullPath{"/x"}) {
+		t.Fatalf("the unrelated inode gained %v", paths)
+	}
+	m.Forget(file, 5, nil, nil)
+	if m.PersistedInode(file) != file {
+		t.Fatal("the probe's record outlived the inode")
+	}
+}
+
+// A path overwritten by another object (its persisted inode differs) is
+// detached even when it was the inode's only path: the newcomer gets its
+// own inode, the old one keeps no path.
+func TestOverwrittenSinglePathDetaches(t *testing.T) {
+	m := NewInodeToPath(util.FullPath("/"), 0)
+	old := m.Lookup("/a", 1, false, false, 100, true)
+	if fresh := m.Lookup("/a", 2, false, false, 9999, true); fresh == old || fresh != 9999 {
+		t.Fatalf("newcomer inode %d (old %d)", fresh, old)
+	}
+	if _, st := m.GetPath(old); st != fuse.ENOENT {
+		t.Fatal("the old inode kept the path")
+	}
+	// Overwritten by a hard link: both of its names share one inode.
+	m.Lookup("/b", 3, false, true, 4242, true)
+	if a := m.Lookup("/a", 3, false, true, 4242, true); a != 4242 {
+		t.Fatalf("the overwriting link got %d, its other name 4242", a)
+	}
+}
+
+// Two inodes carry persisted 77: the original (77) and an unrelated file
+// the probe moved to 78. A link joins the inode of its own group, by
+// HardLinkId; a link of another group, or of a group that cannot be told
+// apart, joins neither. A third collider does not lose the others.
+// (The persisted-77 inodes are all taken: the group's inode is probed too.)
+func TestLinksJoinTheirOwnInode(t *testing.T) {
+	m := NewInodeToPath(util.FullPath("/"), 0)
+	orig := m.Lookup("/orig", 1, false, false, 77, true)
+	unrelated := m.Lookup("/other", 1, false, false, 77, true)
+	if orig != 77 || unrelated == 77 {
+		t.Fatalf("inodes %d %d", orig, unrelated)
+	}
+	if got := m.LookupLinked("/elsewhere", 1, 0, "group-X", 77, true); got == orig || got == unrelated {
+		t.Fatalf("a link of another group joined %d", got)
+	}
+	// The original, made a link by another mount: that looks like a
+	// replacement, so the group gets an inode of its own.
+	group := m.LookupLinked("/orig", 1, 0, "group-O", 77, true)
+	if group == orig {
+		t.Fatal("a standalone file became a link of a group in place")
+	}
+	third := m.Lookup("/third", 1, false, false, 77, true)
+	for _, p := range []util.FullPath{"/new-link", "/another-link"} {
+		if got := m.LookupLinked(p, 1, 0, "group-O", 77, true); got != group {
+			t.Fatalf("%s got %d, want %d", p, got, group)
+		}
+	}
+	for _, other := range []uint64{unrelated, third} {
+		if paths := m.GetAllPaths(other); len(paths) != 1 {
+			t.Fatalf("inode %d gained %v", other, paths)
+		}
+	}
+}
+
+// Two hard-link groups that share a legacy persisted inode stay apart.
+func TestDistinctLinkGroupsStayApart(t *testing.T) {
+	m := NewInodeToPath(util.FullPath("/"), 0)
+	a := m.LookupLinked("/a1", 1, 0, "A", 4242, true)
+	if m.LookupLinked("/a2", 1, 0, "A", 4242, true) != a {
+		t.Fatal("one group got two inodes")
+	}
+	if b := m.LookupLinked("/b1", 1, 0, "B", 4242, true); b == a {
+		t.Fatal("two groups were merged")
+	}
+	// /a2 overwritten by a link of group B: detached from A.
+	if m.LookupLinked("/a2", 2, 0, "B", 4242, true) == a {
+		t.Fatal("a path now in group B stayed on group A's inode")
+	}
+}
+
+// A path whose object changes type, or stops being a link of a group with
+// other members, is detached even with the same persisted inode; and an
+// inode whose paths are all gone is never joined again.
+func TestSamePersistedInodeOtherObject(t *testing.T) {
+	m := NewInodeToPath(util.FullPath("/"), 0)
+	file := m.Lookup("/x", 1, false, false, 500, true)
+	if dir := m.Lookup("/x", 1, true, false, 500, true); dir == file {
+		t.Fatal("a directory took the file's inode")
+	}
+	link := m.LookupLinked("/l1", 1, 0, "L", 600, true)
+	m.LookupLinked("/l2", 1, 0, "L", 600, true)
+	if alone := m.Lookup("/l2", 1, false, false, 600, true); alone == link {
+		t.Fatal("a standalone file stayed on the link group's inode")
+	}
+	m.DetachPath(link, "/l1")
+	if again := m.LookupLinked("/l3", 1, 0, "L", 600, true); again == link {
+		t.Fatal("a link joined an inode with no path left")
+	}
+}
+
+// A hard link where a standalone file was, while another inode holds the
+// link's group, is a replacement: the path joins that group's inode, so
+// the group stays one inode.
+func TestLinkWhereAStandaloneFileWas(t *testing.T) {
+	m := NewInodeToPath(util.FullPath("/"), 0)
+	alone := m.LookupLinked("/g", 1, 0, "", 4242, true)
+	group := m.LookupLinked("/h", 1, 0, "L", 4242, true)
+	if group == alone {
+		t.Fatal("the link joined a standalone file")
+	}
+	if !m.Holds(alone, 0, "", 4242) || m.Holds(alone, 0, "L", 4242) {
+		t.Fatal("Holds disagrees with the lookups")
+	}
+	if got := m.LookupLinked("/g", 1, 0, "L", 4242, true); got != group {
+		t.Fatalf("/g now on %d, want the group's %d", got, group)
+	}
+	if paths := m.GetAllPaths(alone); len(paths) != 0 {
+		t.Fatalf("the standalone file's inode still has %v", paths)
+	}
+}
+
+// While a Link here turns a standalone file into a hard link, the file is
+// itself either way; after it, only as the link, and a failed Link leaves
+// it standalone.
+func TestOwnLinkConvertsInPlace(t *testing.T) {
+	m := NewInodeToPath(util.FullPath("/"), 0)
+	file := m.LookupLinked("/f", 1, 0, "", 900, true)
+	m.BeginLink(file, []byte("L"))
+	if m.LookupLinked("/f", 1, 0, "L", 900, true) != file || m.LookupLinked("/f", 1, 0, "", 900, true) != file {
+		t.Fatal("the file being linked looked replaced")
+	}
+	m.EndLink(file, []byte("L"), true)
+	if !m.Holds(file, 0, "L", 900) || m.Holds(file, 0, "", 900) {
+		t.Fatal("after the link, the file is the link only")
+	}
+	other := m.LookupLinked("/g", 1, 0, "", 901, true)
+	m.BeginLink(other, []byte("M"))
+	if m.LookupLinked("/g", 1, 0, "M", 901, true) != other { // a lookup in between
+		t.Fatal("the file being linked looked replaced")
+	}
+	m.EndLink(other, []byte("M"), false)
+	if !m.Holds(other, 0, "", 901) || m.Holds(other, 0, "M", 901) {
+		t.Fatal("after a failed link, the file is standalone only")
+	}
+}
+
+// A path Link or Rename bound back to the same inode moves the watch on, so
+// a slow miss that watched it detaches nothing.
+func TestBindingsMoveWatchesOn(t *testing.T) {
+	m := NewInodeToPath(util.FullPath("/"), 0)
+	inode := m.Lookup("/p", 1, false, false, 700, true)
+	_, _, generation := m.Watch("/p")
+	m.DetachPath(inode, "/p")
+	m.AddPath(inode, "/p")
+	if m.Unwatch("/p", inode, generation, true) || !m.Bound("/p", inode) {
+		t.Fatal("a slow miss undid a Link's binding")
+	}
+	_, _, generation = m.Watch("/p")
+	m.MovePath("/p", "/q")
+	m.MovePath("/q", "/p")
+	if m.Unwatch("/p", inode, generation, true) || !m.Bound("/p", inode) {
+		t.Fatal("a slow miss undid a Rename's binding")
+	}
+}
+
+// AllocateInode draws until a candidate is neither reserved (0, the root's
+// 1) nor in the table, checking every one.
+func TestAllocateInodeSkipsReservedAndTaken(t *testing.T) {
+	m := NewInodeToPath(util.FullPath("/"), 0)
+	m.Lookup("/a", 1, false, false, 100, true)
+	m.Lookup("/b", 1, false, false, 102, true)
+	draws := []uint64{0, 1, 100, 102, 101}
+	saved := randomInode
+	defer func() { randomInode = saved }()
+	randomInode = func() uint64 {
+		next := draws[0]
+		draws = draws[1:]
+		return next
+	}
+	if got := m.AllocateInode("/c", 1); got != 101 {
+		t.Fatalf("allocated %d, want 101", got)
+	}
+	if len(draws) != 0 {
+		t.Fatalf("%d draws left", len(draws))
+	}
+}
+
+// Real draws are 63-bit and differ for one path in one second.
+func TestAllocateInodeIsRandom(t *testing.T) {
+	m := NewInodeToPath(util.FullPath("/"), 0)
+	seen := map[uint64]bool{}
+	for range 1000 {
+		inode := m.AllocateInode("/same", 1)
+		if inode <= 1 || inode >= 1<<63 || seen[inode] {
+			t.Fatalf("allocated %d", inode)
+		}
+		seen[inode] = true
 	}
 }

@@ -3,10 +3,15 @@ package mount
 import (
 	"bytes"
 	"context"
+	"errors"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/seaweedfs/go-fuse/v2/fuse"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
@@ -44,7 +49,6 @@ func (wfs *WFS) Link(cancel <-chan struct{}, in *fuse.LinkIn, name string, out *
 	if code != fuse.OK {
 		return
 	}
-	oldParentPath, _ := oldEntryPath.DirAndName()
 
 	// The new link has to be reported with the node id the kernel already holds
 	// for the source, which is what makes the two names share one file.
@@ -59,9 +63,9 @@ func (wfs *WFS) Link(cancel <-chan struct{}, in *fuse.LinkIn, name string, out *
 
 	ctx, cancelFunc := ctxFromCancel(cancel)
 	defer cancelFunc()
-	oldEntry, _, status := wfs.maybeLoadEntry(ctx, oldEntryPath)
-	if status != fuse.OK {
-		return status
+	oldEntry, _, loadStatus := wfs.maybeLoadEntry(ctx, oldEntryPath)
+	if loadStatus != fuse.OK {
+		return loadStatus
 	}
 
 	// hardlink is not allowed in WORM mode
@@ -69,137 +73,216 @@ func (wfs *WFS) Link(cancel <-chan struct{}, in *fuse.LinkIn, name string, out *
 		return fuse.EPERM
 	}
 
-	// If the source is already a hard link, serialize on its HardLinkId
-	// so concurrent Link/Unlink operations on different siblings cannot
-	// both compute a new counter from a stale base. Re-load the entry
-	// under the lock to pick up any prior holder's sibling update.
-	if len(oldEntry.HardLinkId) > 0 {
-		hlKey := string(oldEntry.HardLinkId)
-		lock := wfs.hardLinkLockTable.AcquireLock("link", hlKey, util.ExclusiveLock)
-		defer wfs.hardLinkLockTable.ReleaseLock(hlKey, lock)
-		// Under the lock, re-resolve the source alias from the inode.
-		// A concurrent Unlink that held this same lock may have removed
-		// the specific alias we picked pre-lock even though other
-		// sibling hard links for the same inode are still around;
-		// GetPath(Oldnodeid) returns whichever alias is still active.
-		refreshedPath, refreshedStatus := wfs.inodeToPath.GetPath(in.Oldnodeid)
-		if refreshedStatus != fuse.OK {
-			return refreshedStatus
+	// Mountable (writeitai/seaweedfs, branch mountable): the invariants of
+	// architecture §4 obligation 13 in writeitai/fsit (D43).
+	//
+	// Locks, in Unlink's order: a group's changes are serialised between
+	// mounts by the -dlm lock keyed by its hard-link ID, and within this
+	// mount by the hard-link lock. Then the source inode's lock, which an
+	// Open takes from loading the entry to registering its handle, and the
+	// open handle's own lock, both held to the end, so no handle is left
+	// with the entry from before the promotion.
+	// A standalone source's group is allocated here, and locked before the
+	// promotion makes it visible: another mount linking into it waits until
+	// the new name exists, or the counter is back.
+	// When the cache was wrong about the source's group, the group the
+	// filer has is locked, and the source read again under it.
+	group := oldEntry.HardLinkId
+	if len(group) == 0 {
+		group = filer.NewHardLinkId()
+	}
+	for range 3 {
+		code, other := wfs.linkLocked(in, sourceInode, oldEntryPath, newParentPath, name, group, out)
+		if other == nil {
+			return code
 		}
-		oldEntryPath = refreshedPath
-		oldParentPath, _ = oldEntryPath.DirAndName()
-		// Do not fall back to the pre-lock snapshot: if every alias
-		// was deleted while we waited, abort instead of deriving the
-		// next counter from a stale entry.
-		fresh, _, freshStatus := wfs.maybeLoadEntry(ctx, oldEntryPath)
-		if freshStatus != fuse.OK {
-			return freshStatus
-		}
-		oldEntry = fresh
+		group = other
+	}
+	return fuse.Status(syscall.EAGAIN)
+}
+
+// linkLocked is Link with the group's locks: group is the source's, or
+// the one allocated for it. When the filer has the source in another
+// group, it returns that group and changes nothing.
+func (wfs *WFS) linkLocked(in *fuse.LinkIn, sourceInode uint64, oldEntryPath, newParentPath util.FullPath, name string, group []byte, out *fuse.EntryOut) (fuse.Status, []byte) {
+	release, code := wfs.lockHardLinkGroup(group)
+	if code != fuse.OK {
+		return code, nil
+	}
+	defer release()
+	inodeLock := wfs.inodeLocks().AcquireLock("link", sourceInode, util.ExclusiveLock)
+	defer wfs.inodeLocks().ReleaseLock(sourceInode, inodeLock)
+	fh, fhLock, code := wfs.lockFlushedHandle(sourceInode, in.Uid, in.Gid)
+	if code != fuse.OK {
+		return code, nil
+	}
+	if fh != nil {
+		defer wfs.fhLockTable.ReleaseLock(fh.fh, fhLock)
 	}
 
-	// update old file to hardlink mode
-	origHardLinkId := oldEntry.HardLinkId
-	origHardLinkCounter := oldEntry.HardLinkCounter
-	if len(oldEntry.HardLinkId) == 0 {
-		oldEntry.HardLinkId = filer.NewHardLinkId()
-		oldEntry.HardLinkCounter = 1
-		glog.V(4).Infof("Link: new HardLinkId %x for %s", oldEntry.HardLinkId, oldEntryPath)
+	if beforeLinkReload != nil {
+		beforeLinkReload()
 	}
-	oldEntry.HardLinkCounter++
-	glog.V(4).Infof("Link: %s -> %s/%s HardLinkId %x counter=%d",
-		oldEntryPath, newParentPath, name, oldEntry.HardLinkId, oldEntry.HardLinkCounter)
-	updateOldEntryRequest := &filer_pb.UpdateEntryRequest{
-		Directory:  oldParentPath,
-		Entry:      oldEntry,
-		Signatures: []int32{wfs.signature},
+	// The source as the filer has it now, under the locks: the object
+	// being linked, or ENOENT. Read from the filer itself, it waits for no
+	// async flush, which would need the handle lock held here.
+	oldEntryPath, code = wfs.inodeToPath.GetPath(sourceInode)
+	if code != fuse.OK {
+		return code, nil
+	}
+	oldParentPath, _ := oldEntryPath.DirAndName()
+	read, _, _, err := filer_pb.GetEntry(context.Background(), wfs, oldEntryPath)
+	if err != nil {
+		if errors.Is(err, filer_pb.ErrNotFound) {
+			return fuse.ENOENT, nil
+		}
+		return fuse.EIO, nil
+	}
+	if read == nil || !wfs.inodeToPath.HoldsEntry(sourceInode, read) {
+		return fuse.ENOENT, nil
+	}
+	if len(read.HardLinkId) > 0 && !bytes.Equal(read.HardLinkId, group) {
+		return fuse.OK, read.HardLinkId
 	}
 
-	// CreateLink 1.2 : update new file to hardlink mode
+	// Promote the source: hard-link mode, its counter raised, before the new
+	// name exists, so its chunks belong to the shared record from here and a
+	// concurrent unlink cannot delete them. The condition fails, as ENOENT,
+	// for a source another mount replaced since it was read.
+	promoted := proto.Clone(read).(*filer_pb.Entry)
+	converting := len(promoted.HardLinkId) == 0
+	if converting {
+		promoted.HardLinkId = group
+		promoted.HardLinkCounter = 1
+	}
+	promoted.HardLinkCounter++
 	linkNow := time.Now()
-	oldEntry.Attributes.Mtime = linkNow.Unix()
-	oldEntry.Attributes.MtimeNs = int32(linkNow.Nanosecond())
-	oldEntry.Attributes.Ctime = linkNow.Unix()
-	oldEntry.Attributes.CtimeNs = int32(linkNow.Nanosecond())
-	request := &filer_pb.CreateEntryRequest{
-		Directory: string(newParentPath),
-		Entry: &filer_pb.Entry{
-			Name:            name,
-			IsDirectory:     false,
-			Attributes:      oldEntry.Attributes,
-			Chunks:          oldEntry.GetChunks(),
-			Extended:        oldEntry.Extended,
-			HardLinkId:      oldEntry.HardLinkId,
-			HardLinkCounter: oldEntry.HardLinkCounter,
-		},
+	promoted.Attributes.Ctime = linkNow.Unix()
+	promoted.Attributes.CtimeNs = int32(linkNow.Nanosecond())
+	glog.V(4).Infof("Link: %s -> %s/%s HardLinkId %x counter=%d", oldEntryPath, newParentPath, name, group, promoted.HardLinkCounter)
+	if converting {
+		wfs.inodeToPath.BeginLink(sourceInode, group)
+	}
+	linked := false // whether the source is a hard link now
+	defer func() {
+		if converting {
+			wfs.inodeToPath.EndLink(sourceInode, group, linked)
+		}
+	}()
+	ctx := context.Background()
+	updateResp, err := wfs.updateEntryOnce(ctx, &filer_pb.UpdateEntryRequest{
+		Directory:  oldParentPath,
+		Entry:      promoted,
+		Signatures: []int32{wfs.signature},
+		Condition:  entryEqual(read),
+	})
+	if err != nil {
+		glog.V(0).Infof("Link %v: promoting the source: %v", oldEntryPath, err)
+		if code := status.Code(err); code == codes.FailedPrecondition || isNotFound(err) {
+			return fuse.ENOENT, nil
+		}
+		return fuse.EIO, nil
+	}
+	linked = true
+	acked := ackedEntry(promoted, updateResp)
+	// Every handle on the source holds the acknowledged entry from here,
+	// fenced against older events.
+	wfs.holdAcked(fh, acked, updateResp)
+	updateEvent := updateResp.GetMetadataEvent()
+	if updateEvent == nil {
+		updateEvent = metadataUpdateEvent(oldParentPath, acked)
+		updateEvent.TsNs = ackVersionTsNs(updateResp)
+	}
+	if applyErr := wfs.applyLocalMetadataEvent(ctx, updateEvent); applyErr != nil {
+		glog.Warningf("link %s: best-effort metadata apply failed: %v", oldEntryPath, applyErr)
+		wfs.inodeToPath.InvalidateChildrenCache(util.FullPath(oldParentPath))
+	}
+
+	// Create the new name exclusively, in one attempt: a retry after a lost
+	// reply could create it a second time once the first was renamed.
+	// The whole entry, inline content included: the new name's create
+	// rewrites the group's shared record (Mountable).
+	alias := proto.Clone(acked).(*filer_pb.Entry)
+	alias.Name = name
+	createResp, err := wfs.createEntryOnce(ctx, &filer_pb.CreateEntryRequest{
+		Directory:                string(newParentPath),
+		Entry:                    alias,
+		OExcl:                    true,
 		Signatures:               []int32{wfs.signature},
 		SkipCheckParentDirectory: true,
-	}
-
-	// apply changes to the filer, and also apply to local metaCache
-	wfs.mapPbIdFromLocalToFiler(request.Entry)
-
-	updateResp, err := wfs.streamUpdateEntry(context.Background(), updateOldEntryRequest)
-	if err == nil {
-		updateEvent := updateResp.GetMetadataEvent()
-		if updateEvent == nil {
-			updateEvent = metadataUpdateEvent(oldParentPath, updateOldEntryRequest.Entry)
+	})
+	newEntryPath := newParentPath.Child(name)
+	switch {
+	case err == nil && createResp.GetErrorCode() == filer_pb.FilerError_ENTRY_ALREADY_EXISTS:
+		// The name another creator has is not in this mount's cache yet:
+		// the next lookup asks the filer, as after Create (Mountable).
+		wfs.inodeToPath.InvalidateChildrenCache(newParentPath)
+		// A typed refusal before any change: the extra reference goes back,
+		// on the condition that the source is still as promoted.
+		rollback := proto.Clone(acked).(*filer_pb.Entry)
+		rollback.HardLinkId, rollback.HardLinkCounter = read.HardLinkId, read.HardLinkCounter
+		rollbackResp, rollbackErr := wfs.updateEntryOnce(ctx, &filer_pb.UpdateEntryRequest{
+			Directory:  oldParentPath,
+			Entry:      rollback,
+			Signatures: []int32{wfs.signature},
+			Condition:  entryEqual(acked),
+		})
+		if rollbackErr != nil {
+			glog.Warningf("link rollback %s: %v", oldEntryPath, rollbackErr)
+			return fuse.Status(syscall.EEXIST), nil
 		}
-		if applyErr := wfs.applyLocalMetadataEvent(context.Background(), updateEvent); applyErr != nil {
-			glog.Warningf("link %s: best-effort metadata apply failed: %v", oldEntryPath, applyErr)
+		// The mount takes the rolled-back source, as acknowledged, before
+		// the conversion ends: the cache, and the open handle, fenced.
+		linked = !converting
+		rollback = ackedEntry(rollback, rollbackResp)
+		wfs.holdAcked(fh, rollback, rollbackResp)
+		rollbackEvent := rollbackResp.GetMetadataEvent()
+		if rollbackEvent == nil {
+			rollbackEvent = metadataUpdateEvent(oldParentPath, rollback)
+			rollbackEvent.TsNs = ackVersionTsNs(rollbackResp)
+		}
+		if applyErr := wfs.applyLocalMetadataEvent(ctx, rollbackEvent); applyErr != nil {
+			glog.Warningf("link rollback %s: best-effort metadata apply failed: %v", oldEntryPath, applyErr)
 			wfs.inodeToPath.InvalidateChildrenCache(util.FullPath(oldParentPath))
 		}
+		return fuse.Status(syscall.EEXIST), nil
+	case err != nil || createResp.GetError() != "":
+		// Ambiguous: the name may exist although the reply says otherwise.
+		// The extra reference stays, which keeps chunks longer, never too
+		// short, and Link fails.
+		glog.V(0).Infof("Link %v -> %s: %v %s", oldEntryPath, newEntryPath, err, createResp.GetError())
+		return fuse.EIO, nil
 	}
-	if err == nil {
-		var createResp *filer_pb.CreateEntryResponse
-		createResp, err = wfs.streamCreateEntry(context.Background(), request)
-		if err != nil {
-			// Rollback: restore original HardLinkId/Counter on the source entry
-			oldEntry.HardLinkId = origHardLinkId
-			oldEntry.HardLinkCounter = origHardLinkCounter
-			rollbackReq := &filer_pb.UpdateEntryRequest{
-				Directory:  oldParentPath,
-				Entry:      oldEntry,
-				Signatures: []int32{wfs.signature},
-			}
-			if _, rollbackErr := wfs.streamUpdateEntry(context.Background(), rollbackReq); rollbackErr != nil {
-				glog.Warningf("link rollback %s: %v", oldEntryPath, rollbackErr)
-			}
-		} else {
-			createEvent := createResp.GetMetadataEvent()
-			if createEvent == nil {
-				createEvent = metadataCreateEvent(string(newParentPath), request.Entry)
-			}
-			if applyErr := wfs.applyLocalMetadataEvent(context.Background(), createEvent); applyErr != nil {
-				glog.Warningf("link %s: best-effort metadata apply failed: %v", newParentPath.Child(name), applyErr)
-				wfs.inodeToPath.InvalidateChildrenCache(newParentPath)
-			}
-			wfs.touchDirMtimeCtimeBest(newParentPath)
-		}
+	createEvent := createResp.GetMetadataEvent()
+	if createEvent == nil {
+		createEvent = metadataCreateEvent(string(newParentPath), alias)
+		createEvent.TsNs = ackVersionTsNs(createResp)
 	}
-
-	newEntryPath := newParentPath.Child(name)
-
-	// Map back to local uid/gid before writing attributes to the kernel.
-	wfs.mapPbIdFromFilerToLocal(request.Entry)
-
-	if err != nil {
-		glog.V(0).Infof("Link %v -> %s: %v", oldEntryPath, newEntryPath, err)
-		return fuse.EIO
+	if applyErr := wfs.applyLocalMetadataEvent(ctx, createEvent); applyErr != nil {
+		glog.Warningf("link %s: best-effort metadata apply failed: %v", newEntryPath, applyErr)
+		wfs.inodeToPath.InvalidateChildrenCache(newParentPath)
 	}
+	wfs.touchDirMtimeCtimeBest(newParentPath)
 
 	wfs.inodeToPath.AddPath(sourceInode, newEntryPath)
+	// The group as the filer has it, also for a source this mount knew as
+	// a hard link of an unknown group (Mountable).
+	wfs.inodeToPath.SetLinkID(sourceInode, group)
 
 	// Propagate the new HardLinkCounter to sibling cache entries and
 	// invalidate the kernel's inode attr cache. Without this, `stat` on any
 	// existing sibling link (other than the source we just wrote) returns
 	// the old nlink from the local metacache — pjdfstest link/00.t catches
 	// this after `link n1 n2` when it stats n0.
-	wfs.syncHardLinkSiblings(sourceInode, oldEntry, oldEntryPath, newEntryPath)
+	wfs.syncHardLinkSiblings(sourceInode, acked, oldEntryPath, newEntryPath)
 
-	wfs.outputPbEntry(out, sourceInode, request.Entry)
+	// Map back to local uid/gid before writing attributes to the kernel.
+	reported := proto.Clone(alias).(*filer_pb.Entry)
+	wfs.mapPbIdFromFilerToLocal(reported)
+	wfs.outputPbEntry(out, sourceInode, reported)
 
-	return fuse.OK
+	return fuse.OK, nil
+
 }
 
 // syncHardLinkSiblings rewrites the cached HardLinkCounter (and ctime) on
@@ -249,4 +332,42 @@ func (wfs *WFS) syncHardLinkSiblings(inode uint64, authoritativeEntry *filer_pb.
 	// writes onto the same /dev/fuse fd that the kernel is still waiting to
 	// read the Link reply from — causing a self-notify deadlock. The kernel
 	// will re-stat siblings once its attr-cache TTL expires.
+}
+
+// ackedEntry is the entry the filer acknowledged for an update of sent: the
+// stored entry its event carries, its chunks' file IDs restored as a lookup
+// returns them (the store keeps them parsed only), else sent (Mountable).
+func ackedEntry(sent *filer_pb.Entry, resp *filer_pb.UpdateEntryResponse) *filer_pb.Entry {
+	stored := resp.GetMetadataEvent().GetEventNotification().GetNewEntry()
+	if stored == nil {
+		return sent
+	}
+	acked := proto.Clone(stored).(*filer_pb.Entry)
+	filer_pb.AfterEntryDeserialization(acked.GetChunks())
+	return acked
+}
+
+// holdAcked puts an acknowledged entry into a handle Link holds locked, as
+// its entry and base, fenced at the acknowledgement's log position
+// (Mountable).
+func (wfs *WFS) holdAcked(fh *FileHandle, acked *filer_pb.Entry, resp *filer_pb.UpdateEntryResponse) {
+	if fh == nil {
+		return
+	}
+	local := proto.Clone(acked).(*filer_pb.Entry)
+	wfs.mapPbIdFromFilerToLocal(local)
+	fh.SetEntry(local)
+	fh.setAuthoritativeBase(proto.Clone(local).(*filer_pb.Entry))
+	fh.advanceEntryVersion(ackVersionTsNs(resp), resp.GetLogSignature())
+}
+
+// beforeLinkReload, when set (by tests), runs in Link once it holds the
+// source handle's lock, before it reads the source again.
+var beforeLinkReload func()
+
+// isNotFound reports whether a filer call failed for a missing entry: a
+// NotFound status, or the filer's own wording, which its UpdateEntry
+// returns untyped (Mountable).
+func isNotFound(err error) bool {
+	return status.Code(err) == codes.NotFound || strings.Contains(err.Error(), filer_pb.ErrNotFound.Error())
 }

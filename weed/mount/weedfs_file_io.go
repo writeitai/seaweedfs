@@ -76,8 +76,10 @@ func (wfs *WFS) Open(cancel <-chan struct{}, in *fuse.OpenIn, out *fuse.OpenOut)
 		// has not changed since the last open.  This tells the kernel to
 		// preserve its existing page cache, avoiding redundant reads.
 		if in.Flags&fuse.O_ANYWRITE == 0 {
-			if entry := fileHandle.GetEntry(); entry != nil && entry.Attributes != nil {
-				wfs.applyKeepCacheFlag(in.NodeId, entry, out)
+			// The entry is read under its lock: a Link may swap it meanwhile
+			// (Mountable).
+			if entry := fileHandle.GetEntry().GetEntry(); entry != nil && entry.Attributes != nil {
+				wfs.applyKeepCacheFlag(in.NodeId, &LockedEntry{Entry: entry}, out)
 			}
 		}
 	}

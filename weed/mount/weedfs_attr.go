@@ -104,12 +104,14 @@ func (wfs *WFS) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *fuse
 		return fuse.EPERM
 	}
 
+	truncated := false // whether the chunks changed (Mountable: see saveAttributes)
 	if size, ok := input.GetSize(); ok {
 		glog.V(4).Infof("%v setattr set size=%v chunks=%d", path, size, len(entry.GetChunks()))
 		// Invalidate the open-mtime cache so the next Open does not set
 		// FOPEN_KEEP_CACHE with stale kernel page cache data.
 		wfs.invalidateOpenMtimeCache(input.NodeId)
 		oldFileSize := filer.FileSize(entry)
+		truncated = size < oldFileSize
 		if size < oldFileSize {
 			// fmt.Printf("truncate %v \n", fullPath)
 			var chunks []*filer_pb.FileChunk
@@ -218,7 +220,10 @@ func (wfs *WFS) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *fuse
 		return fuse.OK
 	}
 
-	return wfs.saveEntry(path, entry)
+	if truncated {
+		return wfs.saveEntry(path, entry)
+	}
+	return wfs.saveAttributes(path, entry)
 
 }
 
@@ -349,7 +354,7 @@ func (wfs *WFS) touchDirMtimeCtime(dirPath util.FullPath) {
 	dirEntry.Attributes.MtimeNs = int32(now.Nanosecond())
 	dirEntry.Attributes.Ctime = now.Unix()
 	dirEntry.Attributes.CtimeNs = int32(now.Nanosecond())
-	wfs.saveEntry(dirPath, dirEntry)
+	wfs.saveAttributes(dirPath, dirEntry)
 }
 
 // touchDirMtimeCtimeLocal updates a directory's mtime and ctime in an in-memory

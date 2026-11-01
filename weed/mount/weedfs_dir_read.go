@@ -233,7 +233,7 @@ func (wfs *WFS) doReadDirectory(ctx context.Context, input *fuse.ReadIn, out Dir
 		}
 		var inode uint64
 		if takesLookupRef {
-			inode = wfs.inodeToPath.Lookup(childPath, entry.Crtime.Unix(), entry.IsDirectory(), len(entry.HardLinkId) > 0, entry.Inode, false)
+			inode = wfs.inodeToPath.LookupLinked(childPath, entry.Crtime.Unix(), EntryKind(entry.IsDirectory(), entry.Mode), string(entry.HardLinkId), entry.Inode, false)
 		} else {
 			inode = wfs.inodeToPath.InodeForListing(childPath, entry.Crtime.Unix(), entry.Inode)
 		}
@@ -253,13 +253,13 @@ func (wfs *WFS) doReadDirectory(ctx context.Context, input *fuse.ReadIn, out Dir
 			}
 			if fh, found := wfs.fhMap.FindFileHandle(inode); found {
 				glog.V(4).Infof("readdir opened file %s", childPath)
-				entry = filer.FromPbEntry(string(dirPath), fh.GetEntry().GetEntry())
+				entry = wfs.openEntry(fh, dirPath, entry)
 			}
 			wfs.outputFilerEntry(entryOut, inode, entry)
 			// Taken only once the entry is really in the sink, so one that did not
 			// fit leaves no reference behind. The fallback covers a racing Forget.
 			if takesLookupRef && !wfs.inodeToPath.IncrementNlookup(inode) {
-				wfs.inodeToPath.Lookup(childPath, entry.Crtime.Unix(), entry.IsDirectory(), len(entry.HardLinkId) > 0, entry.Inode, true)
+				wfs.inodeToPath.LookupLinked(childPath, entry.Crtime.Unix(), EntryKind(entry.IsDirectory(), entry.Mode), string(entry.HardLinkId), entry.Inode, true)
 			}
 		}
 		return true
@@ -393,14 +393,14 @@ func (wfs *WFS) doReadDirectory(ctx context.Context, input *fuse.ReadIn, out Dir
 			glog.V(1).Infof("refresh %s sections: %v", dirPath, err)
 		}
 
+		// The batch is read out of the cache first and handed to the sink
+		// after: an open file's entry is read under its handle's locks, which
+		// must not be taken under the cache's (Mountable). What the sink does
+		// not take stays in the stream for the next call.
 		bufferFull := false
+		firstIndex := int64(len(dh.entryStream))
 		storeLastName, loadErr := wfs.metaCache.ListDirectoryEntries(listingCtx, dirPath, lastEntryName, false, int64(batchSize), func(entry *filer.Entry) (bool, error) {
-			currentIndex := int64(len(dh.entryStream))
 			dh.entryStream = append(dh.entryStream, entry)
-			if !processEachEntryFn(entry, currentIndex) {
-				bufferFull = true
-				return false, nil
-			}
 			return true, nil
 		})
 		if loadErr != nil {
@@ -411,6 +411,12 @@ func (wfs *WFS) doReadDirectory(ctx context.Context, input *fuse.ReadIn, out Dir
 			return fuse.EIO
 		}
 		dh.lastListedName = storeLastName
+		for index := firstIndex; index < int64(len(dh.entryStream)); index++ {
+			if !processEachEntryFn(dh.entryStream[index], index) {
+				bufferFull = true
+				break
+			}
+		}
 
 		// The store reaching nothing is the only sound end-of-directory signal:
 		// a batch can come back short because entries expired, not because the
@@ -442,7 +448,7 @@ func (wfs *WFS) readDirectoryDirect(ctx context.Context, input *fuse.ReadIn, out
 	if input.Offset >= dh.entryStreamOffset {
 		if len(dh.entryStream) == 0 && input.Offset > dh.entryStreamOffset {
 			skipCount := uint32(input.Offset-dh.entryStreamOffset) + batchSize
-			entries, snapshotTs, err := loadDirectoryEntriesDirect(listingCtx, wfs, wfs.option.UidGidMapper, dirPath, "", false, skipCount, dh.snapshotTsNs, wfs.option.IncludeSystemEntries)
+			entries, snapshotTs, _, _, err := loadDirectoryEntriesDirect(listingCtx, wfs, wfs.option.UidGidMapper, dirPath, "", false, skipCount, dh.snapshotTsNs, wfs.option.IncludeSystemEntries)
 			if err != nil {
 				if ctx.Err() != nil {
 					return fuse.EINTR
@@ -479,7 +485,7 @@ func (wfs *WFS) readDirectoryDirect(ctx context.Context, input *fuse.ReadIn, out
 			}
 		}
 
-		entries, snapshotTs, err := loadDirectoryEntriesDirect(listingCtx, wfs, wfs.option.UidGidMapper, dirPath, lastEntryName, false, batchSize, dh.snapshotTsNs, wfs.option.IncludeSystemEntries)
+		entries, snapshotTs, listed, _, err := loadDirectoryEntriesDirect(listingCtx, wfs, wfs.option.UidGidMapper, dirPath, lastEntryName, false, batchSize, dh.snapshotTsNs, wfs.option.IncludeSystemEntries)
 		if err != nil {
 			if ctx.Err() != nil {
 				return fuse.EINTR
@@ -500,7 +506,7 @@ func (wfs *WFS) readDirectoryDirect(ctx context.Context, input *fuse.ReadIn, out
 				break
 			}
 		}
-		if !bufferFull && len(entries) < int(batchSize) {
+		if !bufferFull && listed < int(batchSize) {
 			dh.isFinished = true
 			// After a full successful read-through listing, exit direct mode
 			// so subsequent reads can use the cache instead of hitting the filer.
@@ -511,7 +517,11 @@ func (wfs *WFS) readDirectoryDirect(ctx context.Context, input *fuse.ReadIn, out
 	return fuse.OK
 }
 
-func loadDirectoryEntriesDirect(ctx context.Context, client filer_pb.FilerClient, uidGidMapper *meta_cache.UidGidMapper, dirPath util.FullPath, startFileName string, includeStart bool, limit uint32, snapshotTsNs int64, includeSystemEntries bool) ([]*filer.Entry, int64, error) {
+// loadDirectoryEntriesDirect lists up to limit entries from the filer.
+// listed and last are what the filer returned before hidden system entries
+// were dropped (Mountable: a short filtered batch is not the end), so a
+// caller pages and detects the end by them.
+func loadDirectoryEntriesDirect(ctx context.Context, client filer_pb.FilerClient, uidGidMapper *meta_cache.UidGidMapper, dirPath util.FullPath, startFileName string, includeStart bool, limit uint32, snapshotTsNs int64, includeSystemEntries bool) (entries []*filer.Entry, actualSnapshotTsNs int64, listed int, last string, err error) {
 	// limit can be a client-supplied resume offset rather than a batch size, so
 	// preallocating for it would size the slice from where the caller happened to
 	// seek. Reserve a batch and let append find the rest.
@@ -519,11 +529,15 @@ func loadDirectoryEntriesDirect(ctx context.Context, client filer_pb.FilerClient
 	if prealloc > batchSize {
 		prealloc = batchSize
 	}
-	entries := make([]*filer.Entry, 0, prealloc)
-	var actualSnapshotTsNs int64
-	err := client.WithFilerClient(false, func(sc filer_pb.SeaweedFilerClient) error {
+	entries = make([]*filer.Entry, 0, prealloc)
+	err = client.WithFilerClient(false, func(sc filer_pb.SeaweedFilerClient) error {
+		// A retried attempt starts its batch over: what an interrupted
+		// stream delivered would otherwise come twice. (Mountable,
+		// writeitai/seaweedfs branch mountable.)
+		entries, listed, last = entries[:0], 0, ""
 		var innerErr error
 		actualSnapshotTsNs, innerErr = filer_pb.DoSeaweedListWithSnapshot(ctx, sc, dirPath, "", func(entry *filer_pb.Entry, isLast bool) error {
+			listed, last = listed+1, entry.Name
 			if !includeSystemEntries && meta_cache.IsHiddenSystemEntry(string(dirPath), entry.Name) {
 				return nil
 			}
@@ -536,7 +550,7 @@ func loadDirectoryEntriesDirect(ctx context.Context, client filer_pb.FilerClient
 		return innerErr
 	})
 	if err != nil {
-		return nil, actualSnapshotTsNs, err
+		return nil, actualSnapshotTsNs, 0, "", err
 	}
-	return entries, actualSnapshotTsNs, nil
+	return entries, actualSnapshotTsNs, listed, last, nil
 }

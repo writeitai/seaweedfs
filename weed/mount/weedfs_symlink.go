@@ -59,9 +59,15 @@ func (wfs *WFS) Symlink(cancel <-chan struct{}, header *fuse.InHeader, target st
 
 	resp, err := wfs.streamCreateEntry(context.Background(), request)
 	if err == nil {
+		// The inode the filer stored, before anything caches the entry
+		// (Mountable).
+		inode, err = wfs.adoptStoredInode(entryFullPath, request.Entry, resp)
+	}
+	if err == nil {
 		event := resp.GetMetadataEvent()
 		if event == nil {
 			event = metadataCreateEvent(string(dirPath), request.Entry)
+			event.TsNs = ackVersionTsNs(resp)
 		}
 		if applyErr := wfs.applyLocalMetadataEvent(context.Background(), event); applyErr != nil {
 			glog.Warningf("symlink %s: best-effort metadata apply failed: %v", entryFullPath, applyErr)
@@ -78,7 +84,8 @@ func (wfs *WFS) Symlink(cancel <-chan struct{}, header *fuse.InHeader, target st
 		return fuse.EIO
 	}
 
-	inode = wfs.inodeToPath.Lookup(entryFullPath, request.Entry.Attributes.Crtime, false, false, inode, true)
+	// As a symlink (Mountable: see LookupLinked).
+	inode = wfs.inodeToPath.LookupLinked(entryFullPath, request.Entry.Attributes.Crtime, os.ModeSymlink, "", inode, true)
 
 	wfs.outputPbEntry(out, inode, request.Entry)
 
@@ -93,7 +100,7 @@ func (wfs *WFS) Readlink(cancel <-chan struct{}, header *fuse.InHeader) (out []b
 
 	ctx, cancelFunc := ctxFromCancel(cancel)
 	defer cancelFunc()
-	entry, _, status := wfs.maybeLoadEntry(ctx, entryFullPath)
+	_, entry, _, status := wfs.loadInodeEntry(ctx, header.NodeId, entryFullPath)
 	if status != fuse.OK {
 		return nil, status
 	}

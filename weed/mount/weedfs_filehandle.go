@@ -2,13 +2,12 @@ package mount
 
 import (
 	"context"
-	"fmt"
-	"syscall"
 
 	"github.com/seaweedfs/go-fuse/v2/fuse"
-	"github.com/seaweedfs/seaweedfs/weed/cluster/lock_manager"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/util"
+	"google.golang.org/protobuf/proto"
 )
 
 func (wfs *WFS) AcquireHandle(ctx context.Context, inode uint64, flags, uid, gid uint32) (fileHandle *FileHandle, status fuse.Status) {
@@ -33,7 +32,29 @@ func (wfs *WFS) AcquireHandle(ctx context.Context, inode uint64, flags, uid, gid
 	var entry *filer_pb.Entry
 	var entryVersionTsNs entryVersion
 	freshLookup := false
-	if existingFh, found := wfs.fhMap.FindFileHandle(inode); found {
+	// From loading the entry to registering the handle, the inode's lock
+	// is shared: a Link of the inode, which holds it exclusively, cannot
+	// fall between the two and leave the handle with the entry from before
+	// it (Mountable: see inodeLocks).
+	inodeLock := wfs.inodeLocks().AcquireLock("open", inode, util.SharedLock)
+	inodeLocked := true
+	defer func() {
+		if inodeLocked {
+			wfs.inodeLocks().ReleaseLock(inode, inodeLock)
+		}
+	}()
+	existingFh, found := wfs.fhMap.FindFileHandle(inode)
+	if found && !wfs.handleHolds(existingFh) {
+		// The handle holds another object than the inode's (Mountable: see
+		// InodeToPath.Holds): it gets the inode's own back, if it can.
+		var loaded *filer_pb.Entry
+		var loadedVersion entryVersion
+		if path, loaded, loadedVersion, status = wfs.loadInodeEntry(ctx, inode, path); status != fuse.OK {
+			return nil, status
+		}
+		wfs.reclaimHandle(existingFh, loaded, loadedVersion)
+	}
+	if found {
 		entry = existingFh.UpdateEntry(func(entry *filer_pb.Entry) {
 			if entry != nil && existingFh.entry.Attributes == nil {
 				entry.Attributes = &filer_pb.FuseAttributes{}
@@ -41,7 +62,7 @@ func (wfs *WFS) AcquireHandle(ctx context.Context, inode uint64, flags, uid, gid
 		})
 		entryVersionTsNs = entryVersion{tsNs: existingFh.entryVersionTsNs.Load(), signature: existingFh.entryVersionSignature.Load()}
 	} else {
-		entry, entryVersionTsNs, status = wfs.maybeLoadEntry(ctx, path)
+		path, entry, entryVersionTsNs, status = wfs.loadInodeEntry(ctx, inode, path)
 		if status != fuse.OK {
 			return nil, status
 		}
@@ -64,6 +85,9 @@ func (wfs *WFS) AcquireHandle(ctx context.Context, inode uint64, flags, uid, gid
 	}
 	// need to AcquireFileHandle again to ensure correct handle counter
 	var existed bool
+	if afterOpenLoaded != nil {
+		afterOpenLoaded(inode)
+	}
 	fileHandle, existed = wfs.fhMap.AcquireFileHandle(wfs, inode, entry, entryVersionTsNs.tsNs, entryVersionTsNs.signature)
 	fileHandle.RememberPath(path)
 	if existed && freshLookup {
@@ -71,23 +95,18 @@ func (wfs *WFS) AcquireHandle(ctx context.Context, inode uint64, flags, uid, gid
 		// install only state that provably improves on what it holds.
 		fileHandle.installAckedEntry(entry, entryVersionTsNs.tsNs, entryVersionTsNs.signature)
 	}
+	wfs.inodeLocks().ReleaseLock(inode, inodeLock)
+	inodeLocked = false
 
 	// Acquire distributed lock for write opens. The lock is held with
 	// auto-renewal until the file handle is released (close).
 	// Use the filer path as the lock key since inode numbers are
 	// assigned per-mount and differ across mount instances.
-	if wfs.lockClient != nil && flags&fuse.O_ANYWRITE != 0 && fileHandle.dlmLock == nil {
-		owner := fmt.Sprintf("mount-%d", wfs.signature)
-		fileHandle.dlmLock = wfs.lockClient.NewBlockingLongLivedLock(
-			string(path), owner, lock_manager.LiveLockTTL,
-		)
-		if fileHandle.dlmLock == nil {
-			// No lock server is reachable: proceeding would silently drop
-			// cross-mount write serialization, so fail the open instead.
-			wfs.fhMap.ReleaseByHandle(fileHandle.fh)
-			return nil, fuse.Status(syscall.EAGAIN)
+	if flags&fuse.O_ANYWRITE != 0 {
+		if code := wfs.acquireWriteLease(fileHandle, path); code != fuse.OK {
+			wfs.ReleaseHandle(fileHandle.fh)
+			return nil, code
 		}
-		glog.V(1).Infof("DLM lock acquired for %s", path)
 	}
 	return fileHandle, fuse.OK
 }
@@ -145,6 +164,44 @@ func (wfs *WFS) waitForPendingAsyncFlush(ctx context.Context, inode uint64) bool
 	}
 }
 
+// asyncFlushPending reports whether an async flush of inode is pending
+// (Mountable: see Link).
+func (wfs *WFS) asyncFlushPending(inode uint64) bool {
+	wfs.pendingAsyncFlushMu.Lock()
+	defer wfs.pendingAsyncFlushMu.Unlock()
+	_, found := wfs.pendingAsyncFlush[inode]
+	return found
+}
+
 func (wfs *WFS) GetHandle(handleId FileHandleId) *FileHandle {
 	return wfs.fhMap.GetFileHandle(handleId)
+}
+
+// handleHolds reports whether an open handle's entry is its inode's object
+// by the identity rule (Mountable: see InodeToPath.Holds).
+func (wfs *WFS) handleHolds(fh *FileHandle) bool {
+	fh.entry.RLock()
+	defer fh.entry.RUnlock()
+	return fh.entry.Entry != nil && wfs.inodeToPath.HoldsEntry(fh.inode, fh.entry.Entry)
+}
+
+// reclaimHandle installs the inode's own entry on a handle that holds
+// another object, under the handle lock, unless the handle has local
+// writes, which only a flush may settle (Mountable).
+func (wfs *WFS) reclaimHandle(fh *FileHandle, entry *filer_pb.Entry, version entryVersion) {
+	fhActiveLock := wfs.fhLockTable.AcquireLock("reclaimHandle", fh.fh, util.ExclusiveLock)
+	defer wfs.fhLockTable.ReleaseLock(fh.fh, fhActiveLock)
+	if fh.dirtyMetadata || wfs.handleHolds(fh) {
+		return
+	}
+	entry = proto.Clone(entry).(*filer_pb.Entry)
+	fh.dirtyPages.Destroy()
+	fh.dirtyPages = newPageWriter(fh, wfs.option.ChunkSizeLimit)
+	fh.SetEntry(entry)
+	fh.baseEntry.Store(proto.Clone(entry).(*filer_pb.Entry))
+	// Nothing of the previous occupant's state carries over.
+	fh.isDeleted, fh.isRenamed, fh.persistErr, fh.pendingCreate = false, false, 0, false
+	fh.contentType = ""
+	fh.entryVersionTsNs.Store(version.tsNs)
+	fh.entryVersionSignature.Store(version.signature)
 }

@@ -2,6 +2,8 @@ package mount
 
 import (
 	"context"
+	"errors"
+	"syscall"
 	"time"
 
 	"github.com/seaweedfs/go-fuse/v2/fuse"
@@ -37,11 +39,13 @@ func (wfs *WFS) processAsyncFlushItem(item *asyncFlushItem) {
 	defer func() {
 		// Remove from fhMap first (so AcquireFileHandle creates a fresh handle).
 		wfs.fhMap.RemoveFileHandle(item.fh.fh, item.fh.inode)
-		// Then signal completion (unblocks waitForPendingAsyncFlush).
-		close(item.done)
+		// Then signal completion (unblocks waitForPendingAsyncFlush), the
+		// entry gone first, so no one who saw the signal still finds the
+		// flush pending (Mountable: see Link).
 		wfs.pendingAsyncFlushMu.Lock()
 		delete(wfs.pendingAsyncFlush, item.fh.inode)
 		wfs.pendingAsyncFlushMu.Unlock()
+		close(item.done)
 	}()
 	wfs.completeAsyncFlush(item.fh)
 }
@@ -115,8 +119,11 @@ func (wfs *WFS) completeAsyncFlush(fh *FileHandle) {
 // with exponential backoff on transient errors. The chunk data is already on the
 // volume servers at this point; only the filer metadata reference needs persisting.
 func (wfs *WFS) flushMetadataWithRetry(fh *FileHandle, dir, name string, fileFullPath util.FullPath) {
-	err := retryMetadataFlush(context.Background(), func() error {
+	err := retryMetadataFlushIf(context.Background(), func() error {
 		return wfs.flushMetadataToFiler(context.Background(), fh, dir, name, fh.asyncFlushUid, fh.asyncFlushGid)
+	}, func(err error) bool {
+		var refused syscall.Errno
+		return !errors.As(err, &refused) // a refusal stands (Mountable)
 	}, func(nextAttempt, totalAttempts int, backoff time.Duration, err error) {
 		glog.Warningf("completeAsyncFlush %s: retrying metadata flush (attempt %d/%d) after %v: %v",
 			fileFullPath, nextAttempt, totalAttempts, backoff, err)

@@ -3,8 +3,12 @@ package mount
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"github.com/seaweedfs/seaweedfs/weed/pb"
+	"google.golang.org/grpc"
 	"io"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -134,9 +138,24 @@ func (wfs *WFS) doFlush(ctx context.Context, fh *FileHandle, uid, gid uint32, al
 	// flush works at fh level
 	fileFullPath := fh.FullPath()
 	fh.RememberPath(fileFullPath)
-	dir, name := fileFullPath.DirAndName()
 	// send the data to the OS
 	glog.V(4).Infof("doFlush %s fh %d", fileFullPath, fh.fh)
+
+	// Nothing is uploaded for a dirty handle whose flush would not be
+	// written (Mountable: see persistDestination).
+	fhActiveLock := wfs.fhLockTable.AcquireLock("doFlush", fh.fh, util.ExclusiveLock)
+	write, refusal := true, error(nil)
+	if fh.dirtyMetadata {
+		_, write, refusal = wfs.persistDestination(fh, "")
+	}
+	wfs.fhLockTable.ReleaseLock(fh.fh, fhActiveLock)
+	if !write {
+		var refused syscall.Errno
+		if errors.As(refusal, &refused) {
+			return fuse.Status(refused)
+		}
+		return fuse.OK
+	}
 
 	// When writebackCache is enabled and this is a close()-triggered Flush (not fsync),
 	// defer the expensive data upload + metadata flush to a background goroutine.
@@ -165,6 +184,10 @@ func (wfs *WFS) doFlush(ctx context.Context, fh *FileHandle, uid, gid uint32, al
 		}
 	}
 
+	if afterFlushData != nil {
+		afterFlushData(fh)
+	}
+
 	if !fh.dirtyMetadata {
 		return fuse.OK
 	}
@@ -180,13 +203,22 @@ func (wfs *WFS) doFlush(ctx context.Context, fh *FileHandle, uid, gid uint32, al
 		return fuse.Status(syscall.ENOSPC)
 	}
 
-	if err := retryMetadataFlush(ctx, func() error {
-		return wfs.flushMetadataToFiler(ctx, fh, dir, name, uid, gid)
+	if err := retryMetadataFlushIf(ctx, func() error {
+		// The destination is resolved under the handle lock (Mountable):
+		// a rename during the upload above moves it.
+		return wfs.flushMetadataToFiler(ctx, fh, "", "", uid, gid)
+	}, func(err error) bool {
+		var refused syscall.Errno
+		return !errors.As(err, &refused) // a refusal stands (Mountable)
 	}, func(nextAttempt, totalAttempts int, backoff time.Duration, err error) {
 		glog.Warningf("%v fh %d flush: retrying metadata flush (attempt %d/%d) after %v: %v",
 			fileFullPath, fh.fh, nextAttempt, totalAttempts, backoff, err)
 	}); err != nil {
 		glog.Errorf("%v fh %d flush: %v", fileFullPath, fh.fh, err)
+		var refused syscall.Errno
+		if errors.As(err, &refused) {
+			return fuse.Status(refused)
+		}
 		return grpcErrorToFuseStatus(err)
 	}
 
@@ -203,20 +235,24 @@ func (wfs *WFS) doFlush(ctx context.Context, fh *FileHandle, uid, gid uint32, al
 // When -dlm is enabled, the distributed lock is already held by the FileHandle
 // from open-for-write through close, so no additional distributed lock is
 // needed here. The local fhLockTable lock below serializes within this mount.
+//
+// Mountable: with dir and name empty, the destination is the handle's path
+// as it is under the handle lock. Either way, that destination is the one
+// checked, and written to.
 func (wfs *WFS) flushMetadataToFiler(ctx context.Context, fh *FileHandle, dir, name string, uid, gid uint32) error {
-	fileFullPath := fh.FullPath()
-	glog.V(4).Infof("flushMetadataToFiler %s/%s inode %d fh %d", dir, name, fh.inode, fh.fh)
-
 	fhActiveLock := fh.wfs.fhLockTable.AcquireLock("doFlush", fh.fh, util.ExclusiveLock)
 	defer fh.wfs.fhLockTable.ReleaseLock(fh.fh, fhActiveLock)
 
-	// Re-check under the lock: Unlink sets the flag under it, so a flush that
-	// was already past the earlier check cannot write the entry back after
-	// the delete removed it.
-	if fh.isDeleted {
-		glog.V(3).Infof("flushMetadataToFiler %s fh %d: file was unlinked, skipping", fileFullPath, fh.fh)
-		return nil
+	fileFullPath := util.FullPath("")
+	if dir != "" || name != "" {
+		fileFullPath = util.FullPath(dir).Child(name)
 	}
+	fileFullPath, write, err := wfs.persistDestination(fh, fileFullPath)
+	if !write {
+		return err
+	}
+	dir, name = fileFullPath.DirAndName()
+	glog.V(4).Infof("flushMetadataToFiler %s inode %d fh %d", fileFullPath, fh.inode, fh.fh)
 
 	entry := fh.GetEntry()
 	entry.Name = name // this flush may be just after a rename operation
@@ -275,9 +311,13 @@ func (wfs *WFS) flushMetadataToFiler(ctx context.Context, fh *FileHandle, dir, n
 	baseSnapshot := proto.Clone(requestEntry).(*filer_pb.Entry)
 	wfs.mapPbIdFromLocalToFiler(request.Entry)
 
-	resp, err := wfs.streamCreateEntry(ctx, request)
+	resp, err := wfs.persistEntry(ctx, fh, fileFullPath, request)
 	if err != nil {
 		glog.Errorf("fh flush create %s: %v", fileFullPath, err)
+		var refused syscall.Errno
+		if errors.As(err, &refused) {
+			return refused
+		}
 		return fmt.Errorf("fh flush create %s: %v", fileFullPath, err)
 	}
 
@@ -291,7 +331,7 @@ func (wfs *WFS) flushMetadataToFiler(ctx context.Context, fh *FileHandle, dir, n
 	// The filer acknowledged this state at the event's log position (or, for
 	// a no-op create, at the response's log position); older queued
 	// subscription events must not roll the handle back.
-	fh.setAuthoritativeBase(baseSnapshot)
+	wfs.holdFlushAck(fh, baseSnapshot, request.Entry, resp) // Mountable
 	fh.advanceEntryVersion(ackVersionTsNs(resp), resp.GetLogSignature())
 	if applyErr := wfs.applyLocalMetadataEvent(context.Background(), event); applyErr != nil {
 		glog.Warningf("flush %s: best-effort metadata apply failed: %v", fileFullPath, applyErr)
@@ -300,6 +340,7 @@ func (wfs *WFS) flushMetadataToFiler(ctx context.Context, fh *FileHandle, dir, n
 
 	if err == nil {
 		fh.dirtyMetadata = false
+		fh.pendingCreate = false
 	}
 
 	return err
@@ -378,3 +419,154 @@ func (wfs *WFS) maybeMergeChunks(fileFullPath util.FullPath, compactedChunks []*
 
 	return newChunks, nil
 }
+
+// persistDestination is where a flush of fh writes its metadata, path or,
+// when empty, the handle's own, and whether it may: called under the
+// handle lock by every path that writes a handle's entry back, so they
+// agree. An unlinked file is not written, and that is no error (Unlink
+// sets the flag under the lock, so a flush past an earlier check cannot
+// write the entry back after the delete). A path that no longer leads to
+// the handle's inode, detached or bound to another object since, is not
+// written either: that flush and every later one return ESTALE, rather
+// than take the entry over whatever is there now (Mountable).
+func (wfs *WFS) persistDestination(fh *FileHandle, path util.FullPath) (util.FullPath, bool, error) {
+	if path == "" {
+		path = fh.FullPath()
+	}
+	if fh.isDeleted {
+		glog.V(3).Infof("flush %s fh %d: file was unlinked, skipping", path, fh.fh)
+		return path, false, nil
+	}
+	if fh.persistErr == 0 && !wfs.inodeToPath.Bound(path, fh.inode) {
+		glog.Warningf("flush %s fh %d: the path no longer leads to the open file, not writing it", path, fh.fh)
+		fh.persistErr = syscall.ESTALE
+	}
+	// Nor is an entry that is not the inode's object any more, as an open
+	// that loaded it before a Link changed the object's identity holds.
+	if entry := fh.GetEntry().GetEntry(); fh.persistErr == 0 && entry != nil && !wfs.inodeToPath.HoldsEntry(fh.inode, entry) {
+		glog.Warningf("flush %s fh %d: the handle holds another object than its inode's, not writing it", path, fh.fh)
+		fh.persistErr = syscall.ESTALE
+	}
+	if fh.persistErr != 0 {
+		return path, false, fh.persistErr
+	}
+	return path, true, nil
+}
+
+// persistEntry writes a handle's entry with request, on the condition
+// that the filer still has the entry the handle last saw there (its base),
+// or none for a create the filer has not had yet: a check of the binding
+// beforehand alone could be overtaken by a replacement. When the filer has
+// another entry, it is read: still the handle's object, it becomes the
+// base and the write is tried again, last writer winning on content as
+// before; another object, or none, and the handle refuses for good
+// (ESTALE), keeping its writes. Called under the handle lock (Mountable).
+func (wfs *WFS) persistEntry(ctx context.Context, fh *FileHandle, path util.FullPath, request *filer_pb.CreateEntryRequest) (*filer_pb.CreateEntryResponse, error) {
+	for range 3 {
+		// Only a create waiting for this flush expects no entry; any other
+		// handle expects its base, in the form the filer stores it.
+		var expected *filer_pb.Entry
+		if base := fh.baseEntry.Load(); base != nil && !fh.pendingCreate {
+			expected = storedForm(base)
+			expected.Name = request.Entry.Name // a rename moved the base too
+			wfs.mapPbIdFromLocalToFiler(expected)
+			// The hard-link group and its counter belong to the group,
+			// which other names change: the write keeps them as the filer
+			// had them, never the handle's own copy, perhaps older.
+			request.Entry.HardLinkId, request.Entry.HardLinkCounter = expected.HardLinkId, expected.HardLinkCounter
+		}
+		request.Condition = entryCondition(expected)
+		resp, err := wfs.createEntryOnce(ctx, request)
+		if err != nil {
+			return nil, err
+		}
+		if resp.GetErrorCode() != filer_pb.FilerError_PRECONDITION_FAILED {
+			if resp.GetError() != "" {
+				return nil, fmt.Errorf("create %s: %s", path, resp.GetError())
+			}
+			return resp, nil
+		}
+		current, version, _, err := filer_pb.GetEntry(ctx, wfs, path)
+		if errors.Is(err, filer_pb.ErrNotFound) || err == nil && (current == nil || !wfs.inodeToPath.HoldsEntry(fh.inode, current)) {
+			glog.Warningf("flush %s fh %d: the filer has another object there, not writing it", path, fh.fh)
+			fh.persistErr = syscall.ESTALE
+			return nil, fh.persistErr
+		}
+		if err != nil {
+			return nil, err
+		}
+		wfs.mapPbIdFromFilerToLocal(current)
+		fh.setAuthoritativeBase(current)
+		fh.advanceEntryVersion(version, 0)
+		fh.pendingCreate = false // it is at the filer, as this handle's object
+	}
+	return nil, fmt.Errorf("create %s: the entry kept changing", path)
+}
+
+// holdFlushAck makes what the filer acknowledged for a flush the handle's
+// base: the stored entry its event carries, else the entry sent; the
+// group's counter as written, in the handle's entry too (Mountable).
+func (wfs *WFS) holdFlushAck(fh *FileHandle, sent, written *filer_pb.Entry, resp *filer_pb.CreateEntryResponse) {
+	base := sent
+	if stored := resp.GetMetadataEvent().GetEventNotification().GetNewEntry(); stored != nil {
+		base = proto.Clone(stored).(*filer_pb.Entry)
+		filer_pb.AfterEntryDeserialization(base.GetChunks())
+		wfs.mapPbIdFromFilerToLocal(base)
+	}
+	if len(written.GetHardLinkId()) > 0 {
+		base.HardLinkCounter = written.HardLinkCounter
+		fh.UpdateEntry(func(e *filer_pb.Entry) {
+			if e != nil {
+				e.HardLinkCounter = written.HardLinkCounter
+			}
+		})
+	}
+	fh.setAuthoritativeBase(base)
+	fh.pendingCreate = false // the filer has it now
+}
+
+// storedForm is entry, cloned, as the filer store gives it back: chunk file
+// IDs both as strings and parsed, manifests first, no MIME type for an
+// octet stream, so an unchanged entry compares equal to what is stored
+// (Mountable).
+func storedForm(entry *filer_pb.Entry) *filer_pb.Entry {
+	stored := proto.Clone(entry).(*filer_pb.Entry)
+	filer_pb.BeforeEntrySerialization(stored.GetChunks())
+	filer_pb.AfterEntryDeserialization(stored.GetChunks())
+	// The filer stores manifests first (cleanupChunks), and no MIME type
+	// for an octet stream (normalizeEntryMimeForStore).
+	manifests, data := filer.SeparateManifestChunks(stored.GetChunks())
+	if len(manifests) > 0 {
+		stored.Chunks = append(manifests, data...)
+	}
+	if a := stored.GetAttributes(); a != nil && !stored.IsDirectory && a.Mime == "application/octet-stream" {
+		a.Mime = ""
+	}
+	return stored
+}
+
+// entryCondition is the condition that the stored entry is expected, or
+// that there is none for a nil expected.
+func entryCondition(expected *filer_pb.Entry) *filer_pb.WriteCondition {
+	return &filer_pb.WriteCondition{Clauses: []*filer_pb.WriteCondition_Clause{{
+		Kind:          filer_pb.WriteCondition_IF_ENTRY_EQUAL,
+		ExpectedEntry: expected,
+	}}}
+}
+
+// createEntryOnce sends one CreateEntry to the current filer: unary, with
+// neither the stream's fallback nor WithFilerClient's retries, and its
+// refusal typed in the response (Mountable).
+func (wfs *WFS) createEntryOnce(ctx context.Context, req *filer_pb.CreateEntryRequest) (resp *filer_pb.CreateEntryResponse, err error) {
+	address := wfs.option.FilerAddresses[atomic.LoadInt32(&wfs.option.filerIndex)].ToGrpcAddress()
+	err = pb.WithGrpcClient(ctx, false, wfs.signature, func(conn *grpc.ClientConn) error {
+		var callErr error
+		resp, callErr = filer_pb.NewSeaweedFilerClient(conn).CreateEntry(ctx, req)
+		return callErr
+	}, address, false, wfs.option.GrpcDialOption)
+	return resp, err
+}
+
+// afterFlushData, when set (by tests), runs in doFlush once the data is
+// uploaded, before the metadata is.
+var afterFlushData func(fh *FileHandle)
