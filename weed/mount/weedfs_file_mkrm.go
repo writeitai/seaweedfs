@@ -59,11 +59,15 @@ func (wfs *WFS) Create(cancel <-chan struct{}, in *fuse.CreateIn, name string, o
 		inode = wfs.inodeToPath.LookupLinked(entryFullPath, newEntry.Attributes.Crtime, PbEntryKind(newEntry), string(newEntry.HardLinkId), newEntry.Attributes.Inode, true)
 		fileHandle, status := wfs.AcquireHandle(ctx, inode, in.Flags, in.Uid, in.Gid)
 		if status != fuse.OK {
+			// An error reply gives the kernel no reference to forget, so the
+			// lookup's goes back here (Mountable).
+			wfs.Forget(inode, 1)
 			return status
 		}
 		if in.Flags&syscall.O_TRUNC != 0 && in.Flags&fuse.O_ANYWRITE != 0 {
 			if code = wfs.truncateEntry(entryFullPath, newEntry); code != fuse.OK {
 				wfs.ReleaseHandle(fileHandle.fh)
+				wfs.Forget(inode, 1)
 				return code
 			}
 			newEntry = fileHandle.GetEntry().GetEntry()
@@ -103,11 +107,15 @@ func (wfs *WFS) Create(cancel <-chan struct{}, in *fuse.CreateIn, name string, o
 		inode = wfs.inodeToPath.LookupLinked(entryFullPath, newEntry.Attributes.Crtime, PbEntryKind(newEntry), string(newEntry.HardLinkId), newEntry.Attributes.Inode, true)
 		fileHandle, status := wfs.AcquireHandle(ctx, inode, in.Flags, in.Uid, in.Gid)
 		if status != fuse.OK {
+			// An error reply gives the kernel no reference to forget, so the
+			// lookup's goes back here (Mountable).
+			wfs.Forget(inode, 1)
 			return status
 		}
 		if in.Flags&syscall.O_TRUNC != 0 && in.Flags&fuse.O_ANYWRITE != 0 {
 			if code = wfs.truncateEntry(entryFullPath, newEntry); code != fuse.OK {
 				wfs.ReleaseHandle(fileHandle.fh)
+				wfs.Forget(inode, 1)
 				return code
 			}
 			newEntry = fileHandle.GetEntry().GetEntry()

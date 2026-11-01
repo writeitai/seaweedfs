@@ -187,7 +187,7 @@ func (wfs *WFS) ReadDirPlus(cancel <-chan struct{}, input *fuse.ReadIn, out *fus
 	return wfs.doReadDirectory(ctx, input, fuseDirEntryList{out}, true)
 }
 
-func (wfs *WFS) doReadDirectory(ctx context.Context, input *fuse.ReadIn, out DirEntrySink, isPlusMode bool) fuse.Status {
+func (wfs *WFS) doReadDirectory(ctx context.Context, input *fuse.ReadIn, out DirEntrySink, isPlusMode bool) (status fuse.Status) {
 	listingCtx := filer_pb.WithChunksOmitted(ctx)
 
 	// Get the directory handle and lock it for the duration of this operation.
@@ -221,6 +221,17 @@ func (wfs *WFS) doReadDirectory(ctx context.Context, input *fuse.ReadIn, out Dir
 	// Only a reference makes a child worth entering in the inode table: without
 	// one nothing ever arrives to take the entry back out again.
 	takesLookupRef := isPlusMode && out.TakesLookupRef()
+	// An error reply drops the entries already in the sink, but not the
+	// references they took: once one is in, a later failure (an interrupt,
+	// a filer error) ends the reply short instead, and the next readdir
+	// meets it (Mountable).
+	referenced := false
+	defer func() {
+		if status != fuse.OK && referenced {
+			glog.V(1).Infof("readdir %d: replying with the entries so far after %v", input.NodeId, status)
+			status = fuse.OK
+		}
+	}()
 
 	// index is the position in entryStream, used to calculate the offset for next readdir
 	processEachEntryFn := func(entry *filer.Entry, index int64) bool {
@@ -261,6 +272,7 @@ func (wfs *WFS) doReadDirectory(ctx context.Context, input *fuse.ReadIn, out Dir
 			if takesLookupRef && !wfs.inodeToPath.IncrementNlookup(inode) {
 				wfs.inodeToPath.LookupLinked(childPath, entry.Crtime.Unix(), EntryKind(entry.IsDirectory(), entry.Mode), string(entry.HardLinkId), entry.Inode, true)
 			}
+			referenced = referenced || takesLookupRef
 		}
 		return true
 	}
