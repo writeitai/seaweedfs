@@ -187,6 +187,7 @@ type WFS struct {
 	atimeMap          map[uint64]time.Time // inode -> atime, in-memory only, bounded
 	dirMtimeMu        sync.Mutex
 	dirMtimeMap       map[uint64]time.Time // inode -> mtime/ctime, in-memory overlay for dirs
+	dirReports        map[uint64]dirReport // inode -> the mtime reported for a directory, for a front end without kernel notifications; under dirMtimeMu
 	removedDirMu      sync.Mutex
 	removedDirs       map[uint64]*filer_pb.Entry // inode -> last-known entry of a directory removed while still referenced
 	entryValidSec     uint64                     // kernel FUSE entry cache TTL in seconds
@@ -1032,6 +1033,9 @@ func (wfs *WFS) onEntryInvalidation(invalidation meta_cache.EntryInvalidation) {
 		listener(invalidation)
 	}
 	wfs.invalidateKernelDirListing(invalidation.Path)
+	if invalidation.Entry == nil {
+		wfs.noteNameVacated(invalidation.Path)
+	}
 	// An inode with an open handle has its rename applied above, together with
 	// the handle's own path bookkeeping. This is for the rest: the kernel goes
 	// on addressing a moved inode by nodeid whether or not anything holds it
@@ -1069,6 +1073,31 @@ func (wfs *WFS) invalidateKernelDirListing(path util.FullPath) {
 	if status := server.InodeNotify(dirInode, 0, -1); status != fuse.OK && status != fuse.ENOENT && status != fuse.ENOSYS {
 		glog.V(4).Infof("invalidate kernel listing of %s: %v", dir, status)
 	}
+}
+
+// noteNameVacated tells a client the mount has no kernel channel to that a
+// name left its directory elsewhere, deleted or moved away. An NFS client
+// keeps a name it looked up until the directory's mtime changes, answering
+// ESTALE for it meanwhile, and the filer leaves the directory's mtime alone
+// when another client removes a child, so the mount moves it here, as it
+// does for its own removals. A FUSE kernel is told by
+// invalidateKernelDirListing instead. A directory nothing looked up has no
+// inode and no client holding its names, so it is skipped.
+func (wfs *WFS) noteNameVacated(path util.FullPath) {
+	if wfs.fuseServer != nil {
+		return
+	}
+	dir, _ := path.DirAndName()
+	wfs.inodeToPath.withInode(util.FullPath(dir), func(inode uint64) {
+		wfs.dirMtimeMu.Lock()
+		defer wfs.dirMtimeMu.Unlock()
+		if wfs.dirReports == nil {
+			wfs.dirReports = make(map[uint64]dirReport)
+		}
+		r := wfs.dirReports[inode]
+		r.pending = true
+		wfs.dirReports[inode] = r
+	})
 }
 
 // MountRoot is the filer path this mount is rooted at. Event paths are absolute
