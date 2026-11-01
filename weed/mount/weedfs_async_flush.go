@@ -119,7 +119,8 @@ func (wfs *WFS) completeAsyncFlush(fh *FileHandle) {
 // with exponential backoff on transient errors. The chunk data is already on the
 // volume servers at this point; only the filer metadata reference needs persisting.
 func (wfs *WFS) flushMetadataWithRetry(fh *FileHandle, dir, name string, fileFullPath util.FullPath) {
-	err := retryMetadataFlushIf(context.Background(), func() error {
+	// Waits out the metadata rate, as Release does (Mountable).
+	err := retryMetadataFlushIf(waitingAtMetadataRate(context.Background(), nil), func() error {
 		return wfs.flushMetadataToFiler(context.Background(), fh, dir, name, fh.asyncFlushUid, fh.asyncFlushGid)
 	}, func(err error) bool {
 		var refused syscall.Errno

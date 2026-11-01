@@ -442,7 +442,7 @@ func TestSaveEntryKeepsOpenHandleAheadOfOlderEvents(t *testing.T) {
 		Name:       "file",
 		Attributes: &filer_pb.FuseAttributes{FileSize: 200},
 	}
-	if code := wfs.saveEntry(util.FullPath("/dir/file"), saved); code != fuse.OK {
+	if code := wfs.saveEntry(context.Background(), util.FullPath("/dir/file"), saved); code != fuse.OK {
 		t.Fatalf("saveEntry status = %v, want OK", code)
 	}
 
@@ -716,7 +716,7 @@ func TestEventlessSaveAckStillFencesOlderEvents(t *testing.T) {
 		Name:       "file",
 		Attributes: &filer_pb.FuseAttributes{FileSize: 200},
 	}
-	if code := wfs.saveEntry(util.FullPath("/dir/file"), saved); code != fuse.OK {
+	if code := wfs.saveEntry(context.Background(), util.FullPath("/dir/file"), saved); code != fuse.OK {
 		t.Fatalf("saveEntry status = %v, want OK", code)
 	}
 
@@ -1366,7 +1366,7 @@ func TestAckedSaveInstallsIntoRacingOpenHandle(t *testing.T) {
 		Name:       "file",
 		Attributes: &filer_pb.FuseAttributes{FileSize: 200},
 	}
-	if code := wfs.saveEntry(util.FullPath("/dir/file"), saved); code != fuse.OK {
+	if code := wfs.saveEntry(context.Background(), util.FullPath("/dir/file"), saved); code != fuse.OK {
 		t.Fatalf("saveEntry status = %v, want OK", code)
 	}
 
@@ -1384,7 +1384,7 @@ func TestAckedSaveInstallsIntoRacingOpenHandle(t *testing.T) {
 		Attributes: &filer_pb.FuseAttributes{FileSize: 88},
 	}, 0, 0)
 	dirtyFh.dirtyMetadata = true
-	if code := wfs.saveEntry(util.FullPath("/dir/dirty"), &filer_pb.Entry{
+	if code := wfs.saveEntry(context.Background(), util.FullPath("/dir/dirty"), &filer_pb.Entry{
 		Name:       "dirty",
 		Attributes: &filer_pb.FuseAttributes{FileSize: 200},
 	}); code != fuse.OK {
@@ -1577,7 +1577,7 @@ func TestEventlessSaveVersionsCacheEntry(t *testing.T) {
 	wfs.inodeToPath.Lookup(util.FullPath("/dir"), time.Now().Unix(), true, false, 0, false)
 	wfs.inodeToPath.MarkChildrenCached(util.FullPath("/dir"))
 
-	if code := wfs.saveEntry(util.FullPath("/dir/file"), &filer_pb.Entry{
+	if code := wfs.saveEntry(context.Background(), util.FullPath("/dir/file"), &filer_pb.Entry{
 		Name:       "file",
 		Attributes: &filer_pb.FuseAttributes{FileSize: 200, FileMode: 0100644},
 	}); code != fuse.OK {

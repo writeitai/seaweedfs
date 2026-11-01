@@ -53,7 +53,7 @@ func (wfs *WFS) doRename(ctx context.Context, request *filer_pb.StreamRenameEntr
 
 		stream, streamErr := client.StreamRenameEntry(streamCtx, request)
 		if streamErr != nil {
-			return fmt.Errorf("dir AtomicRenameEntry %s => %s : %v", oldPath, newPath, streamErr)
+			return fmt.Errorf("dir AtomicRenameEntry %s => %s : %w", oldPath, newPath, streamErr)
 		}
 		for {
 			resp, recvErr := stream.Recv()
@@ -64,7 +64,7 @@ func (wfs *WFS) doRename(ctx context.Context, request *filer_pb.StreamRenameEntr
 				if ctx.Err() == nil && streamCtx.Err() != nil {
 					return fmt.Errorf("dir Rename %s => %s: no event for %s", oldPath, newPath, wfs.filerRPCWait())
 				}
-				return fmt.Errorf("dir Rename %s => %s receive: %v", oldPath, newPath, recvErr)
+				return fmt.Errorf("dir Rename %s => %s receive: %w", oldPath, newPath, recvErr)
 			}
 			inHandler.Store(true)
 			err := wfs.handleRenameResponse(ctx, resp, newPath, newPathLock)
@@ -388,8 +388,10 @@ func (wfs *WFS) Rename(cancel <-chan struct{}, in *fuse.RenameIn, oldName string
 		// BEFORE any async flush interference.
 		if fh, ok := wfs.fhMap.FindFileHandle(sourceInode); ok && fh.dirtyMetadata {
 			glog.V(4).Infof("dir Rename %s: flushing deferred metadata before rename", oldPath)
-			// Prerequisite for the rename, so it must complete: non-cancellable context.
-			if flushStatus := wfs.doFlush(context.Background(), fh, oldEntry.Attributes.Uid, oldEntry.Attributes.Gid, false); flushStatus != fuse.OK {
+			// Prerequisite for the rename, so it must complete: non-cancellable
+			// context, but a wait at the metadata rate ends on the interrupt,
+			// with nothing renamed (Mountable).
+			if flushStatus := wfs.doFlush(waitingAtMetadataRate(context.Background(), cancel), fh, oldEntry.Attributes.Uid, oldEntry.Attributes.Gid, false); flushStatus != fuse.OK {
 				glog.Warningf("dir Rename %s: flush before rename failed: %v", oldPath, flushStatus)
 				return flushStatus
 			}
@@ -413,6 +415,11 @@ func (wfs *WFS) Rename(cancel <-chan struct{}, in *fuse.RenameIn, oldName string
 	// makes it. Windows is where this bites: the close carrying the flush runs
 	// after the application's CloseHandle returned, so the flush can land on
 	// top of what the rename just put there.
+	//
+	// Mountable: the mark is held only while the rename is sent. A rename
+	// refused at the metadata rate replaced nothing, so the destination's
+	// handle saves its writes while the rename waits.
+	markTarget, unmarkTarget := func() {}, func() {}
 	if in.Flags == RenameEmptyFlag {
 		targetInode, targetMapped := wfs.inodeToPath.GetInode(newPath)
 		if !targetMapped && newEntry != nil && newEntry.Attributes != nil {
@@ -426,12 +433,14 @@ func (wfs *WFS) Rename(cancel <-chan struct{}, in *fuse.RenameIn, oldName string
 			// marked is skipped and takes its handle with it, past the reach
 			// of the restore below.
 			wfs.waitForPendingAsyncFlush(context.Background(), targetInode)
-			epoch := wfs.markHandleDeleted(targetInode)
+			var epoch uint64
+			markTarget = func() { epoch = wfs.markHandleDeleted(targetInode) }
 			// A rename that does not happen leaves the destination where it
 			// was, so its handle has to go back to writing that name.
+			unmarkTarget = func() { wfs.clearHandleDeleted(targetInode, epoch) }
 			defer func() {
 				if code != fuse.OK {
-					wfs.clearHandleDeleted(targetInode, epoch)
+					unmarkTarget()
 				}
 			}()
 		}
@@ -446,9 +455,20 @@ func (wfs *WFS) Rename(cancel <-chan struct{}, in *fuse.RenameIn, oldName string
 		Signatures:   []int32{wfs.signature},
 	}
 
-	err := wfs.doRename(context.Background(), request, oldPath, newPath, &newPathLock)
+	mutate := waitingAtMetadataRate(context.Background(), cancel)
+	err := atMetadataRate(mutate, "rename "+string(oldPath), func() error {
+		markTarget()
+		err := wfs.doRename(mutate, request, oldPath, newPath, &newPathLock)
+		if metadataRateRefused(err) {
+			unmarkTarget()
+		}
+		return err
+	})
 	if err != nil {
 		glog.V(0).Infof("Rename %s => %s: %v", oldPath, newPath, err)
+		if errors.Is(err, errMetadataRateInterrupted) {
+			return fuse.EINTR
+		}
 		// Map error strings to FUSE status codes. String matching is used
 		// instead of raw errno to stay portable across platforms (errno
 		// numeric values differ between Linux and macOS).

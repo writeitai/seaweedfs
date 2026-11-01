@@ -2,6 +2,7 @@ package mount
 
 import (
 	"context"
+	"errors"
 	"time"
 )
 
@@ -24,12 +25,14 @@ func retryMetadataFlush(ctx context.Context, flush func() error, onRetry func(ne
 // retryMetadataFlushIf retries flush with exponential backoff, stopping early
 // when shouldRetry returns false (clearly permanent errors) or when ctx is
 // cancelled (the FUSE request was interrupted, e.g. the process was killed).
+// Under a ctx marked by waitingAtMetadataRate an attempt the metadata rate
+// refuses waits that out, counting as one attempt (Mountable).
 func retryMetadataFlushIf(ctx context.Context, flush func() error, shouldRetry func(error) bool, onRetry func(nextAttempt, totalAttempts int, backoff time.Duration, err error)) error {
 	totalAttempts := metadataFlushRetries + 1
 	var err error
 	for attempt := 1; attempt <= totalAttempts; attempt++ {
-		err = flush()
-		if err == nil {
+		err = atMetadataRate(ctx, "metadata update", flush)
+		if err == nil || errors.Is(err, errMetadataRateInterrupted) {
 			break
 		}
 		if attempt == totalAttempts {

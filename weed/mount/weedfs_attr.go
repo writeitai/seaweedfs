@@ -78,9 +78,7 @@ func (wfs *WFS) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *fuse
 		// alone, pages beyond the new size come back with the next flush and
 		// grow the file again, so turn them into chunks first. Runs before
 		// the entry locks below: the flush takes its own.
-		ctx, cancelFunc := context.WithTimeout(context.Background(), metadataFlushTimeout)
-		flushStatus := wfs.doFlush(ctx, fh, input.Uid, input.Gid, false)
-		cancelFunc()
+		flushStatus := wfs.doFlush(waitingAtMetadataRate(context.Background(), cancel), fh, input.Uid, input.Gid, false)
 		if flushStatus != fuse.OK {
 			return flushStatus
 		}
@@ -208,10 +206,11 @@ func (wfs *WFS) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *fuse
 		return fuse.OK
 	}
 
+	mutate := waitingAtMetadataRate(context.Background(), cancel)
 	if truncated {
-		return wfs.saveEntry(path, entry)
+		return wfs.saveEntry(mutate, path, entry)
 	}
-	return wfs.saveAttributes(path, entry)
+	return wfs.saveAttributes(mutate, path, entry)
 
 }
 
@@ -350,7 +349,7 @@ func (wfs *WFS) touchDirMtimeCtime(dirPath util.FullPath) {
 	dirEntry.Attributes.MtimeNs = int32(now.Nanosecond())
 	dirEntry.Attributes.Ctime = now.Unix()
 	dirEntry.Attributes.CtimeNs = int32(now.Nanosecond())
-	wfs.saveAttributes(dirPath, dirEntry)
+	wfs.saveAttributes(context.Background(), dirPath, dirEntry)
 }
 
 // touchDirMtimeCtimeLocal updates a directory's mtime and ctime in an in-memory

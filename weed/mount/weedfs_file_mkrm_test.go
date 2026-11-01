@@ -286,7 +286,7 @@ func TestTruncateEntryClearsDirtyPagesForOpenHandle(t *testing.T) {
 		},
 	}
 
-	if status := wfs.truncateEntry(fullPath, truncatedEntry); status != fuse.OK {
+	if status := wfs.truncateEntry(context.Background(), fullPath, truncatedEntry); status != fuse.OK {
 		t.Fatalf("truncateEntry status = %v, want OK", status)
 	}
 	if fh.dirtyPages == oldDirtyPages {

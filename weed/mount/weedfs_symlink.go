@@ -2,6 +2,7 @@ package mount
 
 import (
 	"context"
+	"errors"
 	"os"
 	"syscall"
 	"time"
@@ -57,7 +58,12 @@ func (wfs *WFS) Symlink(cancel <-chan struct{}, header *fuse.InHeader, target st
 
 	wfs.mapPbIdFromLocalToFiler(request.Entry)
 
-	resp, err := wfs.streamCreateEntry(context.Background(), request)
+	mutate := waitingAtMetadataRate(context.Background(), cancel)
+	var resp *filer_pb.CreateEntryResponse
+	err := atMetadataRate(mutate, "symlink "+string(entryFullPath), func() (err error) {
+		resp, err = wfs.streamCreateEntry(mutate, request)
+		return err
+	})
 	if err == nil {
 		// The inode the filer stored, before anything caches the entry
 		// (Mountable).
@@ -81,6 +87,9 @@ func (wfs *WFS) Symlink(cancel <-chan struct{}, header *fuse.InHeader, target st
 
 	if err != nil {
 		glog.V(0).Infof("Symlink %s => %s: %v", entryFullPath, target, err)
+		if errors.Is(err, errMetadataRateInterrupted) {
+			return fuse.EINTR
+		}
 		return fuse.EIO
 	}
 
