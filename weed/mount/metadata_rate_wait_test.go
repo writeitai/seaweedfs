@@ -11,6 +11,7 @@ import (
 
 	"github.com/seaweedfs/go-fuse/v2/fuse"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -254,18 +255,22 @@ func TestFlushSpendingCapIsNotWaitedOut(t *testing.T) {
 }
 
 // rateStore is the store filer behind a gateway at its metadata rate: the
-// next refuse creates, updates or deletes are turned away, changing
-// nothing.
+// next refuse creates, updates, deletes or renames (only: of that kind)
+// are turned away, changing nothing.
 type rateStore struct {
 	*storeFiler
 	mu     sync.Mutex
+	only   string
 	refuse int
 	sent   int
 }
 
-func (f *rateStore) refused() bool {
+func (f *rateStore) refused(kind string) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.only != "" && f.only != kind {
+		return false
+	}
 	f.sent++
 	if f.refuse > 0 {
 		f.refuse--
@@ -277,40 +282,68 @@ func (f *rateStore) refused() bool {
 func (f *rateStore) next(n int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.refuse, f.sent = n, 0
+	f.refuse, f.sent, f.only = n, 0, ""
+}
+
+func (f *rateStore) nextOnly(kind string, n int) {
+	f.next(n)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.only = kind
 }
 
 func (f *rateStore) CreateEntry(ctx context.Context, r *filer_pb.CreateEntryRequest) (*filer_pb.CreateEntryResponse, error) {
-	if f.refused() {
+	if f.refused("create") {
 		return nil, errRate
 	}
 	return f.storeFiler.CreateEntry(ctx, r)
 }
 
 func (f *rateStore) UpdateEntry(ctx context.Context, r *filer_pb.UpdateEntryRequest) (*filer_pb.UpdateEntryResponse, error) {
-	if f.refused() {
+	if f.refused("update") {
 		return nil, errRate
 	}
 	return f.storeFiler.UpdateEntry(ctx, r)
 }
 
 func (f *rateStore) DeleteEntry(ctx context.Context, r *filer_pb.DeleteEntryRequest) (*filer_pb.DeleteEntryResponse, error) {
-	if f.refused() {
+	if f.refused("delete") {
 		return nil, errRate
 	}
 	return f.storeFiler.DeleteEntry(ctx, r)
 }
 
-// Mkdir, an eager Create, Symlink, SetAttr, Link and Unlink each wait at
-// the metadata rate and then do what they would have done, once.
-func TestMutationsWaitAtMetadataRate(t *testing.T) {
-	fastMetadataRate(t)
+func (f *rateStore) StreamRenameEntry(r *filer_pb.StreamRenameEntryRequest, stream grpc.ServerStreamingServer[filer_pb.StreamRenameEntryResponse]) error {
+	if f.refused("rename") {
+		return errRate
+	}
+	return f.storeFiler.StreamRenameEntry(r, stream)
+}
+
+// rateStoreWFS is a mount on a rateStore, with eager creates.
+func rateStoreWFS(t *testing.T) (*WFS, *storeFiler, *rateStore) {
+	t.Helper()
 	store := newStoreFiler()
 	wfs := newLinkTestWFS(t, store)
 	f := &rateStore{storeFiler: store}
 	startFakeFiler(t, wfs, f)
 	wfs.lockClient = nil
 	wfs.option.EagerFilerCreate = true
+	return wfs, store, f
+}
+
+// interruptSoon is a FUSE interrupt that comes 50ms from now.
+func interruptSoon() chan struct{} {
+	interrupt := make(chan struct{})
+	time.AfterFunc(50*time.Millisecond, func() { close(interrupt) })
+	return interrupt
+}
+
+// Mkdir, an eager Create, Symlink, SetAttr, Link, Rename and Unlink each
+// wait at the metadata rate and then do what they would have done, once.
+func TestMutationsWaitAtMetadataRate(t *testing.T) {
+	fastMetadataRate(t)
+	wfs, store, f := rateStoreWFS(t)
 	h := fuse.InHeader{NodeId: 1, Caller: fuse.Caller{Owner: fuse.Owner{Uid: 99, Gid: 100}}}
 	const refusals = 5
 	check := func(op string, st fuse.Status, done bool) {
@@ -348,9 +381,87 @@ func TestMutationsWaitAtMetadataRate(t *testing.T) {
 	check("link", st, store.lookup("/hard") != nil && store.lookup("/file").GetHardLinkCounter() == 2)
 
 	f.next(refusals)
-	st = wfs.Unlink(nil, &h, "hard")
-	check("unlink", st, store.lookup("/hard") == nil)
+	st = wfs.Rename(nil, &fuse.RenameIn{InHeader: h, Newdir: 1}, "hard", "moved")
+	check("rename", st, store.lookup("/hard") == nil && store.lookup("/moved") != nil)
+
+	f.next(refusals)
+	st = wfs.Unlink(nil, &h, "moved")
+	check("unlink", st, store.lookup("/moved") == nil)
 	if c := store.lookup("/file").GetHardLinkCounter(); c > 1 {
 		t.Fatalf("hard-link counter %d after the unlink", c)
+	}
+}
+
+// An open file whose metadata is not written yet is written before it is
+// linked or renamed: that write waits at the metadata rate too.
+func TestDirtySourceWaitsAtMetadataRate(t *testing.T) {
+	fastMetadataRate(t)
+	wfs, store, f := rateStoreWFS(t)
+	h := fuse.InHeader{NodeId: 1, Caller: fuse.Caller{Owner: fuse.Owner{Uid: 99, Gid: 100}}}
+	var created fuse.CreateOut
+	if st := wfs.Create(nil, &fuse.CreateIn{InHeader: h, Flags: syscall.O_WRONLY | syscall.O_CREAT, Mode: 0o644}, "file", &created); st != fuse.OK {
+		t.Fatalf("Create: %v", st)
+	}
+	defer wfs.ReleaseHandle(FileHandleId(created.Fh))
+	fh := wfs.GetHandle(FileHandleId(created.Fh))
+
+	fh.dirtyMetadata = true
+	f.nextOnly("create", 5)
+	if st := wfs.Rename(nil, &fuse.RenameIn{InHeader: h, Newdir: 1}, "file", "renamed"); st != fuse.OK || store.lookup("/renamed") == nil {
+		t.Fatalf("Rename of a dirty file at the metadata rate: %v", st)
+	}
+	if fh.dirtyMetadata {
+		t.Fatal("the rename's flush left the handle dirty")
+	}
+
+	fh.dirtyMetadata = true
+	f.nextOnly("create", 5)
+	if st := wfs.Link(nil, &fuse.LinkIn{InHeader: h, Oldnodeid: created.NodeId}, "hard", &fuse.EntryOut{}); st != fuse.OK || store.lookup("/hard") == nil {
+		t.Fatalf("Link of a dirty file at the metadata rate: %v", st)
+	}
+}
+
+// An interrupted Unlink deleted nothing: the open file's writes are still
+// saved.
+func TestUnlinkInterruptedAtMetadataRateKeepsWrites(t *testing.T) {
+	fastMetadataRate(t)
+	wfs, store, f := rateStoreWFS(t)
+	h := fuse.InHeader{NodeId: 1, Caller: fuse.Caller{Owner: fuse.Owner{Uid: 99, Gid: 100}}}
+	var created fuse.CreateOut
+	if st := wfs.Create(nil, &fuse.CreateIn{InHeader: h, Flags: syscall.O_WRONLY | syscall.O_CREAT, Mode: 0o644}, "file", &created); st != fuse.OK {
+		t.Fatalf("Create: %v", st)
+	}
+	defer wfs.ReleaseHandle(FileHandleId(created.Fh))
+
+	f.nextOnly("delete", 1<<30)
+	if st := wfs.Unlink(interruptSoon(), &h, "file"); st != fuse.EINTR {
+		t.Fatalf("interrupted Unlink: %v, want EINTR", st)
+	}
+	if store.lookup("/file") == nil {
+		t.Fatal("the interrupted unlink deleted the file")
+	}
+	if fh := wfs.GetHandle(FileHandleId(created.Fh)); fh.isDeleted {
+		t.Fatal("the interrupted unlink left the open handle marked deleted")
+	}
+}
+
+// An interrupt ends a link's wait to create the new name: EINTR, the
+// name not created.
+func TestLinkInterruptedAtMetadataRate(t *testing.T) {
+	fastMetadataRate(t)
+	wfs, store, f := rateStoreWFS(t)
+	h := fuse.InHeader{NodeId: 1, Caller: fuse.Caller{Owner: fuse.Owner{Uid: 99, Gid: 100}}}
+	var created fuse.CreateOut
+	if st := wfs.Create(nil, &fuse.CreateIn{InHeader: h, Flags: syscall.O_WRONLY | syscall.O_CREAT, Mode: 0o644}, "file", &created); st != fuse.OK {
+		t.Fatalf("Create: %v", st)
+	}
+	wfs.ReleaseHandle(FileHandleId(created.Fh))
+
+	f.nextOnly("create", 1<<30)
+	if st := wfs.Link(interruptSoon(), &fuse.LinkIn{InHeader: h, Oldnodeid: created.NodeId}, "hard", &fuse.EntryOut{}); st != fuse.EINTR {
+		t.Fatalf("interrupted Link: %v, want EINTR", st)
+	}
+	if store.lookup("/hard") != nil {
+		t.Fatal("the interrupted link created the name")
 	}
 }

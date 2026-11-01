@@ -433,12 +433,13 @@ func (wfs *WFS) Unlink(cancel <-chan struct{}, header *fuse.InHeader, name strin
 	// before Unlink sets the flag).  By waiting here, any in-flight flush
 	// finishes first; even if it recreated the entry, the filer delete below
 	// will remove it again.
+	var markedInode, markEpoch uint64
 	if inode, found := wfs.inodeToPath.GetInode(entryFullPath); found {
-		wfs.markHandleDeleted(inode)
+		markedInode, markEpoch = inode, wfs.markHandleDeleted(inode)
 		wfs.waitForPendingAsyncFlush(context.Background(), inode)
 	} else if entry != nil && entry.Attributes != nil && entry.Attributes.Inode != 0 {
 		inodeFromEntry := entry.Attributes.Inode
-		wfs.markHandleDeleted(inodeFromEntry)
+		markedInode, markEpoch = inodeFromEntry, wfs.markHandleDeleted(inodeFromEntry)
 		wfs.waitForPendingAsyncFlush(context.Background(), inodeFromEntry)
 	}
 
@@ -462,6 +463,9 @@ func (wfs *WFS) Unlink(cancel <-chan struct{}, header *fuse.InHeader, name strin
 	if err != nil {
 		glog.V(0).Infof("remove %s: %v", entryFullPath, err)
 		if errors.Is(err, errMetadataRateInterrupted) {
+			// Nothing was deleted: an open handle keeps saving its writes
+			// (Mountable).
+			wfs.clearHandleDeleted(markedInode, markEpoch)
 			return fuse.EINTR
 		}
 		return fuse.OK
@@ -728,7 +732,8 @@ func (wfs *WFS) asyncCreateEntry(dirFullPath util.FullPath, entry *filer_pb.Entr
 			Signatures:               []int32{wfs.signature},
 			SkipCheckParentDirectory: true,
 		}
-		err := retryMetadataFlush(context.Background(), func() error {
+		// Waits out the metadata rate, as Release does (Mountable).
+		err := retryMetadataFlush(waitingAtMetadataRate(context.Background(), nil), func() error {
 			resp, createErr := wfs.streamCreateEntry(context.Background(), request)
 			if createErr != nil {
 				return createErr

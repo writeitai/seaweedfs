@@ -388,8 +388,10 @@ func (wfs *WFS) Rename(cancel <-chan struct{}, in *fuse.RenameIn, oldName string
 		// BEFORE any async flush interference.
 		if fh, ok := wfs.fhMap.FindFileHandle(sourceInode); ok && fh.dirtyMetadata {
 			glog.V(4).Infof("dir Rename %s: flushing deferred metadata before rename", oldPath)
-			// Prerequisite for the rename, so it must complete: non-cancellable context.
-			if flushStatus := wfs.doFlush(context.Background(), fh, oldEntry.Attributes.Uid, oldEntry.Attributes.Gid, false); flushStatus != fuse.OK {
+			// Prerequisite for the rename, so it must complete: non-cancellable
+			// context, but a wait at the metadata rate ends on the interrupt,
+			// with nothing renamed (Mountable).
+			if flushStatus := wfs.doFlush(waitingAtMetadataRate(context.Background(), cancel), fh, oldEntry.Attributes.Uid, oldEntry.Attributes.Gid, false); flushStatus != fuse.OK {
 				glog.Warningf("dir Rename %s: flush before rename failed: %v", oldPath, flushStatus)
 				return flushStatus
 			}

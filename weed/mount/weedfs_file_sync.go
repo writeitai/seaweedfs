@@ -216,6 +216,11 @@ func (wfs *WFS) doFlush(ctx context.Context, fh *FileHandle, uid, gid uint32, al
 		glog.Warningf("%v fh %d flush: retrying metadata flush (attempt %d/%d) after %v: %v",
 			fileFullPath, fh.fh, nextAttempt, totalAttempts, backoff, err)
 	}); err != nil {
+		if errors.Is(err, errMetadataRateInterrupted) {
+			// Still dirty: the next flush or Release writes it (Mountable).
+			glog.V(0).Infof("%v fh %d flush: %v", fileFullPath, fh.fh, err)
+			return fuse.EINTR
+		}
 		glog.Errorf("%v fh %d flush: %v", fileFullPath, fh.fh, err)
 		var refused syscall.Errno
 		if errors.As(err, &refused) {

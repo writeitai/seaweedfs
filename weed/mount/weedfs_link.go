@@ -116,12 +116,11 @@ func (wfs *WFS) linkLocked(in *fuse.LinkIn, sourceInode uint64, oldEntryPath, ne
 // linkHeld is linkLocked with the group's locks held. An NFS mutation's
 // step, when given, marks where the link begins changing things and
 // bounds its calls (Mountable: see NFSLink). Without a step, its writes
-// wait out the metadata rate: the first until interrupt closes, the ones
-// after it, mid-link, however long.
+// wait out the metadata rate until interrupt closes (Mountable).
 func (wfs *WFS) linkHeld(in *fuse.LinkIn, sourceInode uint64, oldEntryPath, newParentPath util.FullPath, name string, group []byte, out *fuse.EntryOut, step *NFSStep, interrupt <-chan struct{}) (fuse.Status, []byte) {
 	// An NFS link waits for these local locks only within its preparation
 	// (Mountable: see NFSLink).
-	ctx := context.Background()
+	ctx := waitingAtMetadataRate(context.Background(), interrupt)
 	if step != nil {
 		ctx = step.Prepare
 	}
@@ -204,11 +203,6 @@ func (wfs *WFS) linkHeld(in *fuse.LinkIn, sourceInode uint64, oldEntryPath, newP
 		}
 		ctx = step.Mutate
 	}
-	settled := ctx // for the writes after the promotion
-	if step == nil {
-		ctx = waitingAtMetadataRate(context.Background(), interrupt)
-		settled = waitingAtMetadataRate(context.Background(), nil)
-	}
 	var updateResp *filer_pb.UpdateEntryResponse
 	err = atMetadataRate(ctx, "link "+string(oldEntryPath), func() (err error) {
 		updateResp, err = wfs.updateEntryOnce(ctx, &filer_pb.UpdateEntryRequest{
@@ -257,8 +251,8 @@ func (wfs *WFS) linkHeld(in *fuse.LinkIn, sourceInode uint64, oldEntryPath, newP
 	// A refusal at the metadata rate changed nothing, so it is sent again
 	// once the rate allows (Mountable).
 	var createResp *filer_pb.CreateEntryResponse
-	err = atMetadataRate(settled, "link "+string(newParentPath.Child(name)), func() (err error) {
-		createResp, err = wfs.createEntryOnce(settled, &filer_pb.CreateEntryRequest{
+	err = atMetadataRate(ctx, "link "+string(newParentPath.Child(name)), func() (err error) {
+		createResp, err = wfs.createEntryOnce(ctx, &filer_pb.CreateEntryRequest{
 			Directory:                string(newParentPath),
 			Entry:                    alias,
 			OExcl:                    true,
@@ -269,6 +263,12 @@ func (wfs *WFS) linkHeld(in *fuse.LinkIn, sourceInode uint64, oldEntryPath, newP
 	})
 	newEntryPath := newParentPath.Child(name)
 	switch {
+	case errors.Is(err, errMetadataRateInterrupted):
+		// The new name was not created. The extra reference stays, as
+		// after an ambiguous create below: chunks kept longer, never too
+		// short (Mountable).
+		glog.V(0).Infof("Link %v -> %s: %v", oldEntryPath, newEntryPath, err)
+		return fuse.EINTR, nil
 	case err == nil && createResp.GetErrorCode() == filer_pb.FilerError_ENTRY_ALREADY_EXISTS:
 		// The name another creator has is not in this mount's cache yet:
 		// the next lookup asks the filer, as after Create (Mountable).
@@ -278,8 +278,8 @@ func (wfs *WFS) linkHeld(in *fuse.LinkIn, sourceInode uint64, oldEntryPath, newP
 		rollback := proto.Clone(acked).(*filer_pb.Entry)
 		rollback.HardLinkId, rollback.HardLinkCounter = read.HardLinkId, read.HardLinkCounter
 		var rollbackResp *filer_pb.UpdateEntryResponse
-		rollbackErr := atMetadataRate(settled, "link rollback "+string(oldEntryPath), func() (err error) {
-			rollbackResp, err = wfs.updateEntryOnce(settled, &filer_pb.UpdateEntryRequest{
+		rollbackErr := atMetadataRate(ctx, "link rollback "+string(oldEntryPath), func() (err error) {
+			rollbackResp, err = wfs.updateEntryOnce(ctx, &filer_pb.UpdateEntryRequest{
 				Directory:  oldParentPath,
 				Entry:      rollback,
 				Signatures: []int32{wfs.signature},
