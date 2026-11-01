@@ -87,7 +87,12 @@ func (wfs *WFS) Mkdir(cancel <-chan struct{}, in *fuse.MkdirIn, name string, out
 	}
 
 	glog.V(1).Infof("mkdir: %v", request)
-	resp, err := wfs.streamCreateEntry(context.Background(), request)
+	mutate := waitingAtMetadataRate(context.Background(), cancel)
+	var resp *filer_pb.CreateEntryResponse
+	err := atMetadataRate(mutate, "mkdir "+string(entryFullPath), func() (err error) {
+		resp, err = wfs.streamCreateEntry(mutate, request)
+		return err
+	})
 	if err == nil {
 		// The inode the filer stored, before anything caches the entry
 		// (Mountable).
@@ -121,6 +126,9 @@ func (wfs *WFS) Mkdir(cancel <-chan struct{}, in *fuse.MkdirIn, name string, out
 			// metadata subscription to deliver it.
 			wfs.inodeToPath.InvalidateChildrenCache(dirFullPath)
 			return fuse.Status(syscall.EEXIST)
+		}
+		if errors.Is(err, errMetadataRateInterrupted) {
+			return fuse.EINTR
 		}
 		return fuse.EIO
 	}
@@ -193,9 +201,17 @@ func (wfs *WFS) Rmdir(cancel <-chan struct{}, header *fuse.InHeader, name string
 		IgnoreRecursiveError: true, // ignore recursion error since the OS should manage it
 		Signatures:           []int32{wfs.signature},
 	}
-	resp, err := wfs.streamDeleteEntry(context.Background(), deleteReq)
+	mutate := waitingAtMetadataRate(context.Background(), cancel)
+	var resp *filer_pb.DeleteEntryResponse
+	err := atMetadataRate(mutate, "rmdir "+string(entryFullPath), func() (err error) {
+		resp, err = wfs.streamDeleteEntry(mutate, deleteReq)
+		return err
+	})
 	if err != nil {
 		glog.V(1).Infof("remove %s: %v", entryFullPath, err)
+		if errors.Is(err, errMetadataRateInterrupted) {
+			return fuse.EINTR
+		}
 		if filer.IsNonEmptyFolderError(err) {
 			return fuse.Status(syscall.ENOTEMPTY)
 		}

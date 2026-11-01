@@ -65,7 +65,7 @@ func (wfs *WFS) Create(cancel <-chan struct{}, in *fuse.CreateIn, name string, o
 			return status
 		}
 		if in.Flags&syscall.O_TRUNC != 0 && in.Flags&fuse.O_ANYWRITE != 0 {
-			if code = wfs.truncateEntry(entryFullPath, newEntry); code != fuse.OK {
+			if code = wfs.truncateEntry(waitingAtMetadataRate(context.Background(), cancel), entryFullPath, newEntry); code != fuse.OK {
 				wfs.ReleaseHandle(fileHandle.fh)
 				wfs.Forget(inode, 1)
 				return code
@@ -113,7 +113,7 @@ func (wfs *WFS) Create(cancel <-chan struct{}, in *fuse.CreateIn, name string, o
 			return status
 		}
 		if in.Flags&syscall.O_TRUNC != 0 && in.Flags&fuse.O_ANYWRITE != 0 {
-			if code = wfs.truncateEntry(entryFullPath, newEntry); code != fuse.OK {
+			if code = wfs.truncateEntry(waitingAtMetadataRate(context.Background(), cancel), entryFullPath, newEntry); code != fuse.OK {
 				wfs.ReleaseHandle(fileHandle.fh)
 				wfs.Forget(inode, 1)
 				return code
@@ -453,9 +453,17 @@ func (wfs *WFS) Unlink(cancel <-chan struct{}, header *fuse.InHeader, name strin
 		IsDeleteData: true,
 		Signatures:   []int32{wfs.signature},
 	}
-	resp, err := wfs.streamDeleteEntry(context.Background(), deleteReq)
+	mutate := waitingAtMetadataRate(context.Background(), cancel)
+	var resp *filer_pb.DeleteEntryResponse
+	err := atMetadataRate(mutate, "unlink "+string(entryFullPath), func() (err error) {
+		resp, err = wfs.streamDeleteEntry(mutate, deleteReq)
+		return err
+	})
 	if err != nil {
 		glog.V(0).Infof("remove %s: %v", entryFullPath, err)
+		if errors.Is(err, errMetadataRateInterrupted) {
+			return fuse.EINTR
+		}
 		return fuse.OK
 	}
 
@@ -618,7 +626,14 @@ func (wfs *WFS) createRegularFileAt(ctx context.Context, dirFullPath util.FullPa
 	}
 
 	glog.V(1).Infof("createFile: %v", request)
-	resp, err := wfs.streamCreateEntry(context.Background(), request)
+	// The create is not interrupted once sent; only the wait at the
+	// metadata rate is (Mountable).
+	mutate := waitingAtMetadataRate(context.Background(), ctx.Done())
+	var resp *filer_pb.CreateEntryResponse
+	err := atMetadataRate(mutate, "create "+string(entryFullPath), func() (err error) {
+		resp, err = wfs.streamCreateEntry(mutate, request)
+		return err
+	})
 	if err == nil {
 		// The inode the filer stored, before anything caches the entry
 		// (Mountable).
@@ -739,7 +754,7 @@ func (wfs *WFS) asyncCreateEntry(dirFullPath util.FullPath, entry *filer_pb.Entr
 	}()
 }
 
-func (wfs *WFS) truncateEntry(entryFullPath util.FullPath, entry *filer_pb.Entry) fuse.Status {
+func (wfs *WFS) truncateEntry(ctx context.Context, entryFullPath util.FullPath, entry *filer_pb.Entry) fuse.Status {
 	if entry == nil {
 		return fuse.EIO
 	}
@@ -756,7 +771,7 @@ func (wfs *WFS) truncateEntry(entryFullPath util.FullPath, entry *filer_pb.Entry
 	entry.Attributes.Ctime = truncNow.Unix()
 	entry.Attributes.CtimeNs = int32(truncNow.Nanosecond())
 
-	if code := wfs.saveEntry(entryFullPath, entry); code != fuse.OK {
+	if code := wfs.saveEntry(ctx, entryFullPath, entry); code != fuse.OK {
 		return code
 	}
 

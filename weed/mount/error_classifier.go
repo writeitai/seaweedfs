@@ -1,6 +1,7 @@
 package mount
 
 import (
+	"errors"
 	"strings"
 	"syscall"
 
@@ -12,6 +13,9 @@ import (
 func grpcErrorToFuseStatus(err error) fuse.Status {
 	if err == nil {
 		return fuse.OK
+	}
+	if errors.Is(err, errMetadataRateInterrupted) {
+		return fuse.EINTR // Mountable: see atMetadataRate
 	}
 
 	// Unpack error for inspection

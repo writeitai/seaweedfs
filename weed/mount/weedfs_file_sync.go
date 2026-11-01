@@ -82,15 +82,16 @@ func (wfs *WFS) Flush(cancel <-chan struct{}, in *fuse.FlushIn) fuse.Status {
 	hasPosixLocks := wfs.hasPosixOwner(in.NodeId, in.LockOwner)
 	allowAsync := !hasPosixLocks
 
-	// Bound the flush with a deadline instead of tying it to the FUSE cancel
-	// channel. A FUSE interrupt is not a process kill: Go's async preemption
-	// (SIGURG) makes a close() under load emit an interrupt on nearly every
-	// flush (see go-fuse RawFileSystem docs), so cancelling the in-flight
-	// metadata CreateEntry on that interrupt turned healthy concurrent close()s
-	// into EIO. The deadline still keeps close() from hanging forever against an
-	// overwhelmed filer without failing benign flushes.
-	ctx, cancelFunc := context.WithTimeout(context.Background(), metadataFlushTimeout)
-	defer cancelFunc()
+	// Bound each metadata write with a deadline (doFlush) instead of tying it
+	// to the FUSE cancel channel. A FUSE interrupt is not a process kill: Go's
+	// async preemption (SIGURG) makes a close() under load emit an interrupt
+	// on nearly every flush (see go-fuse RawFileSystem docs), so cancelling
+	// the in-flight metadata CreateEntry on that interrupt turned healthy
+	// concurrent close()s into EIO. The deadline still keeps close() from
+	// hanging forever against an overwhelmed filer without failing benign
+	// flushes. Only a wait at the metadata rate, with nothing sent, ends on
+	// the interrupt (Mountable): the handle stays dirty, and Release writes it.
+	ctx := waitingAtMetadataRate(context.Background(), cancel)
 
 	status := wfs.doFlush(ctx, fh, in.Uid, in.Gid, allowAsync)
 	if in.LockOwner != 0 {
@@ -125,11 +126,8 @@ func (wfs *WFS) Fsync(cancel <-chan struct{}, in *fuse.FsyncIn) (code fuse.Statu
 		return fuse.ENOENT
 	}
 
-	ctx, cancelFunc := context.WithTimeout(context.Background(), metadataFlushTimeout)
-	defer cancelFunc()
-
 	// Fsync is an explicit sync request — always flush synchronously
-	return wfs.doFlush(ctx, fh, in.Uid, in.Gid, false)
+	return wfs.doFlush(waitingAtMetadataRate(context.Background(), cancel), fh, in.Uid, in.Gid, false)
 
 }
 
@@ -204,9 +202,13 @@ func (wfs *WFS) doFlush(ctx context.Context, fh *FileHandle, uid, gid uint32, al
 	}
 
 	if err := retryMetadataFlushIf(ctx, func() error {
+		// Each attempt has its deadline: waits at the metadata rate between
+		// attempts have none (Mountable).
+		attempt, cancel := context.WithTimeout(ctx, metadataFlushTimeout)
+		defer cancel()
 		// The destination is resolved under the handle lock (Mountable):
 		// a rename during the upload above moves it.
-		return wfs.flushMetadataToFiler(ctx, fh, "", "", uid, gid)
+		return wfs.flushMetadataToFiler(attempt, fh, "", "", uid, gid)
 	}, func(err error) bool {
 		var refused syscall.Errno
 		return !errors.As(err, &refused) // a refusal stands (Mountable)

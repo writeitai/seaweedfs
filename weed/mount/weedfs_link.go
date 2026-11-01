@@ -92,7 +92,7 @@ func (wfs *WFS) Link(cancel <-chan struct{}, in *fuse.LinkIn, name string, out *
 		group = filer.NewHardLinkId()
 	}
 	for range 3 {
-		code, other := wfs.linkLocked(in, sourceInode, oldEntryPath, newParentPath, name, group, out)
+		code, other := wfs.linkLocked(in, sourceInode, oldEntryPath, newParentPath, name, group, out, cancel)
 		if other == nil {
 			return code
 		}
@@ -104,19 +104,21 @@ func (wfs *WFS) Link(cancel <-chan struct{}, in *fuse.LinkIn, name string, out *
 // linkLocked is Link with the group's locks: group is the source's, or
 // the one allocated for it. When the filer has the source in another
 // group, it returns that group and changes nothing.
-func (wfs *WFS) linkLocked(in *fuse.LinkIn, sourceInode uint64, oldEntryPath, newParentPath util.FullPath, name string, group []byte, out *fuse.EntryOut) (fuse.Status, []byte) {
+func (wfs *WFS) linkLocked(in *fuse.LinkIn, sourceInode uint64, oldEntryPath, newParentPath util.FullPath, name string, group []byte, out *fuse.EntryOut, interrupt <-chan struct{}) (fuse.Status, []byte) {
 	release, code := wfs.lockHardLinkGroup(group)
 	if code != fuse.OK {
 		return code, nil
 	}
 	defer release()
-	return wfs.linkHeld(in, sourceInode, oldEntryPath, newParentPath, name, group, out, nil)
+	return wfs.linkHeld(in, sourceInode, oldEntryPath, newParentPath, name, group, out, nil, interrupt)
 }
 
 // linkHeld is linkLocked with the group's locks held. An NFS mutation's
 // step, when given, marks where the link begins changing things and
-// bounds its calls (Mountable: see NFSLink).
-func (wfs *WFS) linkHeld(in *fuse.LinkIn, sourceInode uint64, oldEntryPath, newParentPath util.FullPath, name string, group []byte, out *fuse.EntryOut, step *NFSStep) (fuse.Status, []byte) {
+// bounds its calls (Mountable: see NFSLink). Without a step, its writes
+// wait out the metadata rate: the first until interrupt closes, the ones
+// after it, mid-link, however long.
+func (wfs *WFS) linkHeld(in *fuse.LinkIn, sourceInode uint64, oldEntryPath, newParentPath util.FullPath, name string, group []byte, out *fuse.EntryOut, step *NFSStep, interrupt <-chan struct{}) (fuse.Status, []byte) {
 	// An NFS link waits for these local locks only within its preparation
 	// (Mountable: see NFSLink).
 	ctx := context.Background()
@@ -202,14 +204,26 @@ func (wfs *WFS) linkHeld(in *fuse.LinkIn, sourceInode uint64, oldEntryPath, newP
 		}
 		ctx = step.Mutate
 	}
-	updateResp, err := wfs.updateEntryOnce(ctx, &filer_pb.UpdateEntryRequest{
-		Directory:  oldParentPath,
-		Entry:      promoted,
-		Signatures: []int32{wfs.signature},
-		Condition:  entryEqual(read),
+	settled := ctx // for the writes after the promotion
+	if step == nil {
+		ctx = waitingAtMetadataRate(context.Background(), interrupt)
+		settled = waitingAtMetadataRate(context.Background(), nil)
+	}
+	var updateResp *filer_pb.UpdateEntryResponse
+	err = atMetadataRate(ctx, "link "+string(oldEntryPath), func() (err error) {
+		updateResp, err = wfs.updateEntryOnce(ctx, &filer_pb.UpdateEntryRequest{
+			Directory:  oldParentPath,
+			Entry:      promoted,
+			Signatures: []int32{wfs.signature},
+			Condition:  entryEqual(read),
+		})
+		return err
 	})
 	if err != nil {
 		glog.V(0).Infof("Link %v: promoting the source: %v", oldEntryPath, err)
+		if errors.Is(err, errMetadataRateInterrupted) {
+			return fuse.EINTR, nil
+		}
 		if code := status.Code(err); code == codes.FailedPrecondition || isNotFound(err) {
 			return fuse.ENOENT, nil
 		}
@@ -240,12 +254,18 @@ func (wfs *WFS) linkHeld(in *fuse.LinkIn, sourceInode uint64, oldEntryPath, newP
 	// rewrites the group's shared record (Mountable).
 	alias := proto.Clone(acked).(*filer_pb.Entry)
 	alias.Name = name
-	createResp, err := wfs.createEntryOnce(ctx, &filer_pb.CreateEntryRequest{
-		Directory:                string(newParentPath),
-		Entry:                    alias,
-		OExcl:                    true,
-		Signatures:               []int32{wfs.signature},
-		SkipCheckParentDirectory: true,
+	// A refusal at the metadata rate changed nothing, so it is sent again
+	// once the rate allows (Mountable).
+	var createResp *filer_pb.CreateEntryResponse
+	err = atMetadataRate(settled, "link "+string(newParentPath.Child(name)), func() (err error) {
+		createResp, err = wfs.createEntryOnce(settled, &filer_pb.CreateEntryRequest{
+			Directory:                string(newParentPath),
+			Entry:                    alias,
+			OExcl:                    true,
+			Signatures:               []int32{wfs.signature},
+			SkipCheckParentDirectory: true,
+		})
+		return err
 	})
 	newEntryPath := newParentPath.Child(name)
 	switch {
@@ -257,11 +277,15 @@ func (wfs *WFS) linkHeld(in *fuse.LinkIn, sourceInode uint64, oldEntryPath, newP
 		// on the condition that the source is still as promoted.
 		rollback := proto.Clone(acked).(*filer_pb.Entry)
 		rollback.HardLinkId, rollback.HardLinkCounter = read.HardLinkId, read.HardLinkCounter
-		rollbackResp, rollbackErr := wfs.updateEntryOnce(ctx, &filer_pb.UpdateEntryRequest{
-			Directory:  oldParentPath,
-			Entry:      rollback,
-			Signatures: []int32{wfs.signature},
-			Condition:  entryEqual(acked),
+		var rollbackResp *filer_pb.UpdateEntryResponse
+		rollbackErr := atMetadataRate(settled, "link rollback "+string(oldEntryPath), func() (err error) {
+			rollbackResp, err = wfs.updateEntryOnce(settled, &filer_pb.UpdateEntryRequest{
+				Directory:  oldParentPath,
+				Entry:      rollback,
+				Signatures: []int32{wfs.signature},
+				Condition:  entryEqual(acked),
+			})
+			return err
 		})
 		if rollbackErr != nil {
 			glog.Warningf("link rollback %s: %v", oldEntryPath, rollbackErr)

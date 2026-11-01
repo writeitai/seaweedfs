@@ -520,7 +520,7 @@ func (wfs *WFS) NFSLink(step NFSStep, source, dir uint64, name string, uid, gid 
 			release()
 			return NFSRetryLater
 		}
-		code, other := wfs.linkHeld(in, source, oldEntryPath, newParentPath, name, group, &fuse.EntryOut{}, &step)
+		code, other := wfs.linkHeld(in, source, oldEntryPath, newParentPath, name, group, &fuse.EntryOut{}, &step, nil)
 		wfs.hardLinkLockTable.ReleaseLock(string(group), local)
 		release()
 		if other == nil {

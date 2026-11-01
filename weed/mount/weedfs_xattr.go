@@ -3,6 +3,7 @@
 package mount
 
 import (
+	"context"
 	"runtime"
 	"strings"
 	"syscall"
@@ -151,7 +152,7 @@ func (wfs *WFS) SetXAttr(cancel <-chan struct{}, input *fuse.SetXAttrIn, attr st
 		return fuse.OK
 	}
 
-	return wfs.saveAttributes(path, entry)
+	return wfs.saveAttributes(waitingAtMetadataRate(context.Background(), cancel), path, entry)
 
 }
 
@@ -238,5 +239,5 @@ func (wfs *WFS) RemoveXAttr(cancel <-chan struct{}, header *fuse.InHeader, attr 
 		return fuse.OK
 	}
 
-	return wfs.saveAttributes(path, entry)
+	return wfs.saveAttributes(waitingAtMetadataRate(context.Background(), cancel), path, entry)
 }

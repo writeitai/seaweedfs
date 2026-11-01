@@ -53,7 +53,7 @@ func (wfs *WFS) doRename(ctx context.Context, request *filer_pb.StreamRenameEntr
 
 		stream, streamErr := client.StreamRenameEntry(streamCtx, request)
 		if streamErr != nil {
-			return fmt.Errorf("dir AtomicRenameEntry %s => %s : %v", oldPath, newPath, streamErr)
+			return fmt.Errorf("dir AtomicRenameEntry %s => %s : %w", oldPath, newPath, streamErr)
 		}
 		for {
 			resp, recvErr := stream.Recv()
@@ -64,7 +64,7 @@ func (wfs *WFS) doRename(ctx context.Context, request *filer_pb.StreamRenameEntr
 				if ctx.Err() == nil && streamCtx.Err() != nil {
 					return fmt.Errorf("dir Rename %s => %s: no event for %s", oldPath, newPath, wfs.filerRPCWait())
 				}
-				return fmt.Errorf("dir Rename %s => %s receive: %v", oldPath, newPath, recvErr)
+				return fmt.Errorf("dir Rename %s => %s receive: %w", oldPath, newPath, recvErr)
 			}
 			inHandler.Store(true)
 			err := wfs.handleRenameResponse(ctx, resp, newPath, newPathLock)
@@ -446,9 +446,15 @@ func (wfs *WFS) Rename(cancel <-chan struct{}, in *fuse.RenameIn, oldName string
 		Signatures:   []int32{wfs.signature},
 	}
 
-	err := wfs.doRename(context.Background(), request, oldPath, newPath, &newPathLock)
+	mutate := waitingAtMetadataRate(context.Background(), cancel)
+	err := atMetadataRate(mutate, "rename "+string(oldPath), func() error {
+		return wfs.doRename(mutate, request, oldPath, newPath, &newPathLock)
+	})
 	if err != nil {
 		glog.V(0).Infof("Rename %s => %s: %v", oldPath, newPath, err)
+		if errors.Is(err, errMetadataRateInterrupted) {
+			return fuse.EINTR
+		}
 		// Map error strings to FUSE status codes. String matching is used
 		// instead of raw errno to stay portable across platforms (errno
 		// numeric values differ between Linux and macOS).
