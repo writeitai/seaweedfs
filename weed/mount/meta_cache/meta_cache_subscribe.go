@@ -2,6 +2,7 @@ package meta_cache
 
 import (
 	"context"
+	"errors"
 	"io"
 	"strings"
 
@@ -61,7 +62,13 @@ func SubscribeMetaEvents(mc *MetaCache, selfSignature int32, client filer_pb.Fil
 				}
 			}
 		}
-		return mc.ApplyMetadataResponse(context.Background(), resp, SubscriberMetadataResponseApplyOptions)
+		// A cache shut down with its mount has nothing left to keep current:
+		// an event arriving after the unmount is dropped, not fatal to a
+		// process that goes on, or mounts again (Mountable).
+		if err := mc.ApplyMetadataResponse(context.Background(), resp, SubscriberMetadataResponseApplyOptions); !errors.Is(err, errMetaCacheClosed) {
+			return err
+		}
+		return nil
 	}
 
 	prefix := dir
