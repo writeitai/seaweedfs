@@ -91,7 +91,7 @@ func newVolumeTestWFSWith(t *testing.T, entry *filer_pb.Entry) (*WFS, *volumeFil
 // port 10000 lower), as the mount's filerProxy uploads need.
 func startProxyFiler(t *testing.T, wfs *WFS, fake filer_pb.SeaweedFilerServer, uploaded func()) *httptest.Server {
 	t.Helper()
-	upload := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return startProxyFilerWith(t, wfs, fake, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet { // a chunk read: zeros
 			_, _ = w.Write(make([]byte, 100))
 			return
@@ -100,7 +100,12 @@ func startProxyFiler(t *testing.T, wfs *WFS, fake filer_pb.SeaweedFilerServer, u
 		uploaded()
 		w.WriteHeader(http.StatusCreated)
 		_ = json.NewEncoder(w).Encode(map[string]any{"size": len(body)})
-	})
+	}))
+}
+
+// startProxyFilerWith is startProxyFiler with upload as the chunk proxy.
+func startProxyFilerWith(t *testing.T, wfs *WFS, fake filer_pb.SeaweedFilerServer, upload http.Handler) *httptest.Server {
+	t.Helper()
 	for range 20 {
 		grpcListener, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
