@@ -134,10 +134,12 @@ func doEnsureVisited(ctx context.Context, mc *MetaCache, client filer_pb.FilerCl
 		}()
 
 		// reloadFromFiler wipes the cached children and reloads them from the filer.
+		var links []*filer.Entry // the listing's hard links (Mountable)
 		reloadFromFiler := func() (entryCount int, snapshotTsNs int64, sections sectionBoundsCollector, err error) {
 			err = util.Retry("ReadDirAllEntries", func() error {
 				entryCount = 0
 				sections = sectionBoundsCollector{}
+				links = nil
 				var batch []*filer.Entry // reset on retry, allow GC of previous entries
 				if err := mc.deleteFolderChildrenForRebuild(ctx, path); err != nil {
 					return fmt.Errorf("clear existing entries for %s: %w", path, err)
@@ -154,6 +156,9 @@ func doEnsureVisited(ctx context.Context, mc *MetaCache, client filer_pb.FilerCl
 					}
 					sections.note(entry.Name())
 					batch = append(batch, entry)
+					if len(entry.HardLinkId) > 0 {
+						links = append(links, entry)
+					}
 					entryCount++
 
 					// flush by size, not isLast: hidden entries can return early
@@ -217,7 +222,7 @@ func doEnsureVisited(ctx context.Context, mc *MetaCache, client filer_pb.FilerCl
 			}
 		}
 
-		if err := mc.CompleteDirectoryBuild(context.Background(), path, snapshotTsNs, sections.bounds); err != nil {
+		if err := mc.completeDirectoryBuild(context.Background(), path, snapshotTsNs, sections.bounds, links); err != nil {
 			cleanupBuild("unreplayed")
 			return nil, fmt.Errorf("complete build for %s: %w", path, err)
 		}

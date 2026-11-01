@@ -21,6 +21,7 @@ import (
 type leaseFiler struct {
 	filer_pb.UnimplementedSeaweedFilerServer
 	lm *lock_manager.LockManager
+	mu sync.Mutex // guards the hooks, which a test may set while serving
 	// beforeGrant and afterGrant, when set, run before the lock manager is
 	// asked and before the reply is sent; beforeUnlock before an unlock.
 	beforeGrant, afterGrant, beforeUnlock func(ctx context.Context)
@@ -28,28 +29,42 @@ type leaseFiler struct {
 	stall bool
 }
 
+// set changes the hooks while the filer serves.
+func (f *leaseFiler) set(change func(*leaseFiler)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	change(f)
+}
+
+func (f *leaseFiler) hooks() (stall bool, beforeGrant, afterGrant, beforeUnlock func(context.Context)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.stall, f.beforeGrant, f.afterGrant, f.beforeUnlock
+}
+
 func (f *leaseFiler) DistributedLock(ctx context.Context, r *filer_pb.LockRequest) (*filer_pb.LockResponse, error) {
-	if f.stall {
+	stall, beforeGrant, afterGrant, _ := f.hooks()
+	if stall {
 		<-ctx.Done()
 		return nil, ctx.Err()
 	}
-	if f.beforeGrant != nil {
-		f.beforeGrant(ctx)
+	if beforeGrant != nil {
+		beforeGrant(ctx)
 	}
 	owner, token, generation, _, err := f.lm.Lock(r.Name, time.Now().Add(time.Duration(r.SecondsToLock)*time.Second).UnixNano(), r.RenewToken, r.Owner)
 	resp := &filer_pb.LockResponse{LockOwner: owner, RenewToken: token, Generation: generation}
 	if err != nil {
 		resp.Error = err.Error()
 	}
-	if f.afterGrant != nil {
-		f.afterGrant(ctx)
+	if afterGrant != nil {
+		afterGrant(ctx)
 	}
 	return resp, nil
 }
 
 func (f *leaseFiler) DistributedUnlock(ctx context.Context, r *filer_pb.UnlockRequest) (*filer_pb.UnlockResponse, error) {
-	if f.beforeUnlock != nil {
-		f.beforeUnlock(ctx)
+	if _, _, _, beforeUnlock := f.hooks(); beforeUnlock != nil {
+		beforeUnlock(ctx)
 	}
 	f.lm.Unlock(r.Name, r.RenewToken)
 	return &filer_pb.UnlockResponse{}, nil
@@ -164,7 +179,7 @@ func TestAbandonedGrantCleanupIsBounded(t *testing.T) {
 	}
 	close(lock.cancelCh) // as Stop does, without its unlock
 	<-lock.renewalDone
-	f.beforeUnlock = func(ctx context.Context) { <-ctx.Done() }
+	f.set(func(f *leaseFiler) { f.beforeUnlock = func(ctx context.Context) { <-ctx.Done() } })
 	saved := lockCleanupTimeout
 	lockCleanupTimeout = 200 * time.Millisecond
 	defer func() { lockCleanupTimeout = saved }()
@@ -197,5 +212,47 @@ func TestAcquiredLockIsRenewedUntilStop(t *testing.T) {
 	lock.Stop()
 	if f.held("k") {
 		t.Fatal("Stop left the lock held")
+	}
+}
+
+// StopWithin gives up an unlock that stalls after its bound; the lease
+// then lapses.
+func TestStopWithinIsBounded(t *testing.T) {
+	f := &leaseFiler{}
+	lc := startLeaseFiler(t, f)
+	lock, err := lc.AcquireLock(context.Background(), "k", "me", time.Second)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	f.set(func(f *leaseFiler) { f.beforeUnlock = func(ctx context.Context) { <-ctx.Done() } })
+	start := time.Now()
+	lock.StopWithin(200 * time.Millisecond)
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("StopWithin took %v", elapsed)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for f.held("k") && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if f.held("k") {
+		t.Fatal("the lease did not lapse")
+	}
+}
+
+// A renewal that stalls ends with the lock's stop: nothing keeps running.
+func TestStopEndsAStalledRenewal(t *testing.T) {
+	f := &leaseFiler{}
+	lc := startLeaseFiler(t, f)
+	lock, err := lc.AcquireLock(context.Background(), "k", "me", time.Second)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	f.set(func(f *leaseFiler) { f.beforeGrant = func(ctx context.Context) { <-ctx.Done() } }) // renewals stall
+	time.Sleep(700 * time.Millisecond)                                                        // one is in flight
+	lock.StopWithin(200 * time.Millisecond)
+	select {
+	case <-lock.renewalDone:
+	case <-time.After(time.Second):
+		t.Fatal("the renewal is still running")
 	}
 }

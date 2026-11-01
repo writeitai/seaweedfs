@@ -356,7 +356,7 @@ func (mc *MetaCache) applySectionRefreshNow(ctx context.Context, dirPath util.Fu
 			if _, tombstone := mc.getEntryVersionRecordLocked(ctx, entry.FullPath); tombstone {
 				continue
 			}
-			if err := mc.localStore.InsertEntry(ctx, entry); err != nil {
+			if err := mc.insertListedLocked(ctx, entry, 0); err != nil {
 				return err
 			}
 			mc.setEntryVersionLocked(ctx, entry.FullPath, 0)
@@ -375,7 +375,7 @@ func (mc *MetaCache) applySectionRefreshNow(ctx context.Context, dirPath util.Fu
 			}
 		}
 		// no per-entry version: the section floor set below covers the range
-		if err := mc.localStore.InsertEntry(ctx, entry); err != nil {
+		if err := mc.insertListedLocked(ctx, entry, snapshotTsNs); err != nil {
 			return err
 		}
 		if unversioned {

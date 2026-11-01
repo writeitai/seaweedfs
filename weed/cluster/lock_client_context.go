@@ -99,6 +99,9 @@ func (lock *LiveLock) attempt(ctx context.Context, lockDuration time.Duration) (
 	if err != nil || resp == nil {
 		return "", err
 	}
+	if resp.LockHostMovedTo != "" {
+		lock.hostFiler = pb.ServerAddress(resp.LockHostMovedTo)
+	}
 	if resp.Error != "" {
 		return resp.Error, nil
 	}
@@ -107,32 +110,62 @@ func (lock *LiveLock) attempt(ctx context.Context, lockDuration time.Duration) (
 	if resp.Generation > 0 {
 		atomic.StoreInt64(&lock.generation, resp.Generation)
 	}
-	if resp.LockHostMovedTo != "" {
-		lock.hostFiler = pb.ServerAddress(resp.LockHostMovedTo)
-	}
 	atomic.StoreInt32(&lock.isLocked, 1)
 	return "", nil
 }
 
 // release unlocks a lock that was never handed out, within
 // lockCleanupTimeout.
-func (lock *LiveLock) release() {
-	ctx, cancel := context.WithTimeout(context.Background(), lockCleanupTimeout)
+func (lock *LiveLock) release() { lock.unlockWithin(lockCleanupTimeout) }
+
+// StopWithin is Stop bounded by d: the renewal ends, and the unlock is
+// given up after d, the lease then lapsing on its own.
+func (lock *LiveLock) StopWithin(d time.Duration) {
+	select {
+	case <-lock.cancelCh:
+	default:
+		close(lock.cancelCh)
+	}
+	if lock.renewalDone != nil {
+		timer := time.NewTimer(d)
+		defer timer.Stop()
+		select {
+		case <-lock.renewalDone:
+		case <-timer.C:
+			// A renewal in flight may still rotate the token: it is
+			// abandoned, and the lease lapses on its own.
+			lock.abortRenewal()
+			return
+		}
+	}
+	lock.unlockWithin(d)
+}
+
+func (lock *LiveLock) unlockWithin(d time.Duration) {
+	ctx, cancel := context.WithTimeout(context.Background(), d)
 	defer cancel()
 	err := withFilerClient(ctx, lock, func(client filer_pb.SeaweedFilerClient) error {
 		_, callErr := client.DistributedUnlock(ctx, &filer_pb.UnlockRequest{Name: lock.key, RenewToken: lock.renewToken})
 		return callErr
 	})
 	if err != nil {
-		glog.V(1).Infof("lock %s: unlocking an abandoned grant: %v; it lapses with its lease", lock.key, err)
+		glog.V(1).Infof("lock %s: unlocking: %v; it lapses with its lease", lock.key, err)
+		return
 	}
+	atomic.StoreInt32(&lock.isLocked, 0)
 }
 
 // startRenewal renews the lock every half lease until Stop, as
 // NewBlockingLongLivedLock's renewal does.
+// A renewal in flight is let finish on a stop, so the unlock has the
+// latest renew token, and abandoned once StopWithin's bound is over: none is
+// left running.
 func (lock *LiveLock) startRenewal() {
 	lock.renewalDone = make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	lock.abortRenewal = cancel
 	go func() {
+		defer cancel()
 		defer close(lock.renewalDone)
 		ticker := time.NewTicker(lock.lockTTL / 2)
 		defer ticker.Stop()
@@ -141,8 +174,8 @@ func (lock *LiveLock) startRenewal() {
 			case <-lock.cancelCh:
 				return
 			case <-ticker.C:
-				if err := lock.AttemptToLock(lock.lockTTL); err != nil {
-					glog.V(0).Infof("lock renewal failed for %s: %v", lock.key, err)
+				if message, err := lock.attempt(ctx, lock.lockTTL); err != nil || message != "" {
+					glog.V(0).Infof("lock renewal failed for %s: %v %s", lock.key, err, message)
 					atomic.StoreInt32(&lock.isLocked, 0)
 				}
 			}

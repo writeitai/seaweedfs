@@ -114,25 +114,7 @@ func (wfs *WFS) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *fuse
 		truncated = size < oldFileSize
 		if size < oldFileSize {
 			// fmt.Printf("truncate %v \n", fullPath)
-			var chunks []*filer_pb.FileChunk
-			var truncatedChunks []*filer_pb.FileChunk
-			for _, chunk := range entry.GetChunks() {
-				int64Size := int64(chunk.Size)
-				if chunk.Offset+int64Size > int64(size) {
-					// this chunk is truncated
-					int64Size = int64(size) - chunk.Offset
-					if int64Size > 0 {
-						chunks = append(chunks, chunk)
-						glog.V(4).Infof("truncated chunk %+v from %d to %d\n", chunk.GetFileIdString(), chunk.Size, int64Size)
-						chunk.Size = uint64(int64Size)
-					} else {
-						glog.V(4).Infof("truncated whole chunk %+v\n", chunk.GetFileIdString())
-						truncatedChunks = append(truncatedChunks, chunk)
-					}
-				} else {
-					chunks = append(chunks, chunk)
-				}
-			}
+			chunks := truncatedChunks(entry.GetChunks(), size)
 			// set the new chunks and reset entry cache
 			entry.Chunks = chunks
 			if fh != nil {
@@ -161,7 +143,9 @@ func (wfs *WFS) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *fuse
 		// glog.V(4).Infof("setAttr mode %o", mode)
 		entry.Attributes.FileMode = chmod(entry.Attributes.FileMode, mode)
 		if input.NodeId == 1 {
+			wfs.rootMu.Lock()
 			wfs.option.MountMode = os.FileMode(chmod(uint32(wfs.option.MountMode), mode))
+			wfs.rootMu.Unlock()
 		}
 	}
 
@@ -170,7 +154,9 @@ func (wfs *WFS) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *fuse
 		entry.Attributes.Uid = uid
 		ownerChanged = true
 		if input.NodeId == 1 {
+			wfs.rootMu.Lock()
 			wfs.option.MountUid = uid
+			wfs.rootMu.Unlock()
 		}
 	}
 
@@ -178,7 +164,9 @@ func (wfs *WFS) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *fuse
 		entry.Attributes.Gid = gid
 		ownerChanged = true
 		if input.NodeId == 1 {
+			wfs.rootMu.Lock()
 			wfs.option.MountGid = gid
+			wfs.rootMu.Unlock()
 		}
 	}
 
@@ -227,17 +215,25 @@ func (wfs *WFS) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *fuse
 
 }
 
+// rootAttrs is the root's mode and owner, read together.
+func (wfs *WFS) rootAttrs() (os.FileMode, uint32, uint32) {
+	wfs.rootMu.RLock()
+	defer wfs.rootMu.RUnlock()
+	return wfs.option.MountMode, wfs.option.MountUid, wfs.option.MountGid
+}
+
 func (wfs *WFS) setRootAttr(out *fuse.AttrOut) {
 	now := uint64(time.Now().Unix())
 	out.AttrValid = 119
 	out.Ino = 1
 	setBlksize(&out.Attr, blockSize)
-	out.Uid = wfs.option.MountUid
-	out.Gid = wfs.option.MountGid
+	mode, uid, gid := wfs.rootAttrs()
+	out.Uid = uid
+	out.Gid = gid
 	out.Mtime = now
 	out.Ctime = now
 	out.Atime = now
-	out.Mode = toSyscallType(os.ModeDir) | uint32(wfs.option.MountMode)
+	out.Mode = toSyscallType(os.ModeDir) | uint32(mode)
 	out.Nlink = 2
 }
 
@@ -547,4 +543,27 @@ func toOsFileType(mode uint32) os.FileMode {
 
 func toOsFileMode(mode uint32) os.FileMode {
 	return toOsFileType(mode) | os.FileMode(mode&07777)
+}
+
+// truncatedChunks is chunks cut at size: chunks past it dropped, the one
+// across it shortened in place.
+func truncatedChunks(chunks []*filer_pb.FileChunk, size uint64) []*filer_pb.FileChunk {
+	var kept []*filer_pb.FileChunk
+	for _, chunk := range chunks {
+		int64Size := int64(chunk.Size)
+		if chunk.Offset+int64Size > int64(size) {
+			// this chunk is truncated
+			int64Size = int64(size) - chunk.Offset
+			if int64Size > 0 {
+				kept = append(kept, chunk)
+				glog.V(4).Infof("truncated chunk %+v from %d to %d\n", chunk.GetFileIdString(), chunk.Size, int64Size)
+				chunk.Size = uint64(int64Size)
+			} else {
+				glog.V(4).Infof("truncated whole chunk %+v\n", chunk.GetFileIdString())
+			}
+		} else {
+			kept = append(kept, chunk)
+		}
+	}
+	return kept
 }

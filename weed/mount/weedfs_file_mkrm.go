@@ -491,7 +491,7 @@ func (wfs *WFS) Unlink(cancel <-chan struct{}, header *fuse.InHeader, name strin
 		now := time.Now()
 		decremented.Attributes.Ctime = now.Unix()
 		decremented.Attributes.CtimeNs = int32(now.Nanosecond())
-		wfs.syncHardLinkSiblings(sharedInode, decremented, entryFullPath)
+		wfs.syncHardLinkSiblings(sharedInode, decremented, event.GetTsNs(), entryFullPath)
 	}
 
 	return fuse.OK
@@ -614,7 +614,7 @@ func (wfs *WFS) createRegularFileAt(ctx context.Context, dirFullPath util.FullPa
 	if err == nil {
 		// The inode the filer stored, before anything caches the entry
 		// (Mountable).
-		inode, err = wfs.adoptStoredInode(entryFullPath, newEntry, resp)
+		inode, err = wfs.adoptStoredInode(context.Background(), entryFullPath, newEntry, resp)
 	}
 	if err != nil {
 		glog.V(0).Infof("createFile %s: %v", entryFullPath, err)

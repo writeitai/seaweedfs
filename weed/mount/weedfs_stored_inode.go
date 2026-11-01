@@ -18,10 +18,10 @@ import (
 //
 // Mountable (writeitai/seaweedfs, branch mountable): D43 and architecture
 // §4 obligation 13 in writeitai/fsit.
-func (wfs *WFS) adoptStoredInode(path util.FullPath, entry *filer_pb.Entry, resp *filer_pb.CreateEntryResponse) (uint64, error) {
+func (wfs *WFS) adoptStoredInode(ctx context.Context, path util.FullPath, entry *filer_pb.Entry, resp *filer_pb.CreateEntryResponse) (uint64, error) {
 	stored := resp.GetMetadataEvent().GetEventNotification().GetNewEntry().GetAttributes().GetInode()
 	if stored == 0 {
-		found, _, _, err := filer_pb.GetEntry(context.Background(), wfs, path)
+		found, _, _, err := filer_pb.GetEntry(ctx, wfs, path)
 		if err != nil {
 			// The object is not reported under a number the filer may not
 			// store.

@@ -37,9 +37,16 @@ type storeFiler struct {
 	beforeCreate func(*filer_pb.CreateEntryRequest)
 	duringDelete func(*filer_pb.DeleteEntryRequest)
 	afterCreate  func(*filer_pb.CreateEntryRequest) (*filer_pb.CreateEntryResponse, error)
-	locks        map[string]string // lock name -> token
-	locked       []string          // every lock name taken, in order
-	failLookup   map[util.FullPath]bool
+	// afterDelete, when set, runs unlocked after a delete's commit; an
+	// error it returns replaces the reply.
+	afterDelete func(*filer_pb.DeleteEntryRequest) error
+	locks       map[string]string // lock name -> token
+	locked      []string          // every lock name taken, in order
+	failLookup  map[util.FullPath]bool
+	// beforeLookup, when set, runs unlocked before a lookup is answered;
+	// beforeLock before a lock is granted or renewed.
+	beforeLookup func(ctx context.Context, p util.FullPath)
+	beforeLock   func(name string)
 }
 
 func newStoreFiler() *storeFiler {
@@ -99,7 +106,10 @@ func entriesEqual(a, b *filer_pb.Entry) bool {
 	return proto.Equal(filer.FromPbEntry("", a).ToProtoEntry(), filer.FromPbEntry("", b).ToProtoEntry())
 }
 
-func (f *storeFiler) LookupDirectoryEntry(_ context.Context, r *filer_pb.LookupDirectoryEntryRequest) (*filer_pb.LookupDirectoryEntryResponse, error) {
+func (f *storeFiler) LookupDirectoryEntry(ctx context.Context, r *filer_pb.LookupDirectoryEntryRequest) (*filer_pb.LookupDirectoryEntryResponse, error) {
+	if hook := f.beforeLookup; hook != nil {
+		hook(ctx, util.FullPath(r.Directory).Child(r.Name))
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.failLookup[util.FullPath(r.Directory).Child(r.Name)] {
@@ -170,7 +180,17 @@ func (f *storeFiler) UpdateEntry(_ context.Context, r *filer_pb.UpdateEntryReque
 // DeleteEntry deletes a name as the filer's DeleteHardLink does: the
 // shared counter is read, then written lowered, in two steps another
 // writer can come between (duringDelete, when set, runs between them).
-func (f *storeFiler) DeleteEntry(_ context.Context, r *filer_pb.DeleteEntryRequest) (*filer_pb.DeleteEntryResponse, error) {
+func (f *storeFiler) DeleteEntry(ctx context.Context, r *filer_pb.DeleteEntryRequest) (*filer_pb.DeleteEntryResponse, error) {
+	resp, err := f.deleteEntry(ctx, r)
+	if hook := f.afterDelete; err == nil && hook != nil {
+		if hookErr := hook(r); hookErr != nil {
+			return nil, hookErr
+		}
+	}
+	return resp, err
+}
+
+func (f *storeFiler) deleteEntry(_ context.Context, r *filer_pb.DeleteEntryRequest) (*filer_pb.DeleteEntryResponse, error) {
 	p := util.FullPath(r.Directory).Child(r.Name)
 	f.mu.Lock()
 	e := f.entries[p]
@@ -209,6 +229,9 @@ func (f *storeFiler) remove(p util.FullPath) {
 }
 
 func (f *storeFiler) DistributedLock(_ context.Context, r *filer_pb.LockRequest) (*filer_pb.LockResponse, error) {
+	if hook := f.beforeLock; hook != nil {
+		hook(r.Name)
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if token, held := f.locks[r.Name]; held && token != r.RenewToken {
@@ -245,6 +268,7 @@ func newLinkTestWFS(t *testing.T, filer *storeFiler) *WFS {
 	startFakeFiler(t, wfs, filer)
 	wfs.lockClient = cluster.NewLockClient(wfs.option.GrpcDialOption, wfs.option.FilerAddresses[0])
 	wfs.openMtimeCache = map[uint64][2]int64{}
+	wfs.atimeMap = map[uint64]time.Time{}
 	// Events reach open handles as in production.
 	wfs.metaCache.Shutdown()
 	wfs.metaCache = meta_cache.NewMetaCache(filepath.Join(t.TempDir(), "meta"), wfs.option.UidGidMapper, "/", false,

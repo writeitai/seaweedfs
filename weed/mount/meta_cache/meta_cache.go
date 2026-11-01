@@ -109,6 +109,7 @@ type metadataApplyRequest struct {
 	buildPath    util.FullPath
 	snapshotTsNs int64
 	sections     *sectionList    // the completed build's section table
+	links        []*filer.Entry  // the completed build's hard links
 	refresh      *sectionRefresh // one section re-listing to reconcile
 	resetFn      func()
 	done         chan error
@@ -176,6 +177,9 @@ func (mc *MetaCache) doInsertEntry(ctx context.Context, entry *filer.Entry, vers
 		return err
 	}
 	mc.setEntryVersionLocked(ctx, entry.FullPath, versionTsNs)
+	if len(entry.HardLinkId) > 0 {
+		mc.setHardLinkVersionLocked(ctx, entry.HardLinkId, versionTsNs)
+	}
 	return nil
 }
 
@@ -184,6 +188,111 @@ func (mc *MetaCache) doInsertEntry(ctx context.Context, entry *filer.Entry, vers
 
 func (mc *MetaCache) doBatchInsertEntries(ctx context.Context, entries []*filer.Entry) error {
 	return mc.leveldbStore.BatchInsertEntries(ctx, entries)
+}
+
+// A hard-link group's shared record, which the store's reads of every name
+// of the group take their attributes and chunks from, as the filer store
+// keeps them, is versioned by the group: the filer log position it
+// reflects, under its own key. A write through one name, a change through
+// a name whose directory is not cached, a listing, a section refresh and a
+// mount's own change to the group's counter all go through
+// setHardLinkRecordLocked, which never lets an older state replace a newer
+// one.
+//
+// Mountable (writeitai/seaweedfs, branch nfs-writes): a hard link's change
+// reaches its other names, and a listing refreshes a record no event did.
+const hardLinkVersionKeyPrefix = "\x00mount.hardlink.ver\x00"
+
+func hardLinkVersionKey(id []byte) []byte { return append([]byte(hardLinkVersionKeyPrefix), id...) }
+
+// hardLinkVersionLocked is the position the group's record reflects, 0
+// when none is known.
+func (mc *MetaCache) hardLinkVersionLocked(ctx context.Context, id []byte) int64 {
+	value, err := mc.localStore.KvGet(ctx, hardLinkVersionKey(id))
+	if err != nil || len(value) != 8 {
+		return 0
+	}
+	return int64(util.BytesToUint64(value))
+}
+
+// setHardLinkVersionLocked records the position the group's record now
+// reflects; 0, for state no position describes, forgets it.
+func (mc *MetaCache) setHardLinkVersionLocked(ctx context.Context, id []byte, tsNs int64) {
+	if tsNs == 0 {
+		mc.localStore.KvDelete(ctx, hardLinkVersionKey(id))
+		return
+	}
+	value := make([]byte, 8)
+	util.Uint64toBytes(value, uint64(tsNs))
+	if err := mc.localStore.KvPut(ctx, hardLinkVersionKey(id), value); err != nil {
+		glog.V(1).Infof("hard link version %x: %v", id, err)
+	}
+}
+
+// hardLinkRecordIsNewerLocked reports whether the group's record reflects
+// a later position than tsNs, so a state at tsNs must not replace it.
+func (mc *MetaCache) hardLinkRecordIsNewerLocked(ctx context.Context, id []byte, tsNs int64) bool {
+	return tsNs != 0 && mc.hardLinkVersionLocked(ctx, id) > tsNs
+}
+
+// setHardLinkRecordLocked writes entry, at tsNs, as its group's record,
+// unless the record reflects a later position. Unless always, only a
+// record already kept is written: one for a group none of whose names is
+// cached would only accumulate. A state with no position (tsNs 0) keeps
+// the record's version, which still fences older listings.
+func (mc *MetaCache) setHardLinkRecordLocked(ctx context.Context, entry *filer.Entry, tsNs int64, always bool) {
+	if mc.hardLinkRecordIsNewerLocked(ctx, entry.HardLinkId, tsNs) {
+		return
+	}
+	if !always {
+		if _, err := mc.localStore.KvGet(ctx, entry.HardLinkId); err != nil {
+			return
+		}
+	}
+	pb := proto.Clone(entry.ToProtoEntry()).(*filer_pb.Entry)
+	filer_pb.BeforeEntrySerialization(pb.Chunks)
+	dir, _ := entry.DirAndName()
+	blob, err := filer.FromPbEntry(dir, pb).EncodeAttributesAndChunks()
+	if err == nil {
+		err = mc.localStore.KvPut(ctx, entry.HardLinkId, blob)
+	}
+	if err != nil {
+		glog.V(1).Infof("hard link record %x: %v", entry.HardLinkId, err)
+		return
+	}
+	if tsNs != 0 {
+		mc.setHardLinkVersionLocked(ctx, entry.HardLinkId, tsNs)
+	}
+}
+
+// insertListedLocked stores an entry a listing at snapshotTsNs returned. A
+// hard link's group record is written through its version gate; a listing
+// with no snapshot, which orders against nothing, only fills a record none
+// keeps.
+func (mc *MetaCache) insertListedLocked(ctx context.Context, entry *filer.Entry, snapshotTsNs int64) error {
+	if len(entry.HardLinkId) == 0 {
+		return mc.localStore.InsertEntry(ctx, entry)
+	}
+	if err := mc.leveldbStore.InsertEntry(ctx, entry); err != nil { // the name
+		return err
+	}
+	if snapshotTsNs == 0 {
+		if _, err := mc.localStore.KvGet(ctx, entry.HardLinkId); err == nil {
+			return nil
+		}
+	}
+	mc.setHardLinkRecordLocked(ctx, entry, snapshotTsNs, true)
+	return nil
+}
+
+// UpdateHardLinkRecord writes entry as its group's record, kept for a
+// cached name of the group, at tsNs, the filer log position of the change
+// it reflects, unless the record reflects a later one (Mountable: see
+// setHardLinkRecordLocked).
+func (mc *MetaCache) UpdateHardLinkRecord(ctx context.Context, entry *filer.Entry, tsNs int64) {
+	mc.Lock()
+	defer mc.Unlock()
+	mc.setHardLinkRecordLocked(ctx, entry, tsNs, false)
 }
 
 func (mc *MetaCache) AtomicUpdateEntryFromFiler(ctx context.Context, oldPath util.FullPath, newEntry *filer.Entry) error {
@@ -222,12 +331,25 @@ func (mc *MetaCache) atomicUpdateEntryFromFilerLocked(ctx context.Context, oldPa
 
 	if newEntry != nil {
 		newDir, _ := newEntry.DirAndName()
-		if allowUncachedInsert || mc.isCachedFn(util.FullPath(newDir)) {
+		switch cached := allowUncachedInsert || mc.isCachedFn(util.FullPath(newDir)); {
+		case cached && len(newEntry.HardLinkId) > 0 && mc.hardLinkRecordIsNewerLocked(ctx, newEntry.HardLinkId, versionTsNs):
+			// The name, without its group's newer record.
+			if err := mc.leveldbStore.InsertEntry(ctx, newEntry); err != nil {
+				return err
+			}
+			mc.setEntryVersionLocked(ctx, newEntry.FullPath, versionTsNs)
+		case cached:
 			glog.V(3).Infof("InsertEntry %s/%s", newDir, newEntry.Name())
 			if err := mc.localStore.InsertEntry(ctx, newEntry); err != nil {
 				return err
 			}
 			mc.setEntryVersionLocked(ctx, newEntry.FullPath, versionTsNs)
+			if len(newEntry.HardLinkId) > 0 {
+				mc.setHardLinkVersionLocked(ctx, newEntry.HardLinkId, versionTsNs)
+			}
+		case len(newEntry.HardLinkId) > 0:
+			// Not cached here, but other names of the group may be.
+			mc.setHardLinkRecordLocked(ctx, newEntry, versionTsNs, false)
 		}
 	}
 	return nil
@@ -326,11 +448,19 @@ func (mc *MetaCache) BeginDirectoryBuild(ctx context.Context, dirPath util.FullP
 }
 
 func (mc *MetaCache) CompleteDirectoryBuild(ctx context.Context, dirPath util.FullPath, snapshotTsNs int64, sectionBounds []string) error {
+	return mc.completeDirectoryBuild(ctx, dirPath, snapshotTsNs, sectionBounds, nil)
+}
+
+// completeDirectoryBuild is CompleteDirectoryBuild with the hard links the
+// listing returned, whose groups' records take them at the snapshot
+// (Mountable: see setHardLinkRecordLocked).
+func (mc *MetaCache) completeDirectoryBuild(ctx context.Context, dirPath util.FullPath, snapshotTsNs int64, sectionBounds []string, links []*filer.Entry) error {
 	return mc.enqueueAndWait(ctx, metadataApplyRequest{
 		kind:         metadataCompleteBuild,
 		buildPath:    dirPath,
 		snapshotTsNs: snapshotTsNs,
 		sections:     newSectionTable(sectionBounds),
+		links:        links,
 	})
 }
 
@@ -829,7 +959,7 @@ func (mc *MetaCache) handleApplyRequest(req metadataApplyRequest) error {
 	case metadataBeginBuild:
 		return mc.beginDirectoryBuildNow(req.buildPath)
 	case metadataCompleteBuild:
-		return mc.completeDirectoryBuildNow(req.ctx, req.buildPath, req.snapshotTsNs, req.sections)
+		return mc.completeDirectoryBuildNow(req.ctx, req.buildPath, req.snapshotTsNs, req.sections, req.links)
 	case metadataAbortBuild:
 		return mc.abortDirectoryBuildNow(req.buildPath)
 	case metadataPurgeDir:
@@ -1054,7 +1184,7 @@ func (mc *MetaCache) purgeDirectoryChildrenNow(ctx context.Context, dirPath util
 	return mc.localStore.DeleteFolderChildren(ctx, dirPath)
 }
 
-func (mc *MetaCache) completeDirectoryBuildNow(ctx context.Context, dirPath util.FullPath, snapshotTsNs int64, sections *sectionList) error {
+func (mc *MetaCache) completeDirectoryBuildNow(ctx context.Context, dirPath util.FullPath, snapshotTsNs int64, sections *sectionList, links []*filer.Entry) error {
 	state := mc.buildingDirs[dirPath]
 	delete(mc.buildingDirs, dirPath)
 
@@ -1071,6 +1201,12 @@ func (mc *MetaCache) completeDirectoryBuildNow(ctx context.Context, dirPath util
 	if snapshotTsNs != 0 {
 		mc.dirVersionFloors[dirPath] = snapshotTsNs
 		mc.pruneSupersededTombstonesLocked(ctx, dirPath, snapshotTsNs)
+		// A listed hard link is its group at the snapshot, unless an event
+		// already gave the record a later state; buffered events replay
+		// over it below.
+		for _, link := range links {
+			mc.setHardLinkRecordLocked(ctx, link, snapshotTsNs, true)
+		}
 	} else {
 		delete(mc.dirVersionFloors, dirPath)
 		mc.deleteChildVersionRecordsLocked(ctx, dirPath)

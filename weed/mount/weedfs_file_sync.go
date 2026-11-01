@@ -134,6 +134,18 @@ func (wfs *WFS) Fsync(cancel <-chan struct{}, in *fuse.FsyncIn) (code fuse.Statu
 }
 
 func (wfs *WFS) doFlush(ctx context.Context, fh *FileHandle, uid, gid uint32, allowAsync bool) fuse.Status {
+	return wfs.doFlushAs(ctx, fh, uid, gid, allowAsync, fuseFlushStatus)
+}
+
+// fuseFlushStatus is a FUSE flush's status for its metadata write's
+// error, by the error's text, as it was before the error kept its gRPC
+// status (Mountable: NFSFsync classifies it by that status).
+func fuseFlushStatus(err error) fuse.Status {
+	return grpcErrorToFuseStatus(errors.New(err.Error()))
+}
+
+// doFlushAs is doFlush, the metadata write's error mapped by status.
+func (wfs *WFS) doFlushAs(ctx context.Context, fh *FileHandle, uid, gid uint32, allowAsync bool, status func(error) fuse.Status) fuse.Status {
 
 	// flush works at fh level
 	fileFullPath := fh.FullPath()
@@ -219,7 +231,7 @@ func (wfs *WFS) doFlush(ctx context.Context, fh *FileHandle, uid, gid uint32, al
 		if errors.As(err, &refused) {
 			return fuse.Status(refused)
 		}
-		return grpcErrorToFuseStatus(err)
+		return status(err)
 	}
 
 	if IsDebugFileReadWrite {
@@ -318,7 +330,7 @@ func (wfs *WFS) flushMetadataToFiler(ctx context.Context, fh *FileHandle, dir, n
 		if errors.As(err, &refused) {
 			return refused
 		}
-		return fmt.Errorf("fh flush create %s: %v", fileFullPath, err)
+		return fmt.Errorf("fh flush create %s: %w", fileFullPath, err)
 	}
 
 	event := resp.GetMetadataEvent()

@@ -110,9 +110,25 @@ func (wfs *WFS) linkLocked(in *fuse.LinkIn, sourceInode uint64, oldEntryPath, ne
 		return code, nil
 	}
 	defer release()
-	inodeLock := wfs.inodeLocks().AcquireLock("link", sourceInode, util.ExclusiveLock)
+	return wfs.linkHeld(in, sourceInode, oldEntryPath, newParentPath, name, group, out, nil)
+}
+
+// linkHeld is linkLocked with the group's locks held. An NFS mutation's
+// step, when given, marks where the link begins changing things and
+// bounds its calls (Mountable: see NFSLink).
+func (wfs *WFS) linkHeld(in *fuse.LinkIn, sourceInode uint64, oldEntryPath, newParentPath util.FullPath, name string, group []byte, out *fuse.EntryOut, step *NFSStep) (fuse.Status, []byte) {
+	// An NFS link waits for these local locks only within its preparation
+	// (Mountable: see NFSLink).
+	ctx := context.Background()
+	if step != nil {
+		ctx = step.Prepare
+	}
+	inodeLock, ok := lockWithin(ctx, wfs.inodeLocks(), "link", sourceInode, util.ExclusiveLock)
+	if !ok {
+		return NFSRetryLater, nil
+	}
 	defer wfs.inodeLocks().ReleaseLock(sourceInode, inodeLock)
-	fh, fhLock, code := wfs.lockFlushedHandle(sourceInode, in.Uid, in.Gid)
+	fh, fhLock, code := wfs.lockFlushedHandle(ctx, sourceInode, in.Uid, in.Gid, step == nil)
 	if code != fuse.OK {
 		return code, nil
 	}
@@ -131,10 +147,21 @@ func (wfs *WFS) linkLocked(in *fuse.LinkIn, sourceInode uint64, oldEntryPath, ne
 		return code, nil
 	}
 	oldParentPath, _ := oldEntryPath.DirAndName()
-	read, _, _, err := filer_pb.GetEntry(context.Background(), wfs, oldEntryPath)
+	var read *filer_pb.Entry
+	var err error
+	if step != nil {
+		if read, err = wfs.lookupOnce(step.Prepare, oldEntryPath); err == nil {
+			wfs.mapPbIdFromLocalToFiler(read) // as GetEntry returns it
+		}
+	} else {
+		read, _, _, err = filer_pb.GetEntry(context.Background(), wfs, oldEntryPath)
+	}
 	if err != nil {
 		if errors.Is(err, filer_pb.ErrNotFound) {
 			return fuse.ENOENT, nil
+		}
+		if step != nil {
+			return nfsReadStatus(err), nil // nothing changed yet
 		}
 		return fuse.EIO, nil
 	}
@@ -169,7 +196,12 @@ func (wfs *WFS) linkLocked(in *fuse.LinkIn, sourceInode uint64, oldEntryPath, ne
 			wfs.inodeToPath.EndLink(sourceInode, group, linked)
 		}
 	}()
-	ctx := context.Background()
+	if step != nil {
+		if !step.Begin() {
+			return NFSRetryLater, nil
+		}
+		ctx = step.Mutate
+	}
 	updateResp, err := wfs.updateEntryOnce(ctx, &filer_pb.UpdateEntryRequest{
 		Directory:  oldParentPath,
 		Entry:      promoted,
@@ -180,6 +212,10 @@ func (wfs *WFS) linkLocked(in *fuse.LinkIn, sourceInode uint64, oldEntryPath, ne
 		glog.V(0).Infof("Link %v: promoting the source: %v", oldEntryPath, err)
 		if code := status.Code(err); code == codes.FailedPrecondition || isNotFound(err) {
 			return fuse.ENOENT, nil
+		}
+		if step != nil {
+			wfs.inodeToPath.InvalidateChildrenCache(util.FullPath(oldParentPath))
+			return nfsCallStatus(err, true), nil
 		}
 		return fuse.EIO, nil
 	}
@@ -251,6 +287,13 @@ func (wfs *WFS) linkLocked(in *fuse.LinkIn, sourceInode uint64, oldEntryPath, ne
 		// The extra reference stays, which keeps chunks longer, never too
 		// short, and Link fails.
 		glog.V(0).Infof("Link %v -> %s: %v %s", oldEntryPath, newEntryPath, err, createResp.GetError())
+		if step != nil {
+			wfs.inodeToPath.InvalidateChildrenCache(newParentPath)
+			if err == nil {
+				err = errors.New(createResp.GetError())
+			}
+			return nfsCallStatus(err, false), nil
+		}
 		return fuse.EIO, nil
 	}
 	createEvent := createResp.GetMetadataEvent()
@@ -262,7 +305,11 @@ func (wfs *WFS) linkLocked(in *fuse.LinkIn, sourceInode uint64, oldEntryPath, ne
 		glog.Warningf("link %s: best-effort metadata apply failed: %v", newEntryPath, applyErr)
 		wfs.inodeToPath.InvalidateChildrenCache(newParentPath)
 	}
-	wfs.touchDirMtimeCtimeBest(newParentPath)
+	if step != nil {
+		wfs.nfsTouchDir(*step, newParentPath)
+	} else {
+		wfs.touchDirMtimeCtimeBest(newParentPath)
+	}
 
 	wfs.inodeToPath.AddPath(sourceInode, newEntryPath)
 	// The group as the filer has it, also for a source this mount knew as
@@ -274,7 +321,7 @@ func (wfs *WFS) linkLocked(in *fuse.LinkIn, sourceInode uint64, oldEntryPath, ne
 	// existing sibling link (other than the source we just wrote) returns
 	// the old nlink from the local metacache — pjdfstest link/00.t catches
 	// this after `link n1 n2` when it stats n0.
-	wfs.syncHardLinkSiblings(sourceInode, acked, oldEntryPath, newEntryPath)
+	wfs.syncHardLinkSiblings(sourceInode, acked, ackVersionTsNs(createResp), oldEntryPath, newEntryPath)
 
 	// Map back to local uid/gid before writing attributes to the kernel.
 	reported := proto.Clone(alias).(*filer_pb.Entry)
@@ -288,9 +335,10 @@ func (wfs *WFS) linkLocked(in *fuse.LinkIn, sourceInode uint64, oldEntryPath, ne
 // syncHardLinkSiblings rewrites the cached HardLinkCounter (and ctime) on
 // every sibling link of the given inode, and invalidates the kernel's inode
 // attr cache. `authoritativeEntry` carries the counter/ctime that should be
-// propagated. `skipPaths` are the link paths already updated by the caller
+// propagated, as of `tsNs`, the filer log position of the change (0 when
+// unknown). `skipPaths` are the link paths already updated by the caller
 // (typically the source and/or the newly created/removed link).
-func (wfs *WFS) syncHardLinkSiblings(inode uint64, authoritativeEntry *filer_pb.Entry, skipPaths ...util.FullPath) {
+func (wfs *WFS) syncHardLinkSiblings(inode uint64, authoritativeEntry *filer_pb.Entry, tsNs int64, skipPaths ...util.FullPath) {
 	if authoritativeEntry == nil || len(authoritativeEntry.HardLinkId) == 0 {
 		return
 	}
@@ -323,9 +371,9 @@ func (wfs *WFS) syncHardLinkSiblings(inode uint64, authoritativeEntry *filer_pb.
 		if authoritativeEntry.Attributes != nil {
 			sibling.Attr.Ctime = time.Unix(authoritativeEntry.Attributes.Ctime, int64(authoritativeEntry.Attributes.CtimeNs))
 		}
-		if err := wfs.metaCache.UpdateEntry(ctx, sibling); err != nil {
-			glog.V(4).Infof("syncHardLinkSiblings update %s: %v", p, err)
-		}
+		// The group's record, at the change's log position (Mountable:
+		// see MetaCache.UpdateHardLinkRecord).
+		wfs.metaCache.UpdateHardLinkRecord(ctx, sibling, tsNs)
 	}
 	// Note: we deliberately do NOT call fuseServer.InodeNotify here. That
 	// call would be made from the FUSE Link request handler goroutine, and
