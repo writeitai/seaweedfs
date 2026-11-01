@@ -3,6 +3,7 @@ package mount
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -16,6 +17,28 @@ import (
 )
 
 var _ = filer_pb.FilerClient(&WFS{})
+
+// retryable is util.Retry's rule for a filer call's error, except that a
+// definite refusal by the gateway is final when RefusalsAreFinal is set
+// (Mountable).
+func (wfs *WFS) retryable(err error) bool {
+	if !util.IsTransientError(err) {
+		return false
+	}
+	if !wfs.option.RefusalsAreFinal {
+		return true
+	}
+	st, ok := util.ServerStatus(err)
+	if !ok || st.Code() != codes.ResourceExhausted {
+		return true
+	}
+	for _, refusal := range []string{"quota", "spending_cap", "file too large", "metadata rate"} {
+		if strings.Contains(st.Message(), refusal) {
+			return false
+		}
+	}
+	return true
+}
 
 func (wfs *WFS) WithFilerClient(streamingMode bool, fn func(filer_pb.SeaweedFilerClient) error) (err error) {
 	return wfs.withFilerClient(context.Background(), streamingMode, wfs.filerRPCWait(), func(_ context.Context, client filer_pb.SeaweedFilerClient) error {
@@ -33,7 +56,7 @@ func (wfs *WFS) WithFilerClient(streamingMode bool, fn func(filer_pb.SeaweedFile
 // channel's other callers.
 func (wfs *WFS) withFilerClient(ctx context.Context, streamingMode bool, callWait time.Duration, fn func(ctx context.Context, client filer_pb.SeaweedFilerClient) error) (err error) {
 
-	return util.Retry("filer grpc", func() error {
+	return util.RetryOnError("filer grpc", wfs.retryable, func() error {
 
 		i := atomic.LoadInt32(&wfs.option.filerIndex)
 		n := len(wfs.option.FilerAddresses)

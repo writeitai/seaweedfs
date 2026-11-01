@@ -134,18 +134,6 @@ func (wfs *WFS) Fsync(cancel <-chan struct{}, in *fuse.FsyncIn) (code fuse.Statu
 }
 
 func (wfs *WFS) doFlush(ctx context.Context, fh *FileHandle, uid, gid uint32, allowAsync bool) fuse.Status {
-	return wfs.doFlushAs(ctx, fh, uid, gid, allowAsync, fuseFlushStatus)
-}
-
-// fuseFlushStatus is a FUSE flush's status for its metadata write's
-// error, by the error's text, as it was before the error kept its gRPC
-// status (Mountable: NFSFsync classifies it by that status).
-func fuseFlushStatus(err error) fuse.Status {
-	return grpcErrorToFuseStatus(errors.New(err.Error()))
-}
-
-// doFlushAs is doFlush, the metadata write's error mapped by status.
-func (wfs *WFS) doFlushAs(ctx context.Context, fh *FileHandle, uid, gid uint32, allowAsync bool, status func(error) fuse.Status) fuse.Status {
 
 	// flush works at fh level
 	fileFullPath := fh.FullPath()
@@ -231,7 +219,7 @@ func (wfs *WFS) doFlushAs(ctx context.Context, fh *FileHandle, uid, gid uint32, 
 		if errors.As(err, &refused) {
 			return fuse.Status(refused)
 		}
-		return status(err)
+		return fuseFlushStatus(err)
 	}
 
 	if IsDebugFileReadWrite {
@@ -239,6 +227,13 @@ func (wfs *WFS) doFlushAs(ctx context.Context, fh *FileHandle, uid, gid uint32, 
 	}
 
 	return fuse.OK
+}
+
+// fuseFlushStatus is a FUSE flush's status for its metadata write's error,
+// by the error's text, as it was before the error kept its gRPC status
+// (Mountable: an NFS WRITE classifies it by that status, see nfsWriteStatus).
+func fuseFlushStatus(err error) fuse.Status {
+	return grpcErrorToFuseStatus(errors.New(err.Error()))
 }
 
 // flushMetadataToFiler sends the file's chunk references and attributes to the filer.
@@ -252,6 +247,20 @@ func (wfs *WFS) doFlushAs(ctx context.Context, fh *FileHandle, uid, gid uint32, 
 // as it is under the handle lock. Either way, that destination is the one
 // checked, and written to.
 func (wfs *WFS) flushMetadataToFiler(ctx context.Context, fh *FileHandle, dir, name string, uid, gid uint32) error {
+	return wfs.flushMetadata(ctx, fh, dir, name, uid, gid, false)
+}
+
+// nfsMaxChunks is the most chunks the gateway stores in one entry; past
+// it the mount would fold chunks into manifests, which the gateway does
+// not take.
+const nfsMaxChunks = 9_999
+
+// flushMetadata is flushMetadataToFiler. Mountable: for an NFS WRITE (D45)
+// it runs neither the bloat merge, which re-reads and re-uploads the whole
+// file, nor the manifest fold, either of which would run inside the
+// WRITE's deadline; a file past the gateway's chunk cap is EFBIG instead,
+// before anything is sent.
+func (wfs *WFS) flushMetadata(ctx context.Context, fh *FileHandle, dir, name string, uid, gid uint32, nfsWrite bool) error {
 	fhActiveLock := fh.wfs.fhLockTable.AcquireLock("doFlush", fh.fh, util.ExclusiveLock)
 	defer fh.wfs.fhLockTable.ReleaseLock(fh.fh, fhActiveLock)
 
@@ -291,18 +300,26 @@ func (wfs *WFS) flushMetadataToFiler(ctx context.Context, fh *FileHandle, dir, n
 		return fmt.Errorf("compact chunks of %s: %w", fileFullPath, err)
 	}
 
-	if mergedChunks, mergeErr := wfs.maybeMergeChunks(fileFullPath, chunks, manifestChunks); mergeErr != nil {
-		glog.V(0).Infof("maybeMergeChunks %s: %v", fileFullPath, mergeErr)
-	} else if mergedChunks != nil {
-		chunks = mergedChunks
-		manifestChunks = nil
+	if nfsWrite && len(chunks)+len(manifestChunks) > nfsMaxChunks {
+		return syscall.EFBIG
+	}
+	if !nfsWrite {
+		if mergedChunks, mergeErr := wfs.maybeMergeChunks(fileFullPath, chunks, manifestChunks); mergeErr != nil {
+			glog.V(0).Infof("maybeMergeChunks %s: %v", fileFullPath, mergeErr)
+		} else if mergedChunks != nil {
+			chunks = mergedChunks
+			manifestChunks = nil
+		}
 	}
 
-	// no chunk deleter here: a failed fold reports the blobs it saved
-	chunks, manifestErr := filer.MaybeManifestize(wfs.saveDataAsChunk(fileFullPath), nil, chunks)
-	if manifestErr != nil {
-		// not good, but should be ok
-		glog.V(0).Infof("MaybeManifestize: %v", manifestErr)
+	if !nfsWrite {
+		// no chunk deleter here: a failed fold reports the blobs it saved
+		var manifestErr error
+		chunks, manifestErr = filer.MaybeManifestize(wfs.saveDataAsChunk(fileFullPath), nil, chunks)
+		if manifestErr != nil {
+			// not good, but should be ok
+			glog.V(0).Infof("MaybeManifestize: %v", manifestErr)
+		}
 	}
 	entry.Chunks = append(chunks, manifestChunks...)
 
@@ -474,7 +491,7 @@ func (wfs *WFS) persistDestination(fh *FileHandle, path util.FullPath) (util.Ful
 // before; another object, or none, and the handle refuses for good
 // (ESTALE), keeping its writes. Called under the handle lock (Mountable).
 func (wfs *WFS) persistEntry(ctx context.Context, fh *FileHandle, path util.FullPath, request *filer_pb.CreateEntryRequest) (*filer_pb.CreateEntryResponse, error) {
-	for range 3 {
+	for attempt := range 3 {
 		// Only a create waiting for this flush expects no entry; any other
 		// handle expects its base, in the form the filer stores it.
 		var expected *filer_pb.Entry
@@ -489,6 +506,9 @@ func (wfs *WFS) persistEntry(ctx context.Context, fh *FileHandle, path util.Full
 		}
 		request.Condition = entryCondition(expected)
 		resp, err := wfs.createEntryOnce(ctx, request)
+		if err != nil && attempt > 0 {
+			return nil, resentError{err}
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -514,6 +534,14 @@ func (wfs *WFS) persistEntry(ctx context.Context, fh *FileHandle, path util.Full
 	}
 	return nil, fmt.Errorf("create %s: the entry kept changing", path)
 }
+
+// resentError is an entry write's error on a send after the first, which
+// a definite refusal of the earlier one allowed (Mountable: an NFS WRITE
+// answers a rate refusal of only its first send "retry later").
+type resentError struct{ err error }
+
+func (e resentError) Error() string { return e.err.Error() }
+func (e resentError) Unwrap() error { return e.err }
 
 // holdFlushAck makes what the filer acknowledged for a flush the handle's
 // base: the stored entry its event carries, else the entry sent; the

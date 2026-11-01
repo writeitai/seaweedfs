@@ -671,6 +671,12 @@ func (wfs *WFS) NFSOpenForWrite(ctx context.Context, inode uint64, uid, gid uint
 	if code != fuse.OK {
 		return 0, code
 	}
+	// Marked under the map's lock, which the periodic flush reads the
+	// handles under: no flush that saw the handle unmarked is still
+	// looking when the first WRITE starts.
+	wfs.fhMap.Lock()
+	fh.nfsWrite.Store(true)
+	wfs.fhMap.Unlock()
 	if code := wfs.acquireWriteLeaseContext(ctx, fh); code != fuse.OK {
 		wfs.ReleaseHandle(fh.fh)
 		return 0, code
@@ -966,37 +972,6 @@ func nfsReadStatus(err error) fuse.Status {
 	return nfsCallStatus(err, false)
 }
 
-// NFSFsync persists what the handle id holds, as Fsync does, with the
-// metadata write's refusal classified for an NFS COMMIT: one to retry
-// later (the metadata rate, the gateway unavailable, or out of time)
-// keeps the handle's writes (NFSRetryLater); the size cap is EFBIG, a
-// quota or spending cap EDQUOT, anything else EIO.
-func (wfs *WFS) NFSFsync(id FileHandleId, uid, gid uint32) fuse.Status {
-	fh := wfs.GetHandle(id)
-	if fh == nil {
-		return fuse.ENOENT
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), metadataFlushTimeout)
-	defer cancel()
-	return wfs.doFlushAs(ctx, fh, uid, gid, false, nfsFlushStatus)
-}
-
-// nfsFlushStatus is NFSFsync's status for a metadata write's error.
-func nfsFlushStatus(err error) fuse.Status {
-	msg := err.Error()
-	switch code := status.Code(err); {
-	case code == codes.ResourceExhausted && strings.Contains(msg, "metadata rate"),
-		code == codes.Unavailable, code == codes.Canceled, code == codes.DeadlineExceeded,
-		errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
-		return NFSRetryLater
-	case code == codes.ResourceExhausted && strings.Contains(msg, "file too large"):
-		return fuse.Status(syscall.EFBIG)
-	case code == codes.ResourceExhausted:
-		return fuse.Status(syscall.EDQUOT) // a quota or spending cap
-	}
-	return fuse.EIO
-}
-
 // nfsCallStatus is a mutation call's error as a status. When the call was
 // the first that could change anything (first), refusals the gateway names
 // are mapped to their meaning, and one for the metadata rate changed
@@ -1005,13 +980,19 @@ func nfsFlushStatus(err error) fuse.Status {
 // is EIO: the outcome is unknown.
 func nfsCallStatus(err error, first bool) fuse.Status {
 	msg := err.Error()
+	// A refusal is told by the gateway's own message, never by the names
+	// around it in the error.
+	refusal := ""
+	if st, ok := util.ServerStatus(err); ok {
+		refusal = st.Message()
+	}
 	switch code := status.Code(err); {
-	case code == codes.ResourceExhausted && strings.Contains(msg, "metadata rate"):
+	case code == codes.ResourceExhausted && strings.Contains(refusal, "metadata rate"):
 		if first {
 			return NFSRetryLater
 		}
 		return fuse.EIO
-	case code == codes.ResourceExhausted && strings.Contains(msg, "file too large"):
+	case code == codes.ResourceExhausted && strings.Contains(refusal, "file too large"):
 		return fuse.Status(syscall.EFBIG)
 	case code == codes.ResourceExhausted:
 		return fuse.Status(syscall.EDQUOT) // a quota or spending cap

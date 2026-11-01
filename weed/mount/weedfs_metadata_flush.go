@@ -49,7 +49,7 @@ func (wfs *WFS) flushAllDirtyMetadata() {
 	var dirtyHandles []*FileHandle
 	wfs.fhMap.RLock()
 	for _, fh := range wfs.fhMap.inode2fh {
-		if fh.dirtyMetadata {
+		if !fh.nfsWrite.Load() && fh.dirtyMetadata {
 			dirtyHandles = append(dirtyHandles, fh)
 		}
 	}
@@ -95,8 +95,9 @@ func (wfs *WFS) flushFileMetadata(fh *FileHandle) error {
 	fhActiveLock := fh.wfs.fhLockTable.AcquireLock("flushMetadata", fh.fh, util.ExclusiveLock)
 	defer fh.wfs.fhLockTable.ReleaseLock(fh.fh, fhActiveLock)
 
-	// Double-check dirty flag under lock
-	if !fh.dirtyMetadata {
+	// Double-check dirty flag under lock; an NFS write handle's WRITEs
+	// persist themselves (Mountable)
+	if fh.nfsWrite.Load() || !fh.dirtyMetadata {
 		return nil
 	}
 
