@@ -69,9 +69,13 @@ func metadataRateRefused(err error) bool {
 }
 
 // diskFullMessage is in the gateway's refusal of a create or rename while
-// the cell's disk is nearly full ("disk full: no writable volumes", the
-// chunk assignment's message too).
-const diskFullMessage = "no writable volumes"
+// the cell's disk is nearly full ("disk full: no writable volumes"), and
+// diskFullAssignment is the chunk assignment's whole error for it, which
+// ends the assignment's failure text.
+const (
+	diskFullMessage    = "no writable volumes"
+	diskFullAssignment = "disk full: no writable volumes"
+)
 
 // diskFullRefused reports whether err is that refusal, as a gRPC status or
 // as a stream mutation's error response. It is ENOSPC, at once: neither

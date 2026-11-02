@@ -1,12 +1,16 @@
 package mount
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"syscall"
 	"testing"
 
 	"github.com/seaweedfs/go-fuse/v2/fuse"
+	"github.com/seaweedfs/seaweedfs/weed/pb"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -110,11 +114,38 @@ func TestNFSStatusOnAFullDisk(t *testing.T) {
 		{"call, spending cap", nfsCallStatus(spending, true), edquot},
 		{"entry write", nfsWriteStatus(errDiskFull), enospc},
 		{"entry write, spending cap", nfsWriteStatus(spending), edquot},
-		{"upload, assignment", nfsUploadStatus(errors.New("assign volume: disk full: no writable volumes")), enospc},
+		{"upload, assignment", nfsUploadStatus(errors.New(`assign volume failure path:"/a": disk full: no writable volumes`)), enospc},
+		{"upload, a file named after it", nfsUploadStatus(errors.New(`assign volume failure path:"/disk full: no writable volumes": volume server down`)), fuse.EIO},
 		{"upload, spending cap", nfsUploadStatus(spending), edquot},
 	} {
 		if tc.got != tc.want {
 			t.Errorf("%s: %v, want %v", tc.name, tc.got, tc.want)
 		}
+	}
+}
+
+// diskFullFiler refuses every create for a full disk and counts them.
+type diskFullFiler struct {
+	filer_pb.UnimplementedSeaweedFilerServer
+	creates atomic.Int32
+}
+
+func (f *diskFullFiler) CreateEntry(context.Context, *filer_pb.CreateEntryRequest) (*filer_pb.CreateEntryResponse, error) {
+	f.creates.Add(1)
+	return nil, errDiskFull
+}
+
+// The refusal is the cell's: it is not sent on to the next filer address.
+func TestDiskFullIsNotSentToTheNextFiler(t *testing.T) {
+	wfs := newInvalidateTestWFS(t)
+	first, second := &diskFullFiler{}, &diskFullFiler{}
+	wfs.option.FilerAddresses = []pb.ServerAddress{listenFiler(t, first), listenFiler(t, second)}
+	atomic.StoreInt32(&wfs.option.filerIndex, 0)
+	err := wfs.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+		_, err := client.CreateEntry(context.Background(), &filer_pb.CreateEntryRequest{Directory: "/", Entry: &filer_pb.Entry{Name: "a"}})
+		return err
+	})
+	if !diskFullRefused(err) || first.creates.Load()+second.creates.Load() != 1 {
+		t.Fatalf("err %v after %d+%d creates, want the refusal after 1", err, first.creates.Load(), second.creates.Load())
 	}
 }

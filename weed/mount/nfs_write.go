@@ -114,7 +114,7 @@ func nfsUploadStatus(err error) fuse.Status {
 	if strings.HasSuffix(err.Error(), ": quota exceeded") {
 		return fuse.Status(syscall.EDQUOT)
 	}
-	if isStorageFullError(err) {
+	if strings.HasSuffix(err.Error(), ": "+diskFullAssignment) || diskFullRefused(err) {
 		return fuse.Status(syscall.ENOSPC) // the cell's disk (Mountable)
 	}
 	if st, ok := util.ServerStatus(err); ok {

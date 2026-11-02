@@ -67,6 +67,9 @@ func (wfs *WFS) withFilerClient(ctx context.Context, streamingMode bool, callWai
 
 			filerGrpcAddress := wfs.option.FilerAddresses[i].ToGrpcAddress()
 			err = wfs.callFiler(ctx, streamingMode, callWait, filerGrpcAddress, fn)
+			if diskFullRefused(err) {
+				return err // final: not sent to the next filer (Mountable)
+			}
 
 			if err != nil {
 				// glog.V(0).Infof("WithFilerClient %d %v: %v", x, filerGrpcAddress, err)
