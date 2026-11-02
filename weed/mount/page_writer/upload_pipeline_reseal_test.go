@@ -1,6 +1,9 @@
 package page_writer
 
 import (
+	"bytes"
+	"io"
+	"slices"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -67,8 +70,8 @@ func TestMoveToSealed_ReplaceKeepsUploadReference(t *testing.T) {
 	up.chunksLock.Lock()
 	indexed := up.sealedChunks[0]
 	up.chunksLock.Unlock()
-	if indexed == nil || indexed.chunk != second {
-		t.Errorf("index 0 should still hold the second chunk, got %v", indexed)
+	if len(indexed) != 1 || indexed[0].chunk != second {
+		t.Errorf("index 0 should hold only the second chunk, got %v", indexed)
 	}
 
 	close(second.gate)
@@ -115,6 +118,105 @@ func waitForFree(t *testing.T, c *gatedChunk) {
 	for c.freeCount.Load() == 0 {
 		if time.Now().After(deadline) {
 			t.Fatal("chunk was never freed after its upload finished")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// gatedSave is a saveToStorageFn whose uploads each wait for their own
+// gate, picked by the data's modification time (the write's tsNs), so a
+// test decides which upload finishes when, whatever order they start in.
+type gatedSave struct {
+	gates map[int64]chan struct{}
+	done  map[int64]chan struct{}
+}
+
+func newGatedSave(tsNs ...int64) *gatedSave {
+	g := &gatedSave{gates: map[int64]chan struct{}{}, done: map[int64]chan struct{}{}}
+	for _, ts := range tsNs {
+		g.gates[ts] = make(chan struct{})
+		g.done[ts] = make(chan struct{})
+	}
+	return g
+}
+
+func (g *gatedSave) save(reader io.Reader, offset, size, modifiedTsNs int64, cleanupFn func()) {
+	<-g.gates[modifiedTsNs]
+	_, _ = io.Copy(io.Discard, reader)
+	if cleanupFn != nil {
+		cleanupFn()
+	}
+	close(g.done[modifiedTsNs])
+}
+
+// sealAt writes data at off with tsNs and seals its chunk at once.
+func sealAt(t *testing.T, up *UploadPipeline, data []byte, off, tsNs int64) {
+	t.Helper()
+	if _, err := up.SaveDataAt(data, off, true, tsNs); err != nil {
+		t.Fatal(err)
+	}
+	up.chunksLock.Lock()
+	up.moveToSealed(up.writableChunks[0], 0)
+	up.chunksLock.Unlock()
+}
+
+// Sealing an index again while its earlier chunk is uploading must keep the
+// earlier chunk's data readable: until that upload lands in the entry, the
+// sealed chunk is the only place it is (Mountable: WinFsp sends a close's
+// flush without waiting for it, so the next open's write and flush overlap
+// it, and the reads in between returned zeros). A newer chunk whose upload
+// finishes first stays too: readers overlay the older one on the entry,
+// which would otherwise cover the newer data.
+func TestMoveToSealed_ReplaceKeepsEarlierDataReadable(t *testing.T) {
+	const cs int64 = 2 * 1024 * 1024
+	g := newGatedSave(1, 2)
+	up := NewUploadPipeline(util.NewLimitedConcurrentExecutor(4), cs, g.save, 16, t.TempDir(), nil)
+
+	whole := bytes.Repeat([]byte{'a'}, 8192)
+	sealAt(t, up, whole, 0, 1)
+	sealAt(t, up, []byte("bbbb"), 4096, 2)
+
+	want := bytes.Clone(whole)
+	copy(want[4096:], "bbbb")
+	read := func(when string) {
+		t.Helper()
+		got := make([]byte, len(whole))
+		if maxStop := up.MaybeReadDataAt(got, 0, 0); maxStop != int64(len(whole)) || !bytes.Equal(got, want) {
+			t.Errorf("%s: read %d bytes, data matches %v", when, maxStop, bytes.Equal(got, want))
+		}
+	}
+	read("both uploads in flight")
+
+	close(g.gates[2]) // the newer upload finishes first
+	<-g.done[2]
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		up.chunksLock.Lock()
+		sealed := slices.Clone(up.sealedChunks[0])
+		newerDone := len(sealed) == 2 && sealed[1].uploaded
+		up.chunksLock.Unlock()
+		if newerDone {
+			break
+		}
+		if len(sealed) != 2 || time.Now().After(deadline) {
+			t.Fatalf("after the newer upload finished, index 0 holds %d sealed chunks, want both", len(sealed))
+		}
+		time.Sleep(time.Millisecond)
+	}
+	read("the older upload in flight")
+
+	close(g.gates[1])
+	up.FlushAll()
+	deadline = time.Now().Add(5 * time.Second)
+	for {
+		up.chunksLock.Lock()
+		left := len(up.sealedChunks)
+		up.chunksLock.Unlock()
+		if left == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d indexes still hold sealed chunks after every upload finished", left)
 		}
 		time.Sleep(time.Millisecond)
 	}

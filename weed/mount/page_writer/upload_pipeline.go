@@ -3,6 +3,7 @@ package page_writer
 import (
 	"fmt"
 	"math"
+	"slices"
 	"sync"
 	"sync/atomic"
 
@@ -24,7 +25,15 @@ type UploadPipeline struct {
 	swapFile            *SwapFile
 	chunksLock          sync.Mutex
 	writableChunks      map[LogicChunkIndex]PageChunk
-	sealedChunks        map[LogicChunkIndex]*SealedChunk
+	// sealedChunks holds, per index, the chunks sealed and not yet all
+	// uploaded, oldest first. An index sealed again while an earlier upload
+	// is in flight keeps both: the earlier one's data is in neither the
+	// entry nor a writable chunk until its upload lands, so readers must
+	// still see it. A chunk leaves only once it and every chunk sealed
+	// before it are uploaded: readers overlay the sealed chunks on the
+	// entry, so an older one still indexed would cover a newer one's data
+	// already in the entry (Mountable).
+	sealedChunks        map[LogicChunkIndex][]*SealedChunk
 	activeReadChunks    map[LogicChunkIndex]int
 	readerCountCond     *sync.Cond
 	accountant          *WriteBufferAccountant
@@ -33,7 +42,8 @@ type UploadPipeline struct {
 
 type SealedChunk struct {
 	chunk            PageChunk
-	referenceCounter int // track uploading or reading processes
+	referenceCounter int  // track uploading or reading processes
+	uploaded         bool // its upload is done; guarded by chunksLock (Mountable)
 	// accountant and chunkSize are captured when the chunk is sealed so
 	// FreeReference can release the global write-budget slot exactly once
 	// regardless of which code path triggers the final deref (normal
@@ -68,7 +78,7 @@ func NewUploadPipeline(writers *util.LimitedConcurrentExecutor, chunkSize int64,
 	t := &UploadPipeline{
 		ChunkSize:           chunkSize,
 		writableChunks:      make(map[LogicChunkIndex]PageChunk),
-		sealedChunks:        make(map[LogicChunkIndex]*SealedChunk),
+		sealedChunks:        make(map[LogicChunkIndex][]*SealedChunk),
 		uploaders:           writers,
 		uploaderCountCond:   sync.NewCond(&sync.Mutex{}),
 		saveToStorageFn:     saveToStorageFn,
@@ -174,11 +184,11 @@ func (up *UploadPipeline) MaybeReadDataAt(p []byte, off int64, tsNs int64) (maxS
 		up.chunksLock.Unlock()
 	}()
 
-	// read from sealed chunks first
-	sealedChunk, found := up.sealedChunks[logicChunkIndex]
-	if found {
-		maxStop = sealedChunk.chunk.ReadDataAt(p, off, tsNs)
-		glog.V(4).Infof("%s read sealed memchunk [%d,%d)", up.filepath, off, maxStop)
+	// read from sealed chunks first, oldest first so newer writes win
+	for _, sealedChunk := range up.sealedChunks[logicChunkIndex] {
+		sealedMaxStop := sealedChunk.chunk.ReadDataAt(p, off, tsNs)
+		glog.V(4).Infof("%s read sealed memchunk [%d,%d)", up.filepath, off, sealedMaxStop)
+		maxStop = max(maxStop, sealedMaxStop)
 	}
 
 	// read from writable chunks last
@@ -217,9 +227,6 @@ func (up *UploadPipeline) moveToSealed(memChunk PageChunk, logicChunkIndex Logic
 	newCount := atomic.AddInt32(&up.uploaderCount, 1)
 	glog.V(4).Infof("%s uploaderCount %d ++> %d", up.filepath, newCount-1, newCount)
 
-	if oldMemChunk, found := up.sealedChunks[logicChunkIndex]; found {
-		oldMemChunk.FreeReference(fmt.Sprintf("%s replace chunk %d", up.filepath, logicChunkIndex))
-	}
 	sealedChunk := &SealedChunk{
 		chunk: memChunk,
 		// One for the sealedChunks slot, one for the upload below, which
@@ -229,7 +236,7 @@ func (up *UploadPipeline) moveToSealed(memChunk PageChunk, logicChunkIndex Logic
 		accountant:       up.accountant,
 		chunkSize:        up.ChunkSize,
 	}
-	up.sealedChunks[logicChunkIndex] = sealedChunk
+	up.sealedChunks[logicChunkIndex] = append(up.sealedChunks[logicChunkIndex], sealedChunk)
 	delete(up.writableChunks, logicChunkIndex)
 
 	// unlock before submitting the uploading jobs
@@ -255,16 +262,31 @@ func (up *UploadPipeline) moveToSealed(memChunk PageChunk, logicChunkIndex Logic
 			up.readerCountCond.Wait()
 		}
 
-		// then remove from sealed chunks, unless a later seal took over the
-		// index — deleting that one would hide its dirty pages from readers
-		if up.sealedChunks[logicChunkIndex] == sealedChunk {
-			delete(up.sealedChunks, logicChunkIndex)
-			sealedChunk.FreeReference(fmt.Sprintf("%s unindex chunk %d", up.filepath, logicChunkIndex))
-		}
+		// then remove the uploaded chunks no earlier one is still waiting
+		// for: this one, and those sealed after it that finished first
+		sealedChunk.uploaded = true
+		up.unindexUploaded(logicChunkIndex)
 		sealedChunk.FreeReference(fmt.Sprintf("%s finished uploading chunk %d", up.filepath, logicChunkIndex))
 
 	})
 	up.chunksLock.Lock()
+}
+
+// unindexUploaded removes the oldest chunks sealed at index for as long as
+// they are uploaded, dropping each one's slot reference. The caller holds
+// chunksLock.
+func (up *UploadPipeline) unindexUploaded(index LogicChunkIndex) {
+	sealed := up.sealedChunks[index]
+	done := 0
+	for done < len(sealed) && sealed[done].uploaded {
+		sealed[done].FreeReference(fmt.Sprintf("%s unindex chunk %d", up.filepath, index))
+		done++
+	}
+	if done == len(sealed) {
+		delete(up.sealedChunks, index)
+	} else if done > 0 {
+		up.sealedChunks[index] = slices.Delete(sealed, 0, done)
+	}
 }
 
 // EvictOneWritableChunk force-seals one writable chunk so the accountant's
@@ -394,9 +416,11 @@ func (up *UploadPipeline) Shutdown() {
 		up.accountant.Release(up.ChunkSize)
 		delete(up.writableChunks, logicChunkIndex)
 	}
-	for logicChunkIndex, sealedChunk := range up.sealedChunks {
-		// only the slot reference; an in-flight upload frees the chunk itself
-		sealedChunk.FreeReference(fmt.Sprintf("%s uploadpipeline shutdown chunk %d", up.filepath, logicChunkIndex))
+	for logicChunkIndex, sealed := range up.sealedChunks {
+		for _, sealedChunk := range sealed {
+			// only the slot reference; an in-flight upload frees the chunk itself
+			sealedChunk.FreeReference(fmt.Sprintf("%s uploadpipeline shutdown chunk %d", up.filepath, logicChunkIndex))
+		}
 		delete(up.sealedChunks, logicChunkIndex)
 	}
 }
