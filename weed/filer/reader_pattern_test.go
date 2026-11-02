@@ -143,3 +143,15 @@ func TestReaderPatternRestartBelowFrontierRecovers(t *testing.T) {
 		t.Fatalf("frontier is %d, want it kept at the tail", got)
 	}
 }
+
+// Sparse reads stepping back by less than SeqTolerance each are not a
+// stream: they stay random, fetching only what they ask for (Mountable).
+func TestReaderPatternSparseBackwardReadsStayRandom(t *testing.T) {
+	rp := NewReaderPattern()
+	for _, at := range []int64{60, 24, 20, 16, 12, 8, 4, 0} {
+		rp.MonitorReadAt(at*mb, 4<<10)
+		if at != 60 && !rp.IsRandomMode() {
+			t.Fatalf("the read at %d MiB made sparse backward reads sequential", at)
+		}
+	}
+}
