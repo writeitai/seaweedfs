@@ -7,6 +7,11 @@ import (
 type ReaderPattern struct {
 	isSequentialCounter int64
 	readFrontier        int64 // highest (offset+size) observed across reads
+	// lastReadEnd is where the latest read ended. A stream that starts over
+	// below the frontier (a reader from the file's start after something
+	// read its tail, as happens on Windows when a file is opened) goes on
+	// exactly from here, not from the frontier (Mountable).
+	lastReadEnd int64
 }
 
 const ModeChangeLimit = 3
@@ -42,15 +47,19 @@ func (rp *ReaderPattern) MonitorReadAt(offset int64, size int) {
 		}
 	}
 
-	// near = this read starts within SeqTolerance of where reads had reached.
-	// Hysteresis (the ±ModeChangeLimit counter) keeps a single outlier read from
-	// flipping the mode.
+	// near = this read starts within SeqTolerance of where reads had reached,
+	// or exactly where the latest read ended: no tolerance there, or sparse
+	// reads stepping back less than SeqTolerance each would pass for a
+	// stream and fetch whole chunks. Hysteresis (the ±ModeChangeLimit
+	// counter) keeps a single outlier read from flipping the mode.
+	previousEnd := atomic.SwapInt64(&rp.lastReadEnd, end)
 	diff := offset - frontier
 	if diff < 0 {
 		diff = -diff
 	}
+	near := diff <= SeqTolerance || offset == previousEnd
 	counter := atomic.LoadInt64(&rp.isSequentialCounter)
-	if diff <= SeqTolerance {
+	if near {
 		if counter < ModeChangeLimit {
 			atomic.AddInt64(&rp.isSequentialCounter, 1)
 		}

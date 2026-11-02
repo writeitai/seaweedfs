@@ -122,3 +122,36 @@ func TestReaderPatternRangedReadStaysRandom(t *testing.T) {
 		t.Fatal("sustained sequential reads should restore sequential mode")
 	}
 }
+
+// A sequential reader that starts over below the frontier, after something
+// read the file's tail (on Windows, right after the file is opened), is
+// sequential again after a few reads, not random until it nears the tail
+// (Mountable).
+func TestReaderPatternRestartBelowFrontierRecovers(t *testing.T) {
+	rp := NewReaderPattern()
+	rp.MonitorReadAt(0, 64<<10)
+	rp.MonitorReadAt(40*mb-64<<10, 64<<10) // the tail
+	offset := int64(64 << 10)
+	for range ModeChangeLimit + 1 {
+		rp.MonitorReadAt(offset, 4<<10)
+		offset += 4 << 10
+	}
+	if rp.IsRandomMode() {
+		t.Fatal("a sequential stream from the start must not stay random after the tail was read")
+	}
+	if got := atomic.LoadInt64(&rp.readFrontier); got != 40*mb {
+		t.Fatalf("frontier is %d, want it kept at the tail", got)
+	}
+}
+
+// Sparse reads stepping back by less than SeqTolerance each are not a
+// stream: they stay random, fetching only what they ask for (Mountable).
+func TestReaderPatternSparseBackwardReadsStayRandom(t *testing.T) {
+	rp := NewReaderPattern()
+	for _, at := range []int64{60, 24, 20, 16, 12, 8, 4, 0} {
+		rp.MonitorReadAt(at*mb, 4<<10)
+		if at != 60 && !rp.IsRandomMode() {
+			t.Fatalf("the read at %d MiB made sparse backward reads sequential", at)
+		}
+	}
+}
