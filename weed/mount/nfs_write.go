@@ -114,6 +114,9 @@ func nfsUploadStatus(err error) fuse.Status {
 	if strings.HasSuffix(err.Error(), ": quota exceeded") {
 		return fuse.Status(syscall.EDQUOT)
 	}
+	if isStorageFullError(err) {
+		return fuse.Status(syscall.ENOSPC) // the cell's disk (Mountable)
+	}
 	if st, ok := util.ServerStatus(err); ok {
 		switch {
 		case st.Code() == codes.ResourceExhausted && strings.Contains(st.Message(), "spending_cap_reached"):
@@ -147,6 +150,8 @@ func nfsWriteStatus(err error) fuse.Status {
 		return NFSRetryLater // the first send, refused: nothing changed
 	case code == codes.ResourceExhausted && strings.Contains(msg, "file too large"):
 		return fuse.Status(syscall.EFBIG)
+	case code == codes.ResourceExhausted && strings.Contains(msg, diskFullMessage):
+		return fuse.Status(syscall.ENOSPC) // the cell's disk, not a quota
 	case code == codes.ResourceExhausted:
 		return fuse.Status(syscall.EDQUOT) // a quota or spending cap
 	}

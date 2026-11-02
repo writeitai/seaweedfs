@@ -994,6 +994,8 @@ func nfsCallStatus(err error, first bool) fuse.Status {
 		return fuse.EIO
 	case code == codes.ResourceExhausted && strings.Contains(refusal, "file too large"):
 		return fuse.Status(syscall.EFBIG)
+	case code == codes.ResourceExhausted && strings.Contains(refusal, diskFullMessage):
+		return fuse.Status(syscall.ENOSPC) // the cell's disk, not a quota
 	case code == codes.ResourceExhausted:
 		return fuse.Status(syscall.EDQUOT) // a quota or spending cap
 	case !first:

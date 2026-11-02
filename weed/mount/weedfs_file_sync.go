@@ -222,6 +222,9 @@ func (wfs *WFS) doFlush(ctx context.Context, fh *FileHandle, uid, gid uint32, al
 			return fuse.EINTR
 		}
 		glog.Errorf("%v fh %d flush: %v", fileFullPath, fh.fh, err)
+		if diskFullRefused(err) {
+			return fuse.Status(syscall.ENOSPC) // Mountable
+		}
 		var refused syscall.Errno
 		if errors.As(err, &refused) {
 			return fuse.Status(refused)

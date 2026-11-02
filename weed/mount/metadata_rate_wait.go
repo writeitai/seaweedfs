@@ -68,6 +68,28 @@ func metadataRateRefused(err error) bool {
 	return false
 }
 
+// diskFullMessage is in the gateway's refusal of a create or rename while
+// the cell's disk is nearly full ("disk full: no writable volumes", the
+// chunk assignment's message too).
+const diskFullMessage = "no writable volumes"
+
+// diskFullRefused reports whether err is that refusal, as a gRPC status or
+// as a stream mutation's error response. It is ENOSPC, at once: neither
+// waited out nor retried (Mountable).
+func diskFullRefused(err error) bool {
+	if err == nil {
+		return false
+	}
+	if st, ok := util.ServerStatus(err); ok {
+		return st.Code() == codes.ResourceExhausted && strings.Contains(st.Message(), diskFullMessage)
+	}
+	var streamErr *streamMutateError
+	if errors.As(err, &streamErr) {
+		return strings.Contains(streamErr.msg, diskFullMessage)
+	}
+	return false
+}
+
 // metadataRateWaits reports whether ctx was marked by waitingAtMetadataRate,
 // and the interrupt that ends its waits.
 func metadataRateWaits(ctx context.Context) (<-chan struct{}, bool) {

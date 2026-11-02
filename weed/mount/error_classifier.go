@@ -17,6 +17,9 @@ func grpcErrorToFuseStatus(err error) fuse.Status {
 	if errors.Is(err, errMetadataRateInterrupted) {
 		return fuse.EINTR // Mountable: see atMetadataRate
 	}
+	if diskFullRefused(err) {
+		return fuse.Status(syscall.ENOSPC) // Mountable
+	}
 
 	// Unpack error for inspection
 	if s, ok := status.FromError(err); ok {
@@ -82,7 +85,7 @@ func writeErrorToFuseStatus(err error) fuse.Status {
 // transport errors, Canceled/Unavailable/ResourceExhausted, or errors with no
 // gRPC status — is treated as potentially transient and retried.
 func isRetryableFilerError(err error) bool {
-	if err == nil {
+	if err == nil || diskFullRefused(err) { // Mountable: final
 		return false
 	}
 	if s, ok := status.FromError(err); ok {
