@@ -77,12 +77,16 @@ const (
 	diskFullAssignment = "disk full: no writable volumes"
 )
 
-// diskFullRefused reports whether err is that refusal, as a gRPC status or
-// as a stream mutation's error response. It is ENOSPC, at once: neither
+// diskFullRefused reports whether err is that refusal, as a gRPC status,
+// as a stream mutation's error response, or as the failure text of a chunk
+// assignment, which ends with it. It is ENOSPC, at once: neither
 // waited out nor retried (Mountable).
 func diskFullRefused(err error) bool {
 	if err == nil {
 		return false
+	}
+	if strings.HasSuffix(err.Error(), ": "+diskFullAssignment) {
+		return true // the chunk assignment's, as text
 	}
 	if st, ok := util.ServerStatus(err); ok {
 		return st.Code() == codes.ResourceExhausted && strings.Contains(st.Message(), diskFullMessage)

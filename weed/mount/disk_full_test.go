@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/seaweedfs/go-fuse/v2/fuse"
+	"github.com/seaweedfs/seaweedfs/weed/operation"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"google.golang.org/grpc/codes"
@@ -33,6 +34,8 @@ func TestDiskFullRefused(t *testing.T) {
 		{"spending cap", status.Error(codes.ResourceExhausted, "spending_cap_reached: manage the monthly cap on the Billing page"), false},
 		{"a file named after it", fmt.Errorf("create /no writable volumes: %w", errRate), false},
 		{"unavailable with the text", status.Error(codes.Unavailable, "disk full: no writable volumes"), false},
+		{"assignment", errors.New(`assign volume failure path:"/transport/a": disk full: no writable volumes`), true},
+		{"assignment, a file named after it", errors.New(`assign volume failure path:"/disk full: no writable volumes": volume server down`), false},
 	} {
 		if got := diskFullRefused(tc.err); got != tc.want {
 			t.Errorf("%s: diskFullRefused = %v, want %v", tc.name, got, tc.want)
@@ -41,8 +44,12 @@ func TestDiskFullRefused(t *testing.T) {
 	if got := grpcErrorToFuseStatus(errDiskFull); got != fuse.Status(syscall.ENOSPC) {
 		t.Errorf("grpcErrorToFuseStatus = %v, want ENOSPC", got)
 	}
-	if isRetryableFilerError(errDiskFull) {
+	assignment := errors.New(`assign volume failure path:"/transport/a": disk full: no writable volumes`)
+	if isRetryableFilerError(errDiskFull) || isRetryableFilerError(assignment) {
 		t.Error("the disk-full refusal is retried")
+	}
+	if operation.ShouldReassignUpload(assignment) {
+		t.Error("an upload refused for a full disk is assigned again")
 	}
 }
 
@@ -147,5 +154,39 @@ func TestDiskFullIsNotSentToTheNextFiler(t *testing.T) {
 	})
 	if !diskFullRefused(err) || first.creates.Load()+second.creates.Load() != 1 {
 		t.Fatalf("err %v after %d+%d creates, want the refusal after 1", err, first.creates.Load(), second.creates.Load())
+	}
+}
+
+// diskFullAssigner refuses every chunk assignment for a full disk, as the
+// gateway does, and counts them.
+type diskFullAssigner struct {
+	filer_pb.UnimplementedSeaweedFilerServer
+	assigns atomic.Int32
+}
+
+func (f *diskFullAssigner) AssignVolume(context.Context, *filer_pb.AssignVolumeRequest) (*filer_pb.AssignVolumeResponse, error) {
+	f.assigns.Add(1)
+	return &filer_pb.AssignVolumeResponse{Error: "disk full: no writable volumes"}, nil
+}
+
+// An assignment refused for a full disk is not sent to the next filer,
+// nor retried, even for a path with "transport" in it.
+func TestDiskFullAssignmentIsFinal(t *testing.T) {
+	wfs := newInvalidateTestWFS(t)
+	first, second := &diskFullAssigner{}, &diskFullAssigner{}
+	wfs.option.FilerAddresses = []pb.ServerAddress{listenFiler(t, first), listenFiler(t, second)}
+	atomic.StoreInt32(&wfs.option.filerIndex, 0)
+	err := wfs.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+		resp, err := client.AssignVolume(context.Background(), &filer_pb.AssignVolumeRequest{Path: "/transport/a"})
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("assign volume failure %v: %v", &filer_pb.AssignVolumeRequest{Path: "/transport/a"}, resp.Error)
+	})
+	if !diskFullRefused(err) || first.assigns.Load()+second.assigns.Load() != 1 {
+		t.Fatalf("err %v after %d+%d assignments, want the refusal after 1", err, first.assigns.Load(), second.assigns.Load())
+	}
+	if got := nfsUploadStatus(err); got != fuse.Status(syscall.ENOSPC) {
+		t.Fatalf("NFS status %v, want ENOSPC", got)
 	}
 }

@@ -154,6 +154,9 @@ func ShouldReassignUpload(err error) bool {
 	if errors.As(err, &se) {
 		return se.StatusCode == 0 || se.StatusCode >= 500
 	}
+	if strings.HasSuffix(err.Error(), ": disk full: no writable volumes") {
+		return false // mountable.io's gateway: the cell's disk is full, final (Mountable)
+	}
 	return strings.Contains(err.Error(), "transport")
 }
 
