@@ -32,8 +32,8 @@ func retryMetadataFlushIf(ctx context.Context, flush func() error, shouldRetry f
 	var err error
 	for attempt := 1; attempt <= totalAttempts; attempt++ {
 		err = atMetadataRate(ctx, "metadata update", flush)
-		if err == nil || errors.Is(err, errMetadataRateInterrupted) {
-			break
+		if err == nil || errors.Is(err, errMetadataRateInterrupted) || diskFullRefused(err) {
+			break // the disk-full refusal is final (Mountable)
 		}
 		if attempt == totalAttempts {
 			break

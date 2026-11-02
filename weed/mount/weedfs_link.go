@@ -321,6 +321,11 @@ func (wfs *WFS) linkHeld(in *fuse.LinkIn, sourceInode uint64, oldEntryPath, newP
 			}
 			return nfsCallStatus(err, false), nil
 		}
+		if diskFullRefused(err) {
+			// The new name was not created; the extra reference stays, as
+			// after an interrupt (Mountable).
+			return fuse.Status(syscall.ENOSPC), nil
+		}
 		return fuse.EIO, nil
 	}
 	createEvent := createResp.GetMetadataEvent()

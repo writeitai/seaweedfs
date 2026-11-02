@@ -22,9 +22,10 @@ var _ = filer_pb.FilerClient(&WFS{})
 // metadata rate's refusal is never retried here, and a definite refusal by
 // the gateway is final when RefusalsAreFinal is set (Mountable).
 func (wfs *WFS) retryable(err error) bool {
-	if !util.IsTransientError(err) || metadataRateRefused(err) {
+	if !util.IsTransientError(err) || metadataRateRefused(err) || diskFullRefused(err) {
 		// The metadata rate is waited out by the operation that sent the
-		// mutation, past this retry's few seconds (atMetadataRate).
+		// mutation, past this retry's few seconds (atMetadataRate); a full
+		// disk is ENOSPC at once.
 		return false
 	}
 	if !wfs.option.RefusalsAreFinal {
@@ -66,6 +67,9 @@ func (wfs *WFS) withFilerClient(ctx context.Context, streamingMode bool, callWai
 
 			filerGrpcAddress := wfs.option.FilerAddresses[i].ToGrpcAddress()
 			err = wfs.callFiler(ctx, streamingMode, callWait, filerGrpcAddress, fn)
+			if diskFullRefused(err) {
+				return err // final: not sent to the next filer (Mountable)
+			}
 
 			if err != nil {
 				// glog.V(0).Infof("WithFilerClient %d %v: %v", x, filerGrpcAddress, err)

@@ -472,6 +472,9 @@ func (wfs *WFS) Rename(cancel <-chan struct{}, in *fuse.RenameIn, oldName string
 		// Map error strings to FUSE status codes. String matching is used
 		// instead of raw errno to stay portable across platforms (errno
 		// numeric values differ between Linux and macOS).
+		if diskFullRefused(err) {
+			return fuse.Status(syscall.ENOSPC)
+		}
 		msg := err.Error()
 		if strings.Contains(msg, "not found") {
 			return fuse.Status(syscall.ENOENT)

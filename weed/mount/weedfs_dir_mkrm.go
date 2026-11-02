@@ -130,6 +130,9 @@ func (wfs *WFS) Mkdir(cancel <-chan struct{}, in *fuse.MkdirIn, name string, out
 		if errors.Is(err, errMetadataRateInterrupted) {
 			return fuse.EINTR
 		}
+		if diskFullRefused(err) {
+			return fuse.Status(syscall.ENOSPC)
+		}
 		return fuse.EIO
 	}
 

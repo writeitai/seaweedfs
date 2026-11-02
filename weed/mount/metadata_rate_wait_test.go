@@ -265,7 +265,17 @@ type rateStore struct {
 	pass   int
 	refuse int
 	sent   int
-	taken  int // creates taken
+	taken  int   // creates taken
+	err    error // the refusal; nil: the metadata rate's
+}
+
+func (f *rateStore) refusal() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return f.err
+	}
+	return errRate
 }
 
 func (f *rateStore) refused(kind string) bool {
@@ -307,7 +317,7 @@ func (f *rateStore) sends() int {
 
 func (f *rateStore) CreateEntry(ctx context.Context, r *filer_pb.CreateEntryRequest) (*filer_pb.CreateEntryResponse, error) {
 	if f.refused("create") {
-		return nil, errRate
+		return nil, f.refusal()
 	}
 	f.mu.Lock()
 	f.taken++
@@ -317,21 +327,21 @@ func (f *rateStore) CreateEntry(ctx context.Context, r *filer_pb.CreateEntryRequ
 
 func (f *rateStore) UpdateEntry(ctx context.Context, r *filer_pb.UpdateEntryRequest) (*filer_pb.UpdateEntryResponse, error) {
 	if f.refused("update") {
-		return nil, errRate
+		return nil, f.refusal()
 	}
 	return f.storeFiler.UpdateEntry(ctx, r)
 }
 
 func (f *rateStore) DeleteEntry(ctx context.Context, r *filer_pb.DeleteEntryRequest) (*filer_pb.DeleteEntryResponse, error) {
 	if f.refused("delete") {
-		return nil, errRate
+		return nil, f.refusal()
 	}
 	return f.storeFiler.DeleteEntry(ctx, r)
 }
 
 func (f *rateStore) StreamRenameEntry(r *filer_pb.StreamRenameEntryRequest, stream grpc.ServerStreamingServer[filer_pb.StreamRenameEntryResponse]) error {
 	if f.refused("rename") {
-		return errRate
+		return f.refusal()
 	}
 	return f.storeFiler.StreamRenameEntry(r, stream)
 }

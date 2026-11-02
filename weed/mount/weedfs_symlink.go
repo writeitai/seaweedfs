@@ -90,6 +90,9 @@ func (wfs *WFS) Symlink(cancel <-chan struct{}, header *fuse.InHeader, target st
 		if errors.Is(err, errMetadataRateInterrupted) {
 			return fuse.EINTR
 		}
+		if diskFullRefused(err) {
+			return fuse.Status(syscall.ENOSPC)
+		}
 		return fuse.EIO
 	}
 
