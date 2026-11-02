@@ -356,6 +356,7 @@ func NewSeaweedFileSystem(option *Option) *WFS {
 		if asyncDrained {
 			os.RemoveAll(option.getUniqueCacheDirForWrite())
 		}
+		wfs.chunkCache.Shutdown() // its files are open (Mountable)
 		os.RemoveAll(option.getUniqueCacheDirForRead())
 		if wfs.peerAnnouncer != nil {
 			wfs.peerAnnouncer.Stop()
@@ -1264,6 +1265,8 @@ func (wfs *WFS) getCurrentFiler() pb.ServerAddress {
 
 func (wfs *WFS) ClearCacheDir() {
 	wfs.metaCache.Shutdown()
+	// Its files are open, and Windows removes no open file (Mountable).
+	wfs.chunkCache.Shutdown()
 	os.RemoveAll(wfs.option.getUniqueCacheDirForWrite())
 	os.RemoveAll(wfs.option.getUniqueCacheDirForRead())
 }
