@@ -37,6 +37,9 @@ type TieredChunkCache struct {
 	onDiskCacheSizeLimit1  uint64
 	onDiskCacheSizeLimit2  uint64
 	maxFilePartSizeInCache uint64
+	// closed: Shutdown closed the disk caches, so every later read misses
+	// and every later write is dropped (Mountable).
+	closed bool
 }
 
 var _ ChunkCache = &TieredChunkCache{}
@@ -73,6 +76,9 @@ func (c *TieredChunkCache) IsInCache(fileId string, lockNeeded bool) (answer boo
 	if lockNeeded {
 		c.RLock()
 		defer c.RUnlock()
+	}
+	if c.closed {
+		return false
 	}
 
 	item := c.memCache.cache.Get(fileId)
@@ -117,6 +123,9 @@ func (c *TieredChunkCache) ReadChunkAt(data []byte, fileId string, offset uint64
 
 	c.RLock()
 	defer c.RUnlock()
+	if c.closed {
+		return 0, nil
+	}
 
 	minSize := offset + uint64(len(data))
 	if minSize <= c.onDiskCacheSizeLimit0 {
@@ -165,6 +174,9 @@ func (c *TieredChunkCache) SetChunk(fileId string, data []byte) {
 	}
 	c.Lock()
 	defer c.Unlock()
+	if c.closed {
+		return
+	}
 
 	glog.V(4).Infof("SetChunk %s size %d\n", fileId, len(data))
 	if c.IsInCache(fileId, false) {
@@ -216,6 +228,10 @@ func (c *TieredChunkCache) Shutdown() {
 	}
 	c.Lock()
 	defer c.Unlock()
+	if c.closed {
+		return
+	}
+	c.closed = true
 	for _, diskCache := range c.diskCaches {
 		diskCache.shutdown()
 	}

@@ -199,3 +199,27 @@ func openFDCount() int {
 	}
 	return -1
 }
+
+// After Shutdown the cache's files are closed, so its directory can be
+// removed even on Windows, and the cache is a miss: a read, a write or a
+// second Shutdown racing the end of a mount does not touch the closed
+// files (Mountable).
+func TestShutdownClosesFilesAndMisses(t *testing.T) {
+	dir := t.TempDir()
+	cache := NewTieredChunkCache(2, dir, 32, 1024)
+	data := bytes.Repeat([]byte{7}, 2048) // past the memory tier
+	cache.SetChunk("1,1aabbccdd", data)
+
+	cache.Shutdown()
+	cache.Shutdown()
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatalf("removing the cache directory after Shutdown: %v", err)
+	}
+	if n, err := cache.ReadChunkAt(make([]byte, len(data)), "1,1aabbccdd", 0); n != 0 || err != nil {
+		t.Fatalf("read after Shutdown = %d, %v; want a miss", n, err)
+	}
+	if cache.IsInCache("1,1aabbccdd", true) {
+		t.Fatal("a chunk is reported cached after Shutdown")
+	}
+	cache.SetChunk("1,2aabbccdd", data)
+}

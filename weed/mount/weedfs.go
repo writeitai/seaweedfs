@@ -1264,6 +1264,8 @@ func (wfs *WFS) getCurrentFiler() pb.ServerAddress {
 
 func (wfs *WFS) ClearCacheDir() {
 	wfs.metaCache.Shutdown()
+	// Its files are open, and Windows removes no open file (Mountable).
+	wfs.chunkCache.Shutdown()
 	os.RemoveAll(wfs.option.getUniqueCacheDirForWrite())
 	os.RemoveAll(wfs.option.getUniqueCacheDirForRead())
 }
