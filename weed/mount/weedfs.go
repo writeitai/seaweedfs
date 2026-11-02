@@ -356,6 +356,7 @@ func NewSeaweedFileSystem(option *Option) *WFS {
 		if asyncDrained {
 			os.RemoveAll(option.getUniqueCacheDirForWrite())
 		}
+		wfs.chunkCache.Shutdown() // its files are open (Mountable)
 		os.RemoveAll(option.getUniqueCacheDirForRead())
 		if wfs.peerAnnouncer != nil {
 			wfs.peerAnnouncer.Stop()
